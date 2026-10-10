@@ -242,6 +242,11 @@ if commands is not None:
             self.tracker.is_ready = True
             self.tracker.status = "connected"
             self.tracker.diagnostic_message = "Gateway session resumed."
+            # Refresh the latency snapshot after reconnect; otherwise the dashboard
+            # can keep displaying the last pre-disconnect value.
+            latency = getattr(self, "latency", None)
+            self.tracker.latency_ms = round(latency * 1000, 1) if latency is not None else None
+            self.tracker.guild_count = len(self.guilds)
             self.write_state_file()
 
         async def on_disconnect(self) -> None:
