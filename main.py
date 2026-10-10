@@ -184,6 +184,8 @@ if commands is not None:
                 self.tracker.is_ready = True
                 self.tracker.status = "connected"
                 self.tracker.user = str(self.user)
+                self.tracker.client_id = str(self.user.id)
+                self.tracker.invite_url = f"https://discord.com/oauth2/authorize?client_id={self.user.id}&permissions=2147485696&scope=bot%20applications.commands"
                 self.tracker.guild_count = len(self.guilds)
                 self.tracker.latency_ms = round(self.latency * 1000, 1)
                 self.tracker.last_connected_time = time.time()

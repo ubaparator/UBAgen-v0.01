@@ -24,7 +24,26 @@ import {
   FileCode,
   Terminal,
   Zap,
+  ExternalLink,
+  Copy,
+  Check,
+  Share2,
+  X,
 } from 'lucide-react';
+
+// Official Discord Clyde controller SVG logo
+function DiscordLogo({ className = 'w-4 h-4' }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.893.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z" />
+    </svg>
+  );
+}
 
 interface StatsResponse {
   status: string;
@@ -41,6 +60,8 @@ interface StatsResponse {
     uptime_str: string;
     diagnostic_message?: string;
     sync_status?: string | null;
+    client_id?: string | null;
+    invite_url?: string | null;
   };
   compute: {
     cpu_usage_pct: number | null;
@@ -118,8 +139,49 @@ export default function App() {
   });
   const [showConfig, setShowConfig] = useState<boolean>(false);
   const [customUrlInput, setCustomUrlInput] = useState<string>(endpointUrl);
+  const [showInviteModal, setShowInviteModal] = useState<boolean>(false);
+  const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  const [customClientId, setCustomClientId] = useState<string>(() => {
+    return localStorage.getItem('ubagen_custom_client_id') || '';
+  });
+  const [permissionPreset, setPermissionPreset] = useState<'recommended' | 'admin' | 'basic'>('recommended');
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Derive active Discord client ID & invite URL
+  const effectiveClientId =
+    stats?.bot?.client_id ||
+    customClientId.trim() ||
+    '1558545306046701599';
+
+  const getInviteUrlWithPerms = (preset: 'recommended' | 'admin' | 'basic') => {
+    if (!effectiveClientId) return null;
+    const permCode = preset === 'admin' ? 8 : preset === 'basic' ? 0 : 2147485696;
+    return `https://discord.com/oauth2/authorize?client_id=${effectiveClientId}&permissions=${permCode}&scope=bot%20applications.commands`;
+  };
+
+  const activeInviteUrl =
+    permissionPreset === 'recommended' && stats?.bot?.invite_url
+      ? stats.bot.invite_url
+      : getInviteUrlWithPerms(permissionPreset);
+
+  const handleCopyInviteLink = async () => {
+    if (!activeInviteUrl) return;
+    try {
+      await navigator.clipboard.writeText(activeInviteUrl);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2200);
+    } catch {
+      const textArea = document.createElement('textarea');
+      textArea.value = activeInviteUrl;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2200);
+    }
+  };
 
   // Fetch telemetry from real backend /api/stats
   const fetchStats = useCallback(
@@ -291,6 +353,38 @@ export default function App() {
           >
             <Settings className="w-4 h-4" />
           </button>
+
+          <div className="h-5 w-px bg-slate-800/80 mx-0.5 hidden sm:block" />
+
+          {/* Discord Bot Sunucuya Ekle (Add Bot to Server - Discord Purple Theme) */}
+          <div className="flex items-center gap-1">
+            <a
+              href={activeInviteUrl || '#'}
+              target={activeInviteUrl ? '_blank' : undefined}
+              rel={activeInviteUrl ? 'noopener noreferrer' : undefined}
+              onClick={(e) => {
+                if (!activeInviteUrl) {
+                  e.preventDefault();
+                  setShowInviteModal(true);
+                }
+              }}
+              className="px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg bg-[#5865F2] hover:bg-[#4752C4] active:bg-[#3c45a5] active:scale-95 text-white shadow-md shadow-[#5865F2]/25 hover:shadow-lg hover:shadow-[#5865F2]/40 border border-[#7983F5]/40 transition-all flex items-center gap-2 cursor-pointer select-none group"
+              title="UBAgen Discord botunu kendi sunucunuza ekleyin (OAuth2)"
+            >
+              <DiscordLogo className="w-4 h-4 shrink-0 transition-transform group-hover:scale-110" />
+              <span>Sunucuya Ekle</span>
+              <ExternalLink className="w-3.5 h-3.5 opacity-80 group-hover:opacity-100 transition-opacity" />
+            </a>
+
+            {/* Invite Modal / Options Trigger */}
+            <button
+              onClick={() => setShowInviteModal(true)}
+              className="p-1.5 sm:p-2 text-xs font-medium rounded-lg bg-[#5865F2]/15 hover:bg-[#5865F2]/25 text-[#949cf7] hover:text-white border border-[#5865F2]/30 transition-colors cursor-pointer"
+              title="Davet linki seçenekleri ve yetki ayarları"
+            >
+              <Share2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
       </header>
 
@@ -754,6 +848,28 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {/* Direct Server Invite Button in Card */}
+                <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-slate-400">Sunucu Bağlantısı:</span>
+                  <a
+                    href={activeInviteUrl || '#'}
+                    target={activeInviteUrl ? '_blank' : undefined}
+                    rel={activeInviteUrl ? 'noopener noreferrer' : undefined}
+                    onClick={(e) => {
+                      if (!activeInviteUrl) {
+                        e.preventDefault();
+                        setShowInviteModal(true);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-md bg-[#5865F2] hover:bg-[#4752C4] active:bg-[#3c45a5] text-white shadow-sm transition-all cursor-pointer"
+                    title="Botu kendi Discord sunucunuza ekleyin"
+                  >
+                    <DiscordLogo className="w-3.5 h-3.5" />
+                    <span>Sunucuya Ekle</span>
+                    <ExternalLink className="w-3 h-3 opacity-80" />
+                  </a>
+                </div>
               </div>
 
               <div className="border-t border-slate-800/80 pt-3 mt-4 text-xs flex items-center justify-between text-slate-400">
@@ -916,6 +1032,217 @@ export default function App() {
         <span>UBAgen System Monitor &bull; Real-time Host Hardware Telemetry</span>
         <span className="font-mono text-slate-600">GET /api/stats &bull; GET /health</span>
       </footer>
+
+      {/* Discord Bot Server Invite Modal */}
+      {showInviteModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150"
+          onClick={() => setShowInviteModal(false)}
+        >
+          <div
+            className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="bg-[#5865F2] px-6 py-4 flex items-center justify-between text-white shadow-md">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-white/10 flex items-center justify-center backdrop-blur-sm">
+                  <DiscordLogo className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-base leading-tight">
+                    Discord Botunu Sunucunuza Ekleyin
+                  </h3>
+                  <p className="text-xs text-white/80 mt-0.5">
+                    OAuth2 Sunucu Yetkilendirmesi &amp; Komut Senkronizasyonu
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowInviteModal(false)}
+                className="p-1.5 rounded-lg text-white/80 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                aria-label="Kapat"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 space-y-5">
+              {/* Bot Info & Status */}
+              <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800/80 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-[#5865F2]/20 border border-[#5865F2]/40 flex items-center justify-center text-[#5865F2] font-bold">
+                    <Bot className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="text-sm font-bold text-white block">
+                      {stats?.bot?.user && stats.bot.user !== 'Disconnected'
+                        ? stats.bot.user
+                        : 'UBAgen Bot'}
+                    </span>
+                    <span className="text-xs text-slate-400 block font-mono">
+                      Client ID: {effectiveClientId || 'Algılanamadı'}
+                    </span>
+                  </div>
+                </div>
+
+                {stats?.bot?.connected ? (
+                  <span className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                    Gateway Online
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-full bg-slate-800 text-slate-400 border border-slate-700">
+                    Beklemede
+                  </span>
+                )}
+              </div>
+
+              {/* Permission Presets */}
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-2">
+                  Yetki Seviyesi Seçin:
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPermissionPreset('recommended')}
+                    className={`p-2.5 rounded-xl text-left border transition-all cursor-pointer ${
+                      permissionPreset === 'recommended'
+                        ? 'bg-[#5865F2]/15 border-[#5865F2] text-white shadow-sm'
+                        : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <div className="font-semibold text-xs flex items-center gap-1">
+                      <span>Önerilen</span>
+                      {permissionPreset === 'recommended' && (
+                        <Check className="w-3 h-3 text-[#5865F2]" />
+                      )}
+                    </div>
+                    <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">
+                      Slash Komutları + Mesaj
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setPermissionPreset('admin')}
+                    className={`p-2.5 rounded-xl text-left border transition-all cursor-pointer ${
+                      permissionPreset === 'admin'
+                        ? 'bg-[#5865F2]/15 border-[#5865F2] text-white shadow-sm'
+                        : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <div className="font-semibold text-xs flex items-center gap-1">
+                      <span>Yönetici</span>
+                      {permissionPreset === 'admin' && (
+                        <Check className="w-3 h-3 text-[#5865F2]" />
+                      )}
+                    </div>
+                    <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">
+                      Administrator (Tam yetki)
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setPermissionPreset('basic')}
+                    className={`p-2.5 rounded-xl text-left border transition-all cursor-pointer ${
+                      permissionPreset === 'basic'
+                        ? 'bg-[#5865F2]/15 border-[#5865F2] text-white shadow-sm'
+                        : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <div className="font-semibold text-xs flex items-center gap-1">
+                      <span>Temel</span>
+                      {permissionPreset === 'basic' && (
+                        <Check className="w-3 h-3 text-[#5865F2]" />
+                      )}
+                    </div>
+                    <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">
+                      Yetkisiz / Basic Scope
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Direct Invite URL Input & Copy */}
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                  Resmi Discord Davet Bağlantısı (OAuth2):
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    readOnly
+                    value={activeInviteUrl || ''}
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-slate-300 focus:outline-none focus:border-[#5865F2] select-all"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleCopyInviteLink}
+                    className={`px-3 py-2 text-xs font-medium rounded-xl border transition-all flex items-center gap-1.5 cursor-pointer shrink-0 ${
+                      copiedLink
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700/80'
+                    }`}
+                  >
+                    {copiedLink ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Kopyalandı!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Kopyala</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="pt-2 flex flex-col sm:flex-row items-center gap-3">
+                <a
+                  href={activeInviteUrl || '#'}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full sm:flex-1 py-2.5 px-4 rounded-xl bg-[#5865F2] hover:bg-[#4752C4] active:bg-[#3c45a5] text-white font-semibold text-sm shadow-lg shadow-[#5865F2]/25 border border-[#7983F5]/40 transition-all flex items-center justify-center gap-2 cursor-pointer text-center"
+                >
+                  <DiscordLogo className="w-4 h-4" />
+                  <span>Discord'da Aç ve Sunucuya Ekle</span>
+                  <ExternalLink className="w-4 h-4 opacity-80" />
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setShowInviteModal(false)}
+                  className="w-full sm:w-auto py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium transition-colors cursor-pointer"
+                >
+                  Kapat
+                </button>
+              </div>
+
+              {/* Instructions Guide */}
+              <div className="p-3.5 rounded-xl bg-slate-950/40 border border-slate-800/60 text-xs text-slate-400 space-y-1.5">
+                <span className="font-semibold text-slate-300 block mb-1">
+                  💡 Nasıl Kullanılır:
+                </span>
+                <p>
+                  1. <strong>"Discord'da Aç ve Sunucuya Ekle"</strong> butonuna tıklayın.
+                </p>
+                <p>
+                  2. Açılan Discord yetkilendirme penceresinde yönetici olduğunuz sunucuyu seçip <strong>"Yetkilendir"</strong>e basın.
+                </p>
+                <p>
+                  3. Sunucunuzda herhangi bir metin kanalında <code className="text-indigo-300 bg-slate-800 px-1 py-0.5 rounded font-mono">/stats</code> yazarak canlı sistem raporunu anında görün.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

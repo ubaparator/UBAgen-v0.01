@@ -34,6 +34,9 @@ function ensurePythonWorker() {
 
     pythonWorkerProcess.on('exit', () => {
       pythonWorkerProcess = null;
+      setTimeout(() => {
+        ensurePythonWorker();
+      }, 3000);
     });
 
     process.on('exit', () => {

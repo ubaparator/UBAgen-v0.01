@@ -10,6 +10,7 @@ Provides real measurements for both the Discord slash command and the GET /api/s
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timezone
 import json
 import logging
@@ -42,6 +43,51 @@ PROCESS_START_TIME = time.time()
 
 
 # ------------------------------------------------------------------------------
+# Discord Client ID & Invite Helpers
+# ------------------------------------------------------------------------------
+def extract_discord_client_id(bot_instance: Any = None) -> Optional[str]:
+    """
+    Safely retrieves the Discord Client/Application ID from:
+    1. The connected bot's user object (bot.user.id)
+    2. DISCORD_CLIENT_ID or DISCORD_APPLICATION_ID environment variables
+    3. The first segment of DISCORD_BOT_TOKEN (base64-encoded Client ID in Discord tokens)
+    Never exposes or logs the bot token itself.
+    """
+    if bot_instance and getattr(bot_instance, "user", None):
+        user_id = getattr(bot_instance.user, "id", None)
+        if user_id:
+            return str(user_id)
+
+    for env_key in ("DISCORD_CLIENT_ID", "DISCORD_APPLICATION_ID"):
+        val = os.getenv(env_key, "").strip()
+        if val.isdigit() and len(val) >= 15:
+            return val
+
+    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    if token and "." in token and token not in ("your_discord_bot_token_here", "MY_DISCORD_BOT_TOKEN", "CHANGE_ME"):
+        try:
+            part = token.split(".")[0].strip()
+            padded = part + "=" * (-len(part) % 4)
+            decoded = base64.b64decode(padded).decode("utf-8")
+            if decoded.isdigit() and len(decoded) >= 15:
+                return decoded
+        except Exception:
+            pass
+
+    return None
+
+
+def generate_discord_invite_url(client_id: Optional[str], permissions: int = 2147485696) -> Optional[str]:
+    """
+    Generates standard Discord OAuth2 bot invite URL.
+    Default permissions 2147485696 includes Use Application Commands (2147483648) and Send Messages (2048).
+    """
+    if not client_id:
+        return None
+    return f"https://discord.com/oauth2/authorize?client_id={client_id}&permissions={permissions}&scope=bot%20applications.commands"
+
+
+# ------------------------------------------------------------------------------
 # Bot Tracker Class
 # ------------------------------------------------------------------------------
 class BotTracker:
@@ -61,6 +107,8 @@ class BotTracker:
         self.sync_status: Optional[str] = None
         self.reconnect_attempts: int = 0
         self.last_error_time: Optional[float] = None
+        self.client_id: Optional[str] = extract_discord_client_id()
+        self.invite_url: Optional[str] = generate_discord_invite_url(self.client_id)
 
     def to_dict(self, now: Optional[float] = None) -> dict[str, Any]:
         cur_now = now or time.time()
@@ -82,6 +130,9 @@ class BotTracker:
         else:
             display_user = "Disconnected"
 
+        cid = self.client_id or extract_discord_client_id()
+        inv_url = self.invite_url or generate_discord_invite_url(cid)
+
         return {
             "status": self.status,
             "connected": self.connected,
@@ -93,6 +144,8 @@ class BotTracker:
             "uptime_seconds": uptime_sec,
             "uptime_str": format_duration(uptime_sec),
             "sync_status": self.sync_status,
+            "client_id": cid,
+            "invite_url": inv_url,
         }
 
 
@@ -587,6 +640,8 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
     # Extract status tracker if attached to bot or read from active instance state file
     bot_tracker = getattr(bot, "tracker", None) if bot else None
     sync_status = None
+    bot_client_id = None
+    bot_invite_url = None
 
     state_file = "/tmp/ubagen_bot_state.json"
     if not bot_tracker and os.path.exists(state_file):
@@ -605,6 +660,8 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
                     bot_diag_msg = cached_dict.get("diagnostic_message", "")
                     bot_uptime_sec = cached_dict.get("uptime_seconds")
                     sync_status = cached_dict.get("sync_status")
+                    bot_client_id = cached_dict.get("client_id")
+                    bot_invite_url = cached_dict.get("invite_url")
                     bot_tracker = "cached"
         except Exception as e:
             logger.debug("Failed reading state file: %s", e)
@@ -620,6 +677,8 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
         bot_diag_msg = bot_dict["diagnostic_message"]
         bot_uptime_sec = bot_dict["uptime_seconds"]
         sync_status = bot_dict["sync_status"]
+        bot_client_id = bot_dict.get("client_id")
+        bot_invite_url = bot_dict.get("invite_url")
     elif bot_tracker != "cached":
         is_ready = bool(bot and hasattr(bot, "is_ready") and bot.is_ready())
         is_connected = is_ready
@@ -645,6 +704,11 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             bot_status_str = "not_configured"
             bot_diag_msg = "DISCORD_BOT_TOKEN is not configured. Web monitor is active."
         guild_count = len(bot.guilds) if (is_ready and bot and getattr(bot, "guilds", None)) else 0
+
+    if not bot_client_id:
+        bot_client_id = extract_discord_client_id(bot)
+    if not bot_invite_url and bot_client_id:
+        bot_invite_url = generate_discord_invite_url(bot_client_id)
 
     # 2. CPU Metrics
     cpu_usage_pct = _CPU_SAMPLER.get_percent()
@@ -757,6 +821,9 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             "guild_count": guild_count,
             "uptime_seconds": bot_uptime_sec,
             "uptime_str": format_duration(bot_uptime_sec),
+            "sync_status": sync_status,
+            "client_id": bot_client_id,
+            "invite_url": bot_invite_url,
         },
         "compute": {
             "cpu_usage_pct": cpu_usage_pct,
@@ -847,12 +914,16 @@ def build_stats_embed(stats: dict[str, Any]) -> Any:
             f"**Guilds:** {bot_info['guild_count']} server(s) connected",
             f"**Backend Uptime:** {compute['backend_uptime_str']}",
         ]
+        if bot_info.get("invite_url"):
+            bot_status_lines.append(f"**Invite Bot:** [Add to Discord Server]({bot_info['invite_url']})")
     else:
         bot_status_lines = [
             f"**Status:** 🔴 {bot_info['status'].replace('_', ' ').title()}",
             f"**Diagnostic:** {bot_info['diagnostic_message']}",
             f"**Backend Uptime:** {compute['backend_uptime_str']}",
         ]
+        if bot_info.get("invite_url"):
+            bot_status_lines.append(f"**Invite Bot:** [Add to Discord Server]({bot_info['invite_url']})")
     embed.add_field(
         name="🤖 Bot Gateway Connection",
         value="\n".join(bot_status_lines),
