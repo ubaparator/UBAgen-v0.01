@@ -179,6 +179,7 @@ if commands is not None:
             # Keep global registration too, so commands also propagate to future servers.
             if not self._guild_commands_synced:
                 synced_guilds = 0
+                global_sync_succeeded = False
                 for guild in list(self.guilds):
                     try:
                         self.tree.copy_global_to(guild=guild)
@@ -188,6 +189,7 @@ if commands is not None:
                         logger.warning("Could not sync commands to guild %s: %s", guild.id, type(exc).__name__)
                 try:
                     global_commands = await self.tree.sync()
+                    global_sync_succeeded = True
                     logger.info(
                         "Slash commands synced globally (%d) and to %d current guild(s).",
                         len(global_commands),
@@ -199,7 +201,9 @@ if commands is not None:
                 except Exception as exc:
                     logger.warning("Global command sync from on_ready failed: %s", type(exc).__name__)
                     self.tracker.sync_status = f"Command sync warning: {type(exc).__name__}"
-                self._guild_commands_synced = True
+                # Only mark sync complete after Discord confirms the global sync.
+                # If it failed, a later gateway READY event can retry registration.
+                self._guild_commands_synced = global_sync_succeeded
                 self.write_state_file()
 
             if self.user:
