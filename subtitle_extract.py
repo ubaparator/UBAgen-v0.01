@@ -16,7 +16,7 @@ except ImportError:
     discord = None
 
 logger = logging.getLogger("ubagen.subtitles")
-MAX_INPUT = 100 * 1024 * 1024
+MAX_INPUT = 1_500_000_000  # 1.5 GB (decimal)
 MAX_OUTPUT = 8 * 1024 * 1024
 DOWNLOAD_TIMEOUT = 600
 VIDEO_SUFFIXES = {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm", ".ts", ".m2ts"}
@@ -79,7 +79,7 @@ def register_subtitle_extract_command(tree):
         description="Videodan veya magnet indirmesinden seçilen dildeki altyazıyı çıkarır.",
     )
     @discord.app_commands.describe(
-        video="İstersen doğrudan video dosyası yükle (en fazla 100 MB)",
+        video="İstersen doğrudan video dosyası yükle (en fazla 1.5 GB; Discord yükleme sınırına tabidir)",
         magnet_uri="İsteğe bağlı magnet bağlantısı; torrent içindeki videoyu indirir",
         dil="Altyazı dili kodu (varsayılan: tur)",
         altyazi_sirasi="Video dosyasında akış seçimi; 0 ilk altyazı akışıdır (yalnızca video yüklerken)",
@@ -105,7 +105,7 @@ def register_subtitle_extract_command(tree):
                 await interaction.response.send_message("Desteklenmeyen video dosyası.", ephemeral=True)
                 return
             if not 0 < video.size <= MAX_INPUT:
-                await interaction.response.send_message("Video boş olamaz ve en fazla 100 MB olabilir.", ephemeral=True)
+                await interaction.response.send_message("Video boş olamaz ve en fazla 1.5 GB olabilir. Discord hesabının yükleme sınırı daha düşükse dosyayı doğrudan yükleyemezsin; magnet_uri kullan.", ephemeral=True)
                 return
         lang = (dil or "tur").strip().lower()
         if not re.fullmatch(r"[a-z0-9]{2,3}", lang):
@@ -218,6 +218,7 @@ def register_subtitle_extract_command(tree):
                 await interaction.followup.send(
                     f"Altyazı çıkarıldı: {selected.name} (hedef dil: {lang}; akış kodu: {codec or 'bilinmiyor'}).",
                     file=discord.File(str(output), filename=filename),
+                    delete_after=360,
                 )
         except subprocess.TimeoutExpired:
             await interaction.followup.send("İşlem zaman aşımına uğradı. Daha küçük bir torrent/video dene.")

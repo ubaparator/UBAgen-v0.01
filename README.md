@@ -123,8 +123,17 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 
 3. Open `http://localhost:3000` in your browser to view the live dashboard.
 
-### Automatic redeploy after GitHub updates
+### Google AI Studio Run, GitHub sync, and publishing
 
-The repository includes a GitHub Actions workflow that validates the Python source and builds the frontend on pushes and pull requests. To trigger a real redeploy/restart after each push to `main`, configure a repository Actions secret named `DEPLOY_WEBHOOK_URL` with the deployment provider's deploy-hook URL. Optionally set the repository Actions variable `DEPLOY_WEBHOOK_METHOD` to `GET` or `POST` if the provider requires a specific HTTP method (defaults to `POST`). The workflow sends the hook only after a successful validation run on `main`; without this provider URL, GitHub can validate the code but cannot restart an external running service by itself.
+This project is designed to run as a full-stack AI Studio app in development mode: `npm run dev` starts `server.ts`; Express starts the Vite dashboard and spawns `python3 main.py` as a companion worker. That Python process registers the Discord slash commands, runs the Discord gateway client when `DISCORD_BOT_TOKEN` is configured, and serves its internal FastAPI endpoints on port 5050.
 
-On every process start, `main.py` registers the bot's slash commands and syncs them with Discord. Guild-scoped commands are attempted for servers the bot has joined; global commands are also synced. Global Discord command propagation can take up to an hour. The bot must be invited with the `applications.commands` scope.
+**A GitHub commit alone does not guarantee that an already-running AI Studio Run session or the published `*.ai.studio` app has loaded the new code.** After external commits or merging a pull request:
+
+1. Open the same app in Google AI Studio Build mode.
+2. Open **Settings → GitHub** and use the repository sync/pull action to bring the latest repository changes into the AI Studio project. Review/resolve any conflicts before proceeding.
+3. Run the app again in AI Studio to test the current source.
+4. To update the public `https://your-app.ai.studio` URL, use **Publish/Republish** in AI Studio. AI Studio's published apps are deployed through its managed Cloud Run integration; publishing is separate from the GitHub Actions CI workflow.
+
+GitHub Actions validates the code and builds the frontend/Docker image. It does not stop or restart the AI Studio Run session and does not publish the AI Studio app. Do not configure a fictitious `DEPLOY_WEBHOOK_URL` for this workflow.
+
+On every process start, `main.py` registers the bot's slash commands and syncs them with Discord. Guild-scoped copies are attempted for servers the bot has joined; global commands are also synced. Global Discord command propagation can take up to an hour. The bot must be invited with the `applications.commands` scope.

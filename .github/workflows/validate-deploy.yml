@@ -50,23 +50,3 @@ jobs:
       - name: Build production Docker image
         run: docker build --tag ubagen-ci-test .
 
-  deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger hosting provider deploy hook
-        env:
-          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
-          DEPLOY_WEBHOOK_METHOD: ${{ vars.DEPLOY_WEBHOOK_METHOD }}
-        run: |
-          if [ -z "$DEPLOY_WEBHOOK_URL" ]; then
-            echo "::notice::DEPLOY_WEBHOOK_URL is not configured; validation passed, but no external service was restarted."
-            exit 0
-          fi
-          METHOD="${DEPLOY_WEBHOOK_METHOD:-POST}"
-          case "$METHOD" in
-            GET|POST) ;;
-            *) echo "DEPLOY_WEBHOOK_METHOD must be GET or POST"; exit 1 ;;
-          esac
-          curl --fail --silent --show-error --max-time 30 -X "$METHOD" "$DEPLOY_WEBHOOK_URL"
