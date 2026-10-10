@@ -13,6 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 let pythonWorkerProcess: ChildProcess | null = null;
+let statsCache: { expiresAt: number; data: unknown } | null = null;
 
 function ensurePythonWorker() {
   if (pythonWorkerProcess) return;
@@ -77,20 +78,30 @@ async function startServer() {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     res.setHeader('Pragma', 'no-cache');
 
+    // Share a short-lived snapshot between dashboard polls to avoid repeated subprocess work.
+    if (statsCache && Date.now() < statsCache.expiresAt) {
+      return res.json(statsCache.data);
+    }
+
     // 1. If an upstream Python service is running on BACKEND_URL or http://127.0.0.1:5050, query it
     const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 1200);
-      const upstreamRes = await fetch(`${standaloneBackendUrl}/api/stats`, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
-      clearTimeout(timeout);
+      let upstreamRes: Response;
+      try {
+        upstreamRes = await fetch(`${standaloneBackendUrl}/api/stats`, {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
 
       const contentType = upstreamRes.headers.get('content-type') || '';
       if (upstreamRes.ok && contentType.includes('application/json')) {
         const data = await upstreamRes.json();
+        statsCache = { expiresAt: Date.now() + 3000, data };
         return res.json(data);
       }
     } catch {
@@ -103,6 +114,7 @@ async function startServer() {
       if (!error && stdout) {
         try {
           const stats = JSON.parse(stdout);
+          statsCache = { expiresAt: Date.now() + 3000, data: stats };
           return res.json(stats);
         } catch (parseError) {
           console.error('Failed to parse stats.py output:', parseError, stdout);
