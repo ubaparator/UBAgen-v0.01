@@ -130,11 +130,21 @@ export default function App() {
           cache: 'no-store',
         });
 
+        const contentType = response.headers.get('content-type') || '';
+        const rawText = await response.text();
+
+        // Guard against HTML warmup pages, proxy 502/504 pages, or non-JSON responses
+        if (!contentType.includes('application/json') || rawText.trim().startsWith('<')) {
+          console.warn('Backend returned HTML (warming up). Retrying in next polling cycle...');
+          setError('Backend is initializing or warming up... Connecting in 2s');
+          return;
+        }
+
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
 
-        const data: StatsResponse = await response.json();
+        const data: StatsResponse = JSON.parse(rawText);
         setStats(data);
         setError(null);
         setLastUpdated(new Date());
