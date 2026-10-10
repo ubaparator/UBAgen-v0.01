@@ -56,6 +56,7 @@ function degradedStats(reason: string) {
   return {
     status: 'degraded',
     timestamp: new Date().toISOString(),
+    epoch_time: Date.now() / 1000,
     diagnostic_message: reason,
     bot: { status: 'unavailable', connected: false, is_ready: false,
       diagnostic_message: 'Bot statistics are temporarily unavailable.', latency_ms: null,
