@@ -263,7 +263,18 @@ export default function App() {
 
     setRestartingBot(true);
     try {
-      const response = await fetch('/api/admin/restart-bot', {
+      // Use the configured backend host when the dashboard is hosted separately.
+      // endpointUrl may be a full URL ending in /api/stats or a same-origin path.
+      let restartUrl = '/api/admin/restart-bot';
+      try {
+        if (endpointUrl.startsWith('http://') || endpointUrl.startsWith('https://')) {
+          restartUrl = new URL('/api/admin/restart-bot', endpointUrl).toString();
+        }
+      } catch {
+        throw new Error('Backend Host URL is invalid. Check the connection settings.');
+      }
+
+      const response = await fetch(restartUrl, {
         method: 'POST',
         headers: {
           Accept: 'application/json',
