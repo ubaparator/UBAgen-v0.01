@@ -34,6 +34,7 @@ def _degraded_stats(reason: str) -> dict[str, Any]:
     return {
         "status": "degraded",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "epoch_time": time.time(),
         "diagnostic_message": reason,
         "bot": {
             "status": "unavailable", "connected": False, "is_ready": False,
