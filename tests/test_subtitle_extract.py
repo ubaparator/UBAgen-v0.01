@@ -3,10 +3,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from subtitle_extract import clean_srt_file, subtitle_format
+from subtitle_extract import MAX_INPUT, clean_srt_file, subtitle_format
 
 
 class SubtitleFormatTests(unittest.TestCase):
+    def test_upload_limit_is_1_5_gb_decimal(self):
+        self.assertEqual(MAX_INPUT, 1_500_000_000)
+
     def test_ass_and_ssa_preserve_ass_format(self):
         self.assertEqual(subtitle_format("ass"), (".ass", "ass"))
         self.assertEqual(subtitle_format("SSA"), (".ass", "ass"))
