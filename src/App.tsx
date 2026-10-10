@@ -152,7 +152,7 @@ export default function App() {
   const effectiveClientId =
     stats?.bot?.client_id ||
     customClientId.trim() ||
-    '1558545306046701599';
+    '';
 
   const getInviteUrlWithPerms = (preset: 'recommended' | 'admin' | 'basic') => {
     if (!effectiveClientId) return null;
@@ -332,12 +332,12 @@ export default function App() {
                 ? 'bg-amber-500/10 text-amber-300 border-amber-500/30 hover:bg-amber-500/20'
                 : 'bg-slate-800/80 text-slate-300 border-slate-700/60 hover:bg-slate-800 hover:text-white'
             }`}
-            title={isPaused ? 'Resume 2-second live refresh' : 'Pause live auto-refresh'}
+            title={isPaused ? 'Resume 5-second live refresh' : 'Pause live auto-refresh'}
           >
             {isPaused ? (
               <>
                 <Play className="w-3.5 h-3.5 fill-current" />
-                <span>Resume (2s)</span>
+                <span>Resume (5s)</span>
               </>
             ) : (
               <>
@@ -496,7 +496,7 @@ export default function App() {
             {stats?.bot?.connected ? (
               <span className="flex items-center gap-1 text-emerald-400 font-semibold">
                 <CheckCircle2 className="w-3.5 h-3.5" />
-                Connected ({stats.bot.latency_ms ?? 0} ms)
+                Connected ({stats.bot.latency_ms !== null ? `${stats.bot.latency_ms} ms` : 'Unavailable'})
               </span>
             ) : stats?.bot?.status === 'invalid_token' ? (
               <span className="flex items-center gap-1 text-rose-400 font-semibold" title="Authentication failed: verify DISCORD_BOT_TOKEN">
