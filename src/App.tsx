@@ -188,27 +188,40 @@ export default function App() {
     async (isManual: boolean = false) => {
       if (isManual) setRefreshing(true);
       try {
-        const response = await fetch(endpointUrl, {
-          headers: {
-            Accept: 'application/json',
-          },
-          cache: 'no-store',
-        });
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        // Try the configured endpoint first, then same-origin aliases. This also
+        // recovers users who have an obsolete custom endpoint saved in localStorage.
+        const candidates = [...new Set([endpointUrl, '/api/stats', '/stats'])];
+        let lastFailure: Error | null = null;
+        for (const candidate of candidates) {
+          try {
+            const response = await fetch(candidate, {
+              headers: { Accept: 'application/json' },
+              cache: 'no-store',
+            });
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            const data: StatsResponse = await response.json();
+            if (!data || typeof data !== 'object' || !data.status) {
+              throw new Error('Invalid statistics response from backend.');
+            }
+            setStats(data);
+            setError(null);
+            setLastUpdated(new Date());
+            return;
+          } catch (candidateError: any) {
+            lastFailure = candidateError instanceof Error
+              ? candidateError
+              : new Error('Statistics endpoint unavailable.');
+          }
         }
 
-        const data: StatsResponse = await response.json();
-        setStats(data);
-        setError(null);
-        setLastUpdated(new Date());
-      } catch (err: any) {
-        console.error('Failed to fetch backend statistics:', err);
-        setError(
-          err?.message ||
-            'Unable to connect to UBAgen backend. Please verify the backend is running.'
-        );
+        // Preserve the last good snapshot instead of blanking the dashboard.
+        console.error('Failed to fetch backend statistics:', lastFailure);
+        setError((current) => current || (
+          lastFailure?.message ||
+          'Unable to connect to UBAgen backend. Please verify the backend is running.'
+        ));
       } finally {
         setLoading(false);
         if (isManual) setRefreshing(false);
