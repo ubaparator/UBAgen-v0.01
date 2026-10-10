@@ -6,7 +6,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import discord
+try:
+    import discord
+except ImportError:
+    discord = None
 
 logger = logging.getLogger("ubagen.subtitles")
 MAX_INPUT = 100 * 1024 * 1024
@@ -19,6 +22,9 @@ def _run(args, timeout):
 
 
 def register_subtitle_extract_command(tree):
+    if discord is None or tree is None:
+        logger.warning("discord.py unavailable; /altyazi_ayikla was not registered.")
+        return
     if tree.get_command("altyazi_ayikla") is not None:
         return
 
