@@ -1,0 +1,6 @@
+{
+  "name": "UBAgen Discord Bot Backend",
+  "description": "Production backend infrastructure for the UBAgen Discord bot, featuring the /stats diagnostic slash command, FastAPI health checks, and Docker support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
