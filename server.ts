@@ -8,12 +8,14 @@ import { createServer as createViteServer } from 'vite';
 import { execFile, spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { timingSafeEqual } from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 let pythonWorkerProcess: ChildProcess | null = null;
 let statsCache: { expiresAt: number; data: unknown } | null = null;
+let lastBotRestartAt = 0;
 
 function ensurePythonWorker() {
   if (pythonWorkerProcess) return;
@@ -96,12 +98,50 @@ async function startServer() {
   // Enable CORS
   app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     if (req.method === 'OPTIONS') {
       return res.sendStatus(200);
     }
     next();
+  });
+
+  // POST /api/admin/restart-bot: authenticated restart of the Python Discord worker.
+  // Configure UBAGEN_ADMIN_TOKEN in the host's server-side secrets; never put it in frontend code.
+  app.post('/api/admin/restart-bot', (req, res) => {
+    const expectedToken = process.env.UBAGEN_ADMIN_TOKEN || '';
+    if (!expectedToken) {
+      return res.status(503).json({ error: 'Bot restart is disabled: UBAGEN_ADMIN_TOKEN is not configured on the server.' });
+    }
+
+    const authorization = req.header('authorization') || '';
+    const suppliedToken = authorization.match(/^Bearer\\s+(.+)$/i)?.[1] || '';
+    const supplied = Buffer.from(suppliedToken);
+    const expected = Buffer.from(expectedToken);
+    const tokenMatches = supplied.length === expected.length && timingSafeEqual(supplied, expected);
+    if (!tokenMatches) {
+      return res.status(401).json({ error: 'Unauthorized. The admin token is missing or invalid.' });
+    }
+
+    const now = Date.now();
+    if (now - lastBotRestartAt < 15000) {
+      return res.status(429).json({ error: 'A bot restart was requested recently. Wait 15 seconds before trying again.' });
+    }
+    if (!pythonWorkerProcess || pythonWorkerProcess.killed) {
+      return res.status(503).json({ error: 'The bot worker is not currently available to restart.' });
+    }
+
+    lastBotRestartAt = now;
+    statsCache = null;
+    const worker = pythonWorkerProcess;
+    const sent = worker.kill('SIGTERM');
+    if (!sent) {
+      lastBotRestartAt = 0;
+      return res.status(500).json({ error: 'Could not send the restart signal to the bot worker.' });
+    }
+
+    // The existing worker exit handler starts a fresh Python process after 3 seconds.
+    return res.status(202).json({ status: 'restarting', message: 'Bot restart requested. The worker should reconnect shortly.' });
   });
 
   // GET /api/stats: Fetches live hardware metrics from backend
