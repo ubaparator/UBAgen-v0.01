@@ -17,3 +17,4 @@ dist/
 !.env.example
 .github
 tests/
+download_temp/

@@ -4,7 +4,9 @@ Production-ready backend and live hardware monitoring dashboard for the **UBAgen
 
 Provides real-time host and container telemetry through:
 1. **Live Web Dashboard** (`UBAgen — System Monitor`) polling `GET /api/stats` every 2 seconds with pause/resume and manual refresh.
-2. **Discord Slash Command** (`/stats`) returning a rich diagnostic embed to any Discord server without blocking the event loop.
+2. **Discord Slash Commands**:
+   - `/stats` returning a rich diagnostic embed to any Discord server without blocking the event loop.
+   - `/altyazı_ayıklama` (`magnet`, `dil`) downloading torrents via `aria2c` into an isolated `download_temp` workspace and extracting/cleaning embedded `.srt`/`.ass` subtitles via `ffprobe`/`ffmpeg`.
 3. **HTTP Health Probes** (`GET /health`) for container orchestrators (Render, Railway, Fly.io, Cloud Run, Docker).
 
 ---
@@ -64,15 +66,16 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 
 | Variable | Required | Default | Purpose |
 | :--- | :---: | :---: | :--- |
-| `DISCORD_BOT_TOKEN` | Optional | *Empty* | Your bot token from the Discord Developer Portal. If left empty, UBAgen runs in web-only monitoring mode. |
-| `UBAGEN_ADMIN_TOKEN` | Optional | *Empty* | Private bearer token required by the dashboard's authenticated Discord bot restart button. Keep it in host-side Secrets only. |
+| `DISCORD_BOT_TOKEN` | Optional (Required for Bot) | *Empty* | Server-side Discord Bot token from the Discord Developer Portal. If left empty, UBAgen runs in web-only monitoring mode. Never expose in client/frontend code. |
+| `UBAGEN_ADMIN_TOKEN` | Required for Bot Restart | *Empty* | Server-side private bearer token required by `POST /api/admin/restart-bot` (used by the dashboard's **Restart Bot** button). Must be configured only in server-side Secrets/environment; never put it in `VITE_*` variables, frontend source code, or `HOST`. |
 | `DISCORD_GUILD_ID` | Optional | *Empty* | Your Discord Server (Guild) ID for **instant** slash command registration during testing. If omitted, global sync is used. |
-| `PORT` | Optional | `8080` (or `3000`) | HTTP server port. Injected automatically by hosting platforms. |
-| `HOST` | Optional | `0.0.0.0` | Network binding interface. |
+| `PORT` | Optional | `8080` (or `3000` in Node dev) | Primary HTTP server port. Injected automatically by cloud hosting platforms and used by `Dockerfile` (`8080`). |
+| `UBAGEN_HTTP_PORT` | Optional | *Empty* (falls back to `PORT`) | Optional port override for the Python FastAPI server (set to `5050` automatically when `server.ts` spawns `main.py` as a companion worker). |
+| `HOST` | Optional | `0.0.0.0` | Network bind interface address (e.g. `0.0.0.0` or `127.0.0.1`). **Do not** place admin tokens or URLs in `HOST`. |
 | `ENVIRONMENT` | Optional | `production` | Informational label displayed in logs and monitoring cards. |
 | `GOOGLE_DRIVE_CREDENTIALS` | Optional | *Empty* | Optional Google Drive credentials JSON or file path (tested safely without leaking contents). |
 
-> 🔒 **Security Notice**: Never commit secret tokens or `.env` files to Git. Set them securely through your hosting platform's web dashboard or secret manager.
+> 🔒 **Security Notice**: Never commit secret tokens or `.env` files to Git, and never place `UBAGEN_ADMIN_TOKEN` or `DISCORD_BOT_TOKEN` in client-exposed `VITE_*` environment variables. Set them securely through your hosting platform's server-side secret manager.
 
 ---
 
@@ -83,7 +86,11 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
   Headers: `Cache-Control: no-store, no-cache, max-age=0`.
 - **`GET /health`**:
   Returns lightweight JSON status (`{"status":"healthy","service":"ubagen-backend","http":"alive","discord_bot":{...}}`) for container health checks.
-- **`POST /api/admin/restart-bot`**: Restarts only the Python Discord worker (the dashboard stays online). Requires `Authorization: Bearer <UBAGEN_ADMIN_TOKEN>`, returns `401` for invalid tokens, `503` when not configured/unavailable, and rate-limits repeated requests. The host automatically starts a fresh worker after the old one exits.
+- **`POST /api/admin/restart-bot`**:
+  Supported identically in both the **Python/FastAPI** (`health_api.py` / `main.py` Docker deployment) and **Node/Express** (`server.ts` full-stack) runtime paths.
+  - Requires `Authorization: Bearer <UBAGEN_ADMIN_TOKEN>` (validated using constant-time comparison).
+  - Returns `503` when `UBAGEN_ADMIN_TOKEN` or `DISCORD_BOT_TOKEN` is not configured, `401` when the Bearer token is missing or invalid, `405` for non-POST HTTP methods, `429` when rate-limited (15s cooldown / concurrency lock), and `202` (`{"status":"restarting","message":"..."}`) when accepted.
+  - Cleanly closes the current Discord gateway client, recreates the bot instance, re-registers slash commands and event handlers, and reconnects using `DISCORD_BOT_TOKEN` while keeping the FastAPI/Express HTTP monitoring server (`/api/stats`, `/health`) online without interruption.
 
 ---
 

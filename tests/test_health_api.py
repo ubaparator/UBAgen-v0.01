@@ -71,6 +71,53 @@ class HealthApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(body["discord_bot"]["connected"])
         self.assertFalse(body["discord_bot"]["ready"])
 
+    async def test_restart_bot_returns_503_when_admin_token_not_configured(self):
+        app = create_health_app()
+        with patch.dict("os.environ", {"UBAGEN_ADMIN_TOKEN": "", "HOST": "0.0.0.0"}, clear=False):
+            response = await endpoint_for(app, "/api/admin/restart-bot")(
+                authorization="Bearer 0.0.0.0"
+            )
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("UBAGEN_ADMIN_TOKEN", body["error"])
+
+    async def test_restart_bot_rejects_missing_or_invalid_bearer_token_with_401(self):
+        secret = "super-secret-admin-token-999"
+        app = create_health_app()
+        with patch.dict(
+            "os.environ",
+            {"UBAGEN_ADMIN_TOKEN": secret, "DISCORD_BOT_TOKEN": "MTIzNDU2Nzg5MDEyMzQ1Njc4.Ga.bc"},
+            clear=False,
+        ):
+            missing_res = await endpoint_for(app, "/api/admin/restart-bot")(authorization=None)
+            wrong_res = await endpoint_for(app, "/api/admin/restart-bot")(
+                authorization="Bearer wrong-token"
+            )
+            malformed_res = await endpoint_for(app, "/api/admin/restart-bot")(
+                authorization=f"Basic {secret}"
+            )
+
+        for res in (missing_res, wrong_res, malformed_res):
+            self.assertEqual(res.status_code, 401)
+            payload = json.loads(res.body)
+            self.assertIn("Unauthorized", payload["error"])
+            self.assertNotIn(secret, json.dumps(payload))
+
+    async def test_restart_bot_rejects_disallowed_http_methods_with_405(self):
+        app = create_health_app()
+
+        class DummyRequest:
+            def __init__(self, method: str):
+                self.method = method
+                self.headers = {"authorization": "Bearer any"}
+
+        for bad_method in ("GET", "PUT", "DELETE", "PATCH"):
+            res = await endpoint_for(app, "/api/admin/restart-bot")(
+                request=DummyRequest(bad_method)
+            )
+            self.assertEqual(res.status_code, 405)
+            self.assertIn("POST", res.headers.get("allow", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

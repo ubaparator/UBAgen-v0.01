@@ -466,6 +466,42 @@ def check_environment_variables() -> list[dict[str, str]]:
             "type": "Required for Bot",
         })
 
+    admin_token = os.getenv("UBAGEN_ADMIN_TOKEN", "").strip()
+    if admin_token:
+        results.append({
+            "name": "UBAGEN_ADMIN_TOKEN",
+            "status": "Configured (Bot Restart Enabled)",
+            "indicator": "✅",
+            "type": "Admin Security",
+        })
+    else:
+        results.append({
+            "name": "UBAGEN_ADMIN_TOKEN",
+            "status": "Not configured (Bot Restart Disabled)",
+            "indicator": "⚪",
+            "type": "Admin Security",
+        })
+
+    host_val = os.getenv("HOST", "").strip()
+    if host_val:
+        is_valid_host = (
+            host_val in ("0.0.0.0", "127.0.0.1", "localhost", "::", "::1")
+            or (" " not in host_val and "://" not in host_val and "/" not in host_val and len(host_val) <= 64)
+        )
+        results.append({
+            "name": "HOST",
+            "status": f"{host_val} (Bind Interface)" if is_valid_host else "Invalid Bind Host (Fallback: 0.0.0.0)",
+            "indicator": "✅" if is_valid_host else "⚠️",
+            "type": "HTTP Server",
+        })
+    else:
+        results.append({
+            "name": "HOST",
+            "status": "0.0.0.0 (Default Bind Interface)",
+            "indicator": "⚪",
+            "type": "HTTP Server",
+        })
+
     port = os.getenv("PORT", "").strip()
     if port:
         results.append({

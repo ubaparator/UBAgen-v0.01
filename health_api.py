@@ -14,12 +14,15 @@ Configured with CORS support and zero secret leakage.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
+import hmac
+import logging
 import os
 import time
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +30,30 @@ from fastapi.staticfiles import StaticFiles
 from stats import collect_all_stats
 
 SERVICE_START_TIME = time.time()
+logger = logging.getLogger("ubagen.health")
+
+
+def verify_admin_token(authorization_header: Optional[str], expected_token: str) -> bool:
+    """
+    Validate 'Authorization: Bearer <token>' against expected_token using constant-time comparison.
+    Never logs or exposes tokens.
+    """
+    clean_expected = (expected_token or "").strip()
+    if not clean_expected or not authorization_header:
+        return False
+
+    parts = authorization_header.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return False
+
+    supplied_token = parts[1].strip()
+    if not supplied_token:
+        return False
+
+    return hmac.compare_digest(
+        supplied_token.encode("utf-8"),
+        clean_expected.encode("utf-8"),
+    )
 
 
 def _degraded_stats(reason: str) -> dict[str, Any]:
@@ -74,10 +101,14 @@ def _degraded_stats(reason: str) -> dict[str, Any]:
     }
 
 
-def create_health_app(bot: Any = None) -> FastAPI:
+def create_health_app(
+    bot: Any = None,
+    bot_manager: Any = None,
+    restart_cooldown_seconds: float = 15.0,
+) -> FastAPI:
     """
     Factory creating the FastAPI application.
-    Mounts CORS, /health, /api/stats, and static files when present.
+    Mounts CORS, /health, /api/stats, /api/admin/restart-bot, and static files when present.
     """
     app = FastAPI(
         title="UBAgen System Monitor & Health API",
@@ -92,13 +123,148 @@ def create_health_app(bot: Any = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=False,
-        allow_methods=["GET", "OPTIONS"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization", "*"],
     )
 
-    # Store bot instance and last valid snapshot in application state.
+    # Store bot instance, lifecycle manager, and rate-limiting state in application state.
     app.state.bot = bot
+    app.state.bot_manager = bot_manager
     app.state.last_stats = None
+    app.state.restart_lock = asyncio.Lock()
+    app.state.is_restarting = False
+    app.state.last_restart_at = 0.0
+    app.state.restart_cooldown_seconds = restart_cooldown_seconds
+    app.state.restart_bot = None
+
+    if bot_manager is not None and hasattr(bot_manager, "attach_health_app"):
+        bot_manager.attach_health_app(app)
+
+    async def _fallback_restart_bot() -> tuple[int, dict[str, Any]]:
+        """Fallback in-process restart handler when create_health_app is used without BotLifecycleManager."""
+        cooldown = float(getattr(app.state, "restart_cooldown_seconds", 15.0))
+        if getattr(app.state, "is_restarting", False) or app.state.restart_lock.locked():
+            retry_after = max(1, int(round(cooldown)))
+            return 429, {
+                "error": f"A bot restart is already in progress. Wait {retry_after} seconds before trying again.",
+                "retry_after": retry_after,
+            }
+
+        now = time.monotonic()
+        last_at = float(getattr(app.state, "last_restart_at", 0.0))
+        if last_at > 0 and (now - last_at) < cooldown:
+            remaining = max(1, int(round(cooldown - (now - last_at))))
+            return 429, {
+                "error": f"A bot restart was requested recently. Wait {remaining} seconds before trying again.",
+                "retry_after": remaining,
+            }
+
+        current_bot = getattr(app.state, "bot", None)
+        bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+        token_configured = bool(bot_token) and bot_token not in (
+            "your_discord_bot_token_here",
+            "MY_DISCORD_BOT_TOKEN",
+            "CHANGE_ME",
+        )
+        if current_bot is None and not token_configured:
+            return 503, {
+                "error": "Cannot restart Discord bot: DISCORD_BOT_TOKEN is not configured on the server.",
+            }
+
+        async with app.state.restart_lock:
+            now = time.monotonic()
+            last_at = float(getattr(app.state, "last_restart_at", 0.0))
+            if last_at > 0 and (now - last_at) < cooldown:
+                remaining = max(1, int(round(cooldown - (now - last_at))))
+                return 429, {
+                    "error": f"A bot restart was requested recently. Wait {remaining} seconds before trying again.",
+                    "retry_after": remaining,
+                }
+
+            app.state.is_restarting = True
+            try:
+                if current_bot is not None:
+                    tracker = getattr(current_bot, "tracker", None)
+                    if tracker is not None:
+                        tracker.connected = False
+                        tracker.is_ready = False
+                        tracker.status = "connecting"
+                        tracker.diagnostic_message = "Bot restart requested. Reconnecting to Discord Gateway..."
+                    if hasattr(current_bot, "close") and callable(current_bot.close):
+                        res = current_bot.close()
+                        if asyncio.iscoroutine(res):
+                            await asyncio.wait_for(res, timeout=5.0)
+                    if hasattr(current_bot, "restart") and callable(current_bot.restart):
+                        res = current_bot.restart()
+                        if asyncio.iscoroutine(res):
+                            await res
+
+                app.state.last_stats = None
+                app.state.last_restart_at = time.monotonic()
+                return 202, {
+                    "status": "restarting",
+                    "message": "Bot restart requested. The worker should reconnect shortly.",
+                }
+            except Exception as exc:
+                logger.exception("Error while restarting Discord bot (%s).", type(exc).__name__)
+                return 500, {
+                    "error": "Could not restart the Discord bot due to an internal error.",
+                }
+            finally:
+                app.state.is_restarting = False
+
+    @app.api_route(
+        "/api/admin/restart-bot",
+        methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
+        summary="Authenticated Discord Bot Restart",
+    )
+    async def restart_bot_api(
+        request: Request = None,
+        authorization: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """
+        Authenticated endpoint to restart the Discord bot connection in-process without
+        stopping the FastAPI web monitor.
+        Requires 'Authorization: Bearer <UBAGEN_ADMIN_TOKEN>'.
+        """
+        method = request.method.upper() if (request is not None and getattr(request, "method", None)) else "POST"
+        if method != "POST":
+            return JSONResponse(
+                content={"error": "Method not allowed. Use POST /api/admin/restart-bot."},
+                status_code=405,
+                headers={"Allow": "POST, OPTIONS", "Cache-Control": "no-store"},
+            )
+
+        # UBAGEN_ADMIN_TOKEN is strictly required on the server; never fall back to HOST or other vars.
+        expected_token = os.getenv("UBAGEN_ADMIN_TOKEN", "").strip()
+        if not expected_token:
+            return JSONResponse(
+                content={
+                    "error": "Bot restart is disabled: UBAGEN_ADMIN_TOKEN is not configured on the server."
+                },
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        auth_header: Optional[str] = None
+        if isinstance(authorization, str):
+            auth_header = authorization
+        elif request is not None and hasattr(request, "headers"):
+            auth_header = request.headers.get("authorization")
+
+        if not verify_admin_token(auth_header, expected_token):
+            return JSONResponse(
+                content={"error": "Unauthorized. The admin token is missing or invalid."},
+                status_code=401,
+                headers={"Cache-Control": "no-store", "WWW-Authenticate": "Bearer"},
+            )
+
+        restart_fn = getattr(app.state, "restart_bot", None) or _fallback_restart_bot
+        status_code, payload = await restart_fn()
+        headers = {"Cache-Control": "no-store"}
+        if status_code == 429 and "retry_after" in payload:
+            headers["Retry-After"] = str(payload["retry_after"])
+        return JSONResponse(content=payload, status_code=status_code, headers=headers)
 
     @app.get("/api/stats", summary="Real-time Hardware & Bot Statistics")
     @app.get("/stats", summary="Real-time Hardware & Bot Statistics (Alias)")
@@ -114,8 +280,7 @@ def create_health_app(bot: Any = None) -> FastAPI:
         except Exception as exc:
             # Keep a last known good snapshot if possible; otherwise return a typed
             # degraded payload with HTTP 200 so every frontend can render/retry cleanly.
-            import logging
-            logging.getLogger("ubagen.health").exception("Statistics collection failed")
+            logger.exception("Statistics collection failed")
             stats = getattr(app.state, "last_stats", None) or _degraded_stats(
                 f"Statistics temporarily unavailable ({type(exc).__name__})."
             )

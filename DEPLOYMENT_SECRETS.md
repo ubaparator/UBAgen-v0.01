@@ -2,16 +2,18 @@
 
 Do not commit a real `.env` file or live credentials. This repository is run from Google AI Studio Build mode, and the public `*.ai.studio` URL is published separately from GitHub Actions.
 
-## Required for the live Discord bot
+## Required for the live Discord bot & Restart Bot feature
 
-- `DISCORD_BOT_TOKEN` — the bot token from Discord Developer Portal → Applications → your application → Bot. Add it as a server-side secret in the **same Google AI Studio app's Secrets panel**. Do not put it in browser/frontend code, a commit, the README, or a public issue. The Node server spawns `python3 main.py` and passes its environment to the worker, so the worker can read this variable.
-- If using the local development workflow, put the token in a local `.env` file copied from `.env.example`; keep it untracked.
+- `DISCORD_BOT_TOKEN` — the bot token from Discord Developer Portal → Applications → your application → Bot. Add it as a server-side secret in the **same Google AI Studio app's Secrets panel** (or Docker/Cloud host environment). Do not put it in browser/frontend code, `VITE_*` variables, a commit, the README, or a public issue.
+- `UBAGEN_ADMIN_TOKEN` — strong private bearer token required on the server for `POST /api/admin/restart-bot` (used by the dashboard's **Restart Bot** button). Add it as a server-side secret only. Never place it in `HOST`, frontend source code, or client-side `VITE_*` variables.
+- If using the local development workflow, put these secrets in a local `.env` file copied from `.env.example`; keep it untracked.
 
 ## Optional runtime configuration
 
 - `DISCORD_GUILD_ID` — numeric ID of your test Discord server. Add it to the same AI Studio app's server-side secrets/environment settings if you want faster guild-scoped slash-command sync.
-- `PORT` — provided by the hosting environment in production; Express uses port 3000 in development mode.
-- `HOST` — Python backend defaults to `0.0.0.0`.
+- `PORT` — HTTP server port provided by the hosting environment in production (default `8080` in Docker/FastAPI, `3000` in Node/Express dev mode).
+- `UBAGEN_HTTP_PORT` — optional port override for the Python FastAPI companion server (`5050` when spawned by `server.ts`).
+- `HOST` — network bind interface address (defaults to `0.0.0.0`). Do **not** put admin tokens or URLs into `HOST`.
 - `BACKEND_URL` — only needed if the Node server should query a separate Python backend. In the normal AI Studio Run path, `server.ts` starts its own Python worker on port 5050, so leave this unset.
 
 ## Which system to use

@@ -14,9 +14,10 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     import discord
@@ -262,30 +263,167 @@ else:
 
 
 # ------------------------------------------------------------------------------
+# Configuration & Validation Helpers
+# ------------------------------------------------------------------------------
+def is_placeholder_bot_token(token: Optional[str]) -> bool:
+    """Return True if DISCORD_BOT_TOKEN is empty or a template placeholder."""
+    if not token:
+        return True
+    cleaned = token.strip()
+    return not cleaned or cleaned in (
+        "your_discord_bot_token_here",
+        "MY_DISCORD_BOT_TOKEN",
+        "CHANGE_ME",
+    )
+
+
+def parse_dev_guild_id() -> Optional[int]:
+    """Parse and validate optional test guild ID (Snowflake format: 17-20 digits)."""
+    guild_id_env = os.getenv("DISCORD_GUILD_ID", "").strip()
+    if not guild_id_env:
+        return None
+    if guild_id_env.isdigit() and 17 <= len(guild_id_env) <= 20:
+        try:
+            dev_guild_id = int(guild_id_env)
+            logger.info("Development Guild ID detected: %d (Enabling fast guild command sync)", dev_guild_id)
+            return dev_guild_id
+        except ValueError:
+            return None
+    logger.warning(
+        "Invalid DISCORD_GUILD_ID format ('%s' is not a valid 17-20 digit Snowflake ID). "
+        "Ignoring guild sync and falling back to global sync.",
+        guild_id_env[:4] + "..." if len(guild_id_env) > 4 else guild_id_env,
+    )
+    return None
+
+
+def validate_bind_host(raw_host: Optional[str], port: int = 8080) -> str:
+    """
+    Validate HTTP server bind host.
+    Prevents crashes if a user mistakenly puts an admin token or URL into HOST.
+    Never logs the raw value in case a secret was misconfigured in HOST.
+    """
+    candidate = (raw_host or "").strip()
+    if not candidate:
+        return "0.0.0.0"
+
+    if candidate in ("0.0.0.0", "127.0.0.1", "localhost", "::", "::1"):
+        return candidate
+
+    # Reject values that look like tokens, URLs, or credentials
+    if " " in candidate or "://" in candidate or "/" in candidate or len(candidate) > 64:
+        logger.warning(
+            "Invalid HOST bind address configured. Ensure HOST is a network bind address "
+            "(e.g. '0.0.0.0') and not a token or URL. Use UBAGEN_ADMIN_TOKEN for admin authentication. "
+            "Falling back to '0.0.0.0'."
+        )
+        return "0.0.0.0"
+
+    try:
+        socket.getaddrinfo(candidate, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+        return candidate
+    except OSError:
+        logger.warning(
+            "Configured HOST bind address could not be resolved as a local network interface. "
+            "Falling back to '0.0.0.0'."
+        )
+        return "0.0.0.0"
+
+
+async def _wait_for_any_event(events: list[asyncio.Event], timeout: Optional[float] = None) -> None:
+    """Wait until any of the provided asyncio.Events is set, with an optional timeout."""
+    active_events = [ev for ev in events if ev is not None]
+    if not active_events:
+        if timeout is not None:
+            await asyncio.sleep(timeout)
+        return
+    if any(ev.is_set() for ev in active_events):
+        return
+
+    wait_tasks = [asyncio.create_task(ev.wait()) for ev in active_events]
+    try:
+        done, _ = await asyncio.wait(
+            wait_tasks,
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done and timeout is not None:
+            raise asyncio.TimeoutError()
+    finally:
+        for t in wait_tasks:
+            if not t.done():
+                t.cancel()
+                with suppress(asyncio.CancelledError):
+                    await t
+
+
+# ------------------------------------------------------------------------------
 # Resilient Bot Lifecycle Runner
 # ------------------------------------------------------------------------------
-async def run_discord_bot(bot: Any, token: str, shutdown_event: asyncio.Event) -> None:
+async def run_discord_bot(
+    bot: Any,
+    token: str,
+    shutdown_event: asyncio.Event,
+    stop_event: Optional[asyncio.Event] = None,
+    bot_factory: Optional[Callable[[], Any]] = None,
+    on_bot_replaced: Optional[Callable[[Any], None]] = None,
+    initial_retry_delay: float = 5.0,
+    max_retry_delay: float = 60.0,
+) -> None:
     """
-    Runs the Discord bot lifecycle with resilient error handling and safe diagnostics.
+    Runs the Discord bot lifecycle with resilient error handling, controlled retry, and safe diagnostics.
     Never exposes tokens or logs secrets.
-    Does NOT stop the HTTP monitoring server upon bot error.
+    Does NOT stop the HTTP monitoring server upon bot error or bot restart.
     """
+    def _should_stop() -> bool:
+        return shutdown_event.is_set() or (stop_event is not None and stop_event.is_set())
+
     tracker: BotTracker = getattr(bot, "tracker", None) or BotTracker()
     tracker.status = "connecting"
     tracker.diagnostic_message = "Connecting to Discord Gateway..."
     if hasattr(bot, "write_state_file"):
         bot.write_state_file()
 
-    reconnect_delay = 5.0
-    max_reconnect_delay = 60.0
+    reconnect_delay = initial_retry_delay
+    max_reconnect_delay = max_retry_delay
 
-    while not shutdown_event.is_set():
+    while not _should_stop():
+        # If a previous connection attempt closed the bot client, recreate a fresh bot instance
+        # so slash commands, event handlers, and aiohttp sessions are cleanly reinitialized.
+        if hasattr(bot, "is_closed") and callable(bot.is_closed) and bot.is_closed():
+            if bot_factory is not None:
+                prev_attempts = getattr(tracker, "reconnect_attempts", 0)
+                prev_error_time = getattr(tracker, "last_error_time", None)
+                recreated = bot_factory()
+                if recreated is not None:
+                    bot = recreated
+                    tracker = getattr(bot, "tracker", None) or BotTracker()
+                    tracker.reconnect_attempts = prev_attempts
+                    tracker.last_error_time = prev_error_time
+                    tracker.status = "connecting"
+                    tracker.diagnostic_message = "Reconnecting to Discord Gateway..."
+                    if hasattr(bot, "write_state_file"):
+                        bot.write_state_file()
+                    if on_bot_replaced is not None:
+                        on_bot_replaced(bot)
+            elif hasattr(bot, "clear") and callable(bot.clear):
+                with suppress(Exception):
+                    bot.clear()
+
         try:
             logger.info("Connecting to Discord Gateway...")
             await bot.start(token)
-            # If bot.start returns normally without error (e.g. clean logout)
+            # If bot.start returns normally without error (e.g. clean close during restart/shutdown)
+            break
+        except asyncio.CancelledError:
             break
         except Exception as exc:
+            if _should_stop():
+                break
+
+            tracker.reconnect_attempts = getattr(tracker, "reconnect_attempts", 0) + 1
+            tracker.last_error_time = time.time()
+
             # Check for discord.errors.LoginFailure specifically
             is_login_failure = (
                 (discord is not None and isinstance(exc, discord.errors.LoginFailure))
@@ -308,8 +446,11 @@ async def run_discord_bot(bot: Any, token: str, shutdown_event: asyncio.Event) -
                 )
                 if hasattr(bot, "write_state_file"):
                     bot.write_state_file()
-                # Stop retrying on invalid credentials, but keep waiting so web server remains alive
-                await shutdown_event.wait()
+                if hasattr(bot, "close") and callable(bot.close):
+                    with suppress(Exception):
+                        await bot.close()
+                # Stop retrying on invalid credentials, but keep waiting until shutdown or manual restart
+                await _wait_for_any_event([shutdown_event, stop_event] if stop_event else [shutdown_event])
                 break
 
             # Network-level connection errors
@@ -322,31 +463,277 @@ async def run_discord_bot(bot: Any, token: str, shutdown_event: asyncio.Event) -
                 tracker.status = "network_error"
                 tracker.connected = False
                 tracker.is_ready = False
-                tracker.diagnostic_message = f"Network connection error ({type(exc).__name__}). Reconnecting in {int(reconnect_delay)}s..."
+                tracker.diagnostic_message = (
+                    f"Network connection error ({type(exc).__name__}). Reconnecting in {int(reconnect_delay)}s..."
+                )
                 if hasattr(bot, "write_state_file"):
                     bot.write_state_file()
-                logger.warning("Discord network connection error: %s. Retrying in %ds...", exc, int(reconnect_delay))
+                logger.warning(
+                    "Discord network connection error (%s). Retrying in %ds...",
+                    type(exc).__name__,
+                    int(reconnect_delay),
+                )
             else:
                 # Discord HTTP / API errors or other errors
                 status_code = getattr(exc, "status", None)
                 if status_code is not None:
                     tracker.status = "api_error"
-                    tracker.diagnostic_message = f"Discord API error (HTTP {status_code}). Retrying in {int(reconnect_delay)}s..."
+                    tracker.diagnostic_message = (
+                        f"Discord API error (HTTP {status_code}). Retrying in {int(reconnect_delay)}s..."
+                    )
                 else:
                     tracker.status = "disconnected"
-                    tracker.diagnostic_message = f"Bot connection error ({type(exc).__name__}). Retrying in {int(reconnect_delay)}s..."
+                    tracker.diagnostic_message = (
+                        f"Bot connection error ({type(exc).__name__}). Retrying in {int(reconnect_delay)}s..."
+                    )
                 tracker.connected = False
                 tracker.is_ready = False
                 if hasattr(bot, "write_state_file"):
                     bot.write_state_file()
-                logger.warning("Discord connection exception (%s): %s. Retrying in %ds...", type(exc).__name__, exc, int(reconnect_delay))
+                logger.warning(
+                    "Discord connection exception (%s). Retrying in %ds...",
+                    type(exc).__name__,
+                    int(reconnect_delay),
+                )
 
-            # Wait with exponential backoff before reconnecting, unless shutdown is signaled
+            # Ensure failed bot instance is cleanly closed before retry recreates it
+            if hasattr(bot, "close") and callable(bot.close):
+                with suppress(Exception):
+                    await bot.close()
+
+            # Wait with exponential backoff before reconnecting, unless shutdown or restart is signaled
             try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=reconnect_delay)
+                await _wait_for_any_event(
+                    [shutdown_event, stop_event] if stop_event else [shutdown_event],
+                    timeout=reconnect_delay,
+                )
                 break
             except asyncio.TimeoutError:
                 reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+
+
+# ------------------------------------------------------------------------------
+# Bot Lifecycle Manager (Safe In-Process Restart Orchestration)
+# ------------------------------------------------------------------------------
+class BotLifecycleManager:
+    """
+    Coordinates the Discord bot lifecycle inside the unified Python process.
+    Supports authenticated, lock-protected bot restarts without stopping FastAPI:
+    - Cleanly closes the current Discord gateway session and cancels its task
+    - Instantiates a fresh UBAgenBot (re-registering slash commands, events, and BotTracker)
+    - Reconnects using the existing DISCORD_BOT_TOKEN with controlled retry on failure
+    - Enforces concurrency locking and cooldown throttling across restart requests
+    """
+
+    def __init__(
+        self,
+        bot_factory: Optional[Callable[[], Any]] = None,
+        dev_guild_id: Optional[int] = None,
+        shutdown_event: Optional[asyncio.Event] = None,
+        cooldown_seconds: float = 15.0,
+        retry_delay: float = 5.0,
+        health_app: Any = None,
+    ) -> None:
+        self.dev_guild_id = dev_guild_id
+        self._custom_bot_factory = bot_factory
+        self.shutdown_event = shutdown_event or asyncio.Event()
+        self.cooldown_seconds = cooldown_seconds
+        self.retry_delay = retry_delay
+        self.health_app = health_app
+
+        self._restart_lock = asyncio.Lock()
+        self.is_restarting: bool = False
+        self.last_restart_at: float = 0.0
+        self._stop_bot_event = asyncio.Event()
+        self.bot_task: Optional[asyncio.Task] = None
+
+        self.bot: Any = self._create_bot_instance()
+        if self.health_app is not None:
+            self.attach_health_app(self.health_app)
+
+    def _create_bot_instance(self) -> Any:
+        if self._custom_bot_factory is not None:
+            return self._custom_bot_factory()
+        if UBAgenBot is not None:
+            guild_id = self.dev_guild_id if self.dev_guild_id is not None else parse_dev_guild_id()
+            return UBAgenBot(guild_id=guild_id)
+        return None
+
+    def _update_active_bot(self, new_bot: Any) -> None:
+        self.bot = new_bot
+        if self.health_app is not None:
+            self.health_app.state.bot = new_bot
+            self.health_app.state.last_stats = None
+
+    def attach_health_app(self, app: Any) -> None:
+        """Bind this lifecycle manager to a FastAPI app instance."""
+        self.health_app = app
+        app.state.bot = self.bot
+        app.state.bot_manager = self
+        app.state.restart_bot = self.restart_bot
+
+    def get_bot_token(self) -> str:
+        """Retrieve current DISCORD_BOT_TOKEN from environment without mutating or logging it."""
+        return os.getenv("DISCORD_BOT_TOKEN", "").strip()
+
+    def start(self) -> Optional[asyncio.Task]:
+        """Start the Discord bot background task if token and runtime are available."""
+        bot_token = self.get_bot_token()
+        if self.bot is not None and not is_placeholder_bot_token(bot_token):
+            self._stop_bot_event = asyncio.Event()
+            self.bot_task = asyncio.create_task(
+                run_discord_bot(
+                    self.bot,
+                    bot_token,
+                    self.shutdown_event,
+                    stop_event=self._stop_bot_event,
+                    bot_factory=self._create_bot_instance,
+                    on_bot_replaced=self._update_active_bot,
+                    initial_retry_delay=self.retry_delay,
+                )
+            )
+            return self.bot_task
+
+        if is_placeholder_bot_token(bot_token):
+            logger.info(
+                "NOTICE: 'DISCORD_BOT_TOKEN' is not configured. UBAgen is running in Web Monitor mode. "
+                "Discord bot will remain offline until a valid DISCORD_BOT_TOKEN is set in your environment."
+            )
+            if self.bot and hasattr(self.bot, "tracker"):
+                self.bot.tracker.status = "not_configured"
+                self.bot.tracker.connected = False
+                self.bot.tracker.is_ready = False
+                self.bot.tracker.diagnostic_message = "DISCORD_BOT_TOKEN is not configured. Web monitor is active."
+                if hasattr(self.bot, "write_state_file"):
+                    self.bot.write_state_file()
+        elif not self.bot:
+            logger.warning("NOTICE: discord.py is not installed; running in Web Monitor mode.")
+        return None
+
+    async def stop_bot(self) -> None:
+        """Cleanly close the active Discord bot connection and stop its task without stopping FastAPI."""
+        self._stop_bot_event.set()
+        current_bot = self.bot
+        current_task = self.bot_task
+
+        if current_bot is not None:
+            tracker = getattr(current_bot, "tracker", None)
+            if tracker is not None:
+                tracker.connected = False
+                tracker.is_ready = False
+                tracker.status = "connecting"
+                tracker.diagnostic_message = "Closing existing Discord Gateway session for restart..."
+            if hasattr(current_bot, "write_state_file"):
+                with suppress(Exception):
+                    current_bot.write_state_file()
+
+            is_closed = False
+            if hasattr(current_bot, "is_closed") and callable(current_bot.is_closed):
+                with suppress(Exception):
+                    is_closed = bool(current_bot.is_closed())
+
+            if not is_closed and hasattr(current_bot, "close") and callable(current_bot.close):
+                logger.info("Closing active Discord bot connection...")
+                try:
+                    await asyncio.wait_for(current_bot.close(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Timed out waiting for Discord bot.close(); forcing task cleanup.")
+                except Exception as exc:
+                    logger.warning("Error while closing Discord bot (%s).", type(exc).__name__)
+
+        if current_task is not None and not current_task.done():
+            try:
+                await asyncio.wait_for(current_task, timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                current_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await current_task
+
+        self.bot_task = None
+
+    async def restart_bot(self) -> tuple[int, dict[str, Any]]:
+        """
+        Safely restart the Discord bot in-process while keeping the HTTP server online.
+        Returns (http_status_code, response_dict).
+        """
+        if self.is_restarting or self._restart_lock.locked():
+            retry_after = max(1, int(round(self.cooldown_seconds)))
+            return 429, {
+                "error": f"A bot restart is already in progress. Wait {retry_after} seconds before trying again.",
+                "retry_after": retry_after,
+            }
+
+        now = time.monotonic()
+        if self.last_restart_at > 0 and (now - self.last_restart_at) < self.cooldown_seconds:
+            remaining = max(1, int(round(self.cooldown_seconds - (now - self.last_restart_at))))
+            return 429, {
+                "error": f"A bot restart was requested recently. Wait {remaining} seconds before trying again.",
+                "retry_after": remaining,
+            }
+
+        bot_token = self.get_bot_token()
+        if is_placeholder_bot_token(bot_token):
+            return 503, {
+                "error": "Cannot restart Discord bot: DISCORD_BOT_TOKEN is not configured on the server.",
+            }
+
+        async with self._restart_lock:
+            now = time.monotonic()
+            if self.last_restart_at > 0 and (now - self.last_restart_at) < self.cooldown_seconds:
+                remaining = max(1, int(round(self.cooldown_seconds - (now - self.last_restart_at))))
+                return 429, {
+                    "error": f"A bot restart was requested recently. Wait {remaining} seconds before trying again.",
+                    "retry_after": remaining,
+                }
+
+            self.is_restarting = True
+            try:
+                logger.info("Authenticated Discord bot restart initiated.")
+                await self.stop_bot()
+
+                new_bot = self._create_bot_instance()
+                if new_bot is None:
+                    return 503, {
+                        "error": "The bot worker is not currently available to restart.",
+                    }
+
+                tracker = getattr(new_bot, "tracker", None)
+                if tracker is not None:
+                    tracker.status = "connecting"
+                    tracker.connected = False
+                    tracker.is_ready = False
+                    tracker.diagnostic_message = "Bot restart requested. Reconnecting to Discord Gateway..."
+                if hasattr(new_bot, "write_state_file"):
+                    with suppress(Exception):
+                        new_bot.write_state_file()
+
+                self._update_active_bot(new_bot)
+
+                self._stop_bot_event = asyncio.Event()
+                self.bot_task = asyncio.create_task(
+                    run_discord_bot(
+                        new_bot,
+                        bot_token,
+                        self.shutdown_event,
+                        stop_event=self._stop_bot_event,
+                        bot_factory=self._create_bot_instance,
+                        on_bot_replaced=self._update_active_bot,
+                        initial_retry_delay=self.retry_delay,
+                    )
+                )
+                self.last_restart_at = time.monotonic()
+                logger.info("Discord bot instance recreated and reconnection task started.")
+                return 202, {
+                    "status": "restarting",
+                    "message": "Bot restart requested. The worker should reconnect shortly.",
+                }
+            except Exception as exc:
+                logger.exception("Unexpected error during Discord bot restart (%s).", type(exc).__name__)
+                return 500, {
+                    "error": "Could not restart the Discord bot due to an internal error.",
+                }
+            finally:
+                self.is_restarting = False
 
 
 # ------------------------------------------------------------------------------
@@ -379,13 +766,6 @@ async def run_fastapi_server(app: Any, host: str, port: int, shutdown_event: asy
 
 async def main() -> None:
     """Main application loop coordinating bot and web service."""
-    bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-    is_placeholder_token = not bot_token or bot_token in (
-        "your_discord_bot_token_here",
-        "MY_DISCORD_BOT_TOKEN",
-        "CHANGE_ME",
-    )
-
     port_str = os.getenv("UBAGEN_HTTP_PORT", "").strip() or os.getenv("PORT", "8080").strip()
     try:
         http_port = int(port_str)
@@ -393,30 +773,15 @@ async def main() -> None:
         logger.warning("Invalid PORT '%s'. Falling back to 8080.", port_str)
         http_port = 8080
 
-    http_host = os.getenv("HOST", "0.0.0.0").strip()
-
-    # Parse and validate optional test guild ID (Snowflake format: 17-20 digits)
-    guild_id_env = os.getenv("DISCORD_GUILD_ID", "").strip()
-    dev_guild_id: Optional[int] = None
-    if guild_id_env:
-        if guild_id_env.isdigit() and 17 <= len(guild_id_env) <= 20:
-            try:
-                dev_guild_id = int(guild_id_env)
-                logger.info("Development Guild ID detected: %d (Enabling fast guild command sync)", dev_guild_id)
-            except ValueError:
-                dev_guild_id = None
-        else:
-            logger.warning(
-                "Invalid DISCORD_GUILD_ID format ('%s' is not a valid 17-20 digit Snowflake ID). "
-                "Ignoring guild sync and falling back to global sync.",
-                guild_id_env[:4] + "..." if len(guild_id_env) > 4 else guild_id_env,
-            )
-
-    # Instantiate bot if discord.py is available
-    bot = UBAgenBot(guild_id=dev_guild_id) if UBAgenBot is not None else None
-    health_app = create_health_app(bot=bot)
+    http_host = validate_bind_host(os.getenv("HOST", "0.0.0.0"), port=http_port)
+    dev_guild_id = parse_dev_guild_id()
 
     shutdown_event = asyncio.Event()
+    bot_manager = BotLifecycleManager(
+        dev_guild_id=dev_guild_id,
+        shutdown_event=shutdown_event,
+    )
+    health_app = create_health_app(bot=bot_manager.bot, bot_manager=bot_manager)
 
     # OS signal handlers for graceful shutdown (SIGINT, SIGTERM)
     loop = asyncio.get_running_loop()
@@ -437,24 +802,10 @@ async def main() -> None:
     )
 
     # Start Discord bot in background if token is supplied and valid
-    bot_task = None
-    if bot and not is_placeholder_token:
-        bot_task = asyncio.create_task(run_discord_bot(bot, bot_token, shutdown_event))
-    else:
-        if is_placeholder_token:
-            logger.info(
-                "NOTICE: 'DISCORD_BOT_TOKEN' is not configured. UBAgen is running in Web Monitor mode. "
-                "Discord bot will remain offline until a valid DISCORD_BOT_TOKEN is set in your environment."
-            )
-            if bot and hasattr(bot, "tracker"):
-                bot.tracker.status = "not_configured"
-                bot.tracker.diagnostic_message = "DISCORD_BOT_TOKEN is not configured. Web monitor is active."
-                bot.write_state_file()
-        elif not bot:
-            logger.warning("NOTICE: discord.py is not installed; running in Web Monitor mode.")
+    bot_manager.start()
 
     # ONLY wait for shutdown_event or fastapi_task!
-    # Discord bot errors or disconnects DO NOT kill the web server!
+    # Discord bot errors, disconnects, or restarts DO NOT kill the web server!
     shutdown_waiter = asyncio.create_task(shutdown_event.wait())
     done, pending = await asyncio.wait(
         [fastapi_task, shutdown_waiter],
@@ -464,17 +815,7 @@ async def main() -> None:
     logger.info("Shutdown initiated. Cleaning up active tasks...")
     shutdown_event.set()
 
-    if bot and not bot.is_closed():
-        logger.info("Closing Discord bot connection...")
-        try:
-            await bot.close()
-        except Exception as e:
-            logger.debug("Error while closing bot: %s", e)
-
-    if bot_task and not bot_task.done():
-        bot_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await bot_task
+    await bot_manager.stop_bot()
 
     for task in pending:
         task.cancel()

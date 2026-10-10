@@ -30,6 +30,9 @@ import {
   Share2,
   X,
 } from 'lucide-react';
+import { executeBotRestartRequest, resolveRestartBotUrl } from './restartBot';
+
+export { executeBotRestartRequest, resolveRestartBotUrl };
 
 // Official Discord Clyde controller SVG logo
 function DiscordLogo({ className = 'w-4 h-4' }: { className?: string }) {
@@ -132,6 +135,13 @@ export default function App() {
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [restartingBot, setRestartingBot] = useState<boolean>(false);
+  const [showRestartModal, setShowRestartModal] = useState<boolean>(false);
+  const [restartAdminTokenInput, setRestartAdminTokenInput] = useState<string>('');
+  const [restartFeedback, setRestartFeedback] = useState<{
+    type: 'success' | 'error' | 'cancelled';
+    title: string;
+    message: string;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -256,40 +266,82 @@ export default function App() {
     fetchStats(true);
   };
 
-  const handleRestartBot = async () => {
-    if (!window.confirm('Discord botunu yeniden başlatmak istiyor musun? Bot birkaç saniyeliğine çevrimdışı olabilir.')) return;
-    const adminToken = window.prompt('Sunucuda tanımlı UBAGEN_ADMIN_TOKEN değerini gir:');
-    if (!adminToken?.trim()) return;
+  const resolvedRestartEndpointPreview = (() => {
+    try {
+      return resolveRestartBotUrl(endpointUrl);
+    } catch {
+      return '/api/admin/restart-bot (Geçersiz Backend URL)';
+    }
+  })();
+
+  const handleRestartBot = () => {
+    if (restartingBot) return;
+    setRestartAdminTokenInput('');
+    setShowRestartModal(true);
+  };
+
+  const handleCancelRestartBot = () => {
+    if (restartingBot) return;
+    setShowRestartModal(false);
+    setRestartAdminTokenInput('');
+    setRestartFeedback({
+      type: 'cancelled',
+      title: 'Yeniden Başlatma İptal Edildi',
+      message: 'İşlem kullanıcı tarafından iptal edildi; bota herhangi bir yeniden başlatma isteği gönderilmedi.',
+    });
+  };
+
+  const handleConfirmRestartBot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (restartingBot) return;
+
+    const cleanToken = restartAdminTokenInput.trim();
+    if (!cleanToken) {
+      setRestartFeedback({
+        type: 'error',
+        title: 'Doğrulama Hatası',
+        message: 'Devam etmek için sunucuda tanımlı UBAGEN_ADMIN_TOKEN değerini girmelisiniz.',
+      });
+      return;
+    }
 
     setRestartingBot(true);
     try {
-      // Use the configured backend host when the dashboard is hosted separately.
-      // endpointUrl may be a full URL ending in /api/stats or a same-origin path.
-      let restartUrl = '/api/admin/restart-bot';
-      try {
-        if (endpointUrl.startsWith('http://') || endpointUrl.startsWith('https://')) {
-          restartUrl = new URL('/api/admin/restart-bot', endpointUrl).toString();
-        }
-      } catch {
-        throw new Error('Backend Host URL is invalid. Check the connection settings.');
-      }
-
-      const response = await fetch(restartUrl, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          Authorization: `Bearer ${adminToken.trim()}`,
-        },
+      const result = await executeBotRestartRequest({
+        endpointUrl,
+        adminToken: cleanToken,
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(payload.error || `HTTP ${response.status}`);
+
+      if (result.ok) {
+        setRestartAdminTokenInput('');
+        setShowRestartModal(false);
+        setRestartFeedback({
+          type: 'success',
+          title: `Bot Yeniden Başlatma İsteği Alındı (${result.statusCodeLabel})`,
+          message: result.message,
+        });
+        // Immediately query bot status and poll again after reconnect window
+        await fetchStats(true);
+        window.setTimeout(() => {
+          fetchStats(true);
+        }, 2500);
+        window.setTimeout(() => {
+          fetchStats(true);
+        }, 5500);
+      } else {
+        setRestartFeedback({
+          type: 'error',
+          title: `Bot Yeniden Başlatılamadı (${result.statusCodeLabel})`,
+          message: result.message,
+        });
       }
-      window.alert('Yeniden başlatma isteği alındı. Botun tekrar bağlanması birkaç saniye sürebilir.');
-      window.setTimeout(() => fetchStats(true), 5000);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Bilinmeyen hata';
-      window.alert(`Bot yeniden başlatılamadı: ${message}`);
+      setRestartFeedback({
+        type: 'error',
+        title: 'Bot Yeniden Başlatılamadı',
+        message,
+      });
     } finally {
       setRestartingBot(false);
     }
@@ -516,6 +568,52 @@ export default function App() {
               className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white shrink-0 self-end sm:self-auto cursor-pointer"
             >
               Retry Connection
+            </button>
+          </div>
+        )}
+
+        {/* Bot Restart Status Feedback Banner */}
+        {restartFeedback && (
+          <div
+            role="status"
+            className={`rounded-2xl p-4 flex items-start justify-between gap-4 shadow-lg border ${
+              restartFeedback.type === 'success'
+                ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-100'
+                : restartFeedback.type === 'cancelled'
+                ? 'bg-slate-900/90 border-slate-700/80 text-slate-200'
+                : 'bg-rose-950/50 border-rose-500/40 text-rose-100'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <div
+                className={`p-2 rounded-xl shrink-0 mt-0.5 ${
+                  restartFeedback.type === 'success'
+                    ? 'bg-emerald-500/20 text-emerald-400'
+                    : restartFeedback.type === 'cancelled'
+                    ? 'bg-slate-800 text-slate-400'
+                    : 'bg-rose-500/20 text-rose-400'
+                }`}
+              >
+                {restartFeedback.type === 'success' ? (
+                  <CheckCircle2 className="w-5 h-5" />
+                ) : restartFeedback.type === 'cancelled' ? (
+                  <HelpCircle className="w-5 h-5" />
+                ) : (
+                  <AlertTriangle className="w-5 h-5" />
+                )}
+              </div>
+              <div>
+                <h3 className="text-sm font-bold">{restartFeedback.title}</h3>
+                <p className="text-xs opacity-90 mt-0.5">{restartFeedback.message}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setRestartFeedback(null)}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/60 transition-colors cursor-pointer"
+              aria-label="Bildirimi kapat"
+            >
+              <X className="w-4 h-4" />
             </button>
           </div>
         )}
@@ -1097,6 +1195,110 @@ export default function App() {
         <span>UBAgen System Monitor &bull; Real-time Host Hardware Telemetry</span>
         <span className="font-mono text-slate-600">GET /api/stats &bull; GET /health</span>
       </footer>
+
+      {/* Discord Bot Restart Confirmation & Auth Modal */}
+      {showRestartModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150"
+          onClick={handleCancelRestartBot}
+        >
+          <div
+            className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="bg-rose-600/20 border-b border-rose-500/30 px-6 py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-rose-500/20 border border-rose-500/30 flex items-center justify-center text-rose-400">
+                  <RefreshCw className={`w-5 h-5 ${restartingBot ? 'animate-spin' : ''}`} />
+                </div>
+                <div>
+                  <h3 className="font-bold text-base text-white leading-tight">
+                    Discord Botunu Yeniden Başlat
+                  </h3>
+                  <p className="text-xs text-rose-200/80 mt-0.5">
+                    Onay ve Yönetici Doğrulaması
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleCancelRestartBot}
+                disabled={restartingBot}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-50"
+                aria-label="İptal"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmRestartBot} className="p-6 space-y-4">
+              <p className="text-xs text-slate-300 leading-relaxed">
+                Discord botunu yeniden başlatmak istediğinizden emin misiniz? Mevcut Discord Gateway
+                bağlantısı güvenli şekilde kapatılıp tekrar bağlanacaktır. Web izleme sunucusu
+                kesintisiz çalışmaya devam eder.
+              </p>
+
+              <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 text-[11px] text-slate-400 space-y-1">
+                <span className="font-semibold text-slate-300 block">Hedef Endpoint:</span>
+                <code className="font-mono text-indigo-300 break-all block">
+                  POST {resolvedRestartEndpointPreview}
+                </code>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="ubagen-admin-token-input"
+                  className="block text-xs font-semibold text-slate-200 mb-1.5"
+                >
+                  Sunucu Yönetici Token&apos;ı (<code>UBAGEN_ADMIN_TOKEN</code>):
+                </label>
+                <input
+                  id="ubagen-admin-token-input"
+                  type="password"
+                  autoComplete="off"
+                  value={restartAdminTokenInput}
+                  onChange={(e) => setRestartAdminTokenInput(e.target.value)}
+                  disabled={restartingBot}
+                  placeholder="Sunucuda tanımlı UBAGEN_ADMIN_TOKEN değerini girin"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-slate-100 font-mono focus:outline-none focus:border-rose-500 disabled:opacity-50"
+                  autoFocus
+                />
+                <span className="text-[11px] text-slate-500 mt-1 block">
+                  Token yalnızca <code>Authorization: Bearer</code> başlığı ile gönderilir, tarayıcıda saklanmaz.
+                </span>
+              </div>
+
+              {restartFeedback && restartFeedback.type === 'error' && (
+                <div className="p-3 rounded-xl bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200">
+                  <strong className="block font-semibold text-rose-100">
+                    {restartFeedback.title}
+                  </strong>
+                  <span className="mt-0.5 block">{restartFeedback.message}</span>
+                </div>
+              )}
+
+              <div className="pt-2 flex items-center justify-end gap-2.5">
+                <button
+                  type="button"
+                  onClick={handleCancelRestartBot}
+                  disabled={restartingBot}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  İptal
+                </button>
+                <button
+                  type="submit"
+                  disabled={restartingBot}
+                  className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold shadow-lg shadow-rose-600/25 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${restartingBot ? 'animate-spin' : ''}`} />
+                  <span>{restartingBot ? 'Yeniden Başlatılıyor…' : 'Onayla ve Yeniden Başlat'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Discord Bot Server Invite Modal */}
       {showInviteModal && (
