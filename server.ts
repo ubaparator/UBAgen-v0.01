@@ -115,7 +115,7 @@ async function startServer() {
     }
 
     const authorization = req.header('authorization') || '';
-    const suppliedToken = authorization.match(/^Bearer\\s+(.+)$/i)?.[1] || '';
+    const suppliedToken = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || '';
     const supplied = Buffer.from(suppliedToken);
     const expected = Buffer.from(expectedToken);
     const tokenMatches = supplied.length === expected.length && timingSafeEqual(supplied, expected);
