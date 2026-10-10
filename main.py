@@ -89,6 +89,7 @@ if commands is not None:
             )
             self.dev_guild_id = guild_id
             self.tracker = BotTracker()
+            self._guild_commands_synced = False
 
         def write_state_file(self) -> None:
             """Write current bot state to local tmp file for process sharing."""
@@ -174,6 +175,33 @@ if commands is not None:
 
         async def on_ready(self) -> None:
             """Fires when Discord gateway connection and guild cache are fully established."""
+            # Guild-scoped copies appear immediately in every server the bot has joined.
+            # Keep global registration too, so commands also propagate to future servers.
+            if not self._guild_commands_synced:
+                synced_guilds = 0
+                for guild in list(self.guilds):
+                    try:
+                        self.tree.copy_global_to(guild=guild)
+                        await self.tree.sync(guild=guild)
+                        synced_guilds += 1
+                    except Exception as exc:
+                        logger.warning("Could not sync commands to guild %s: %s", guild.id, type(exc).__name__)
+                try:
+                    global_commands = await self.tree.sync()
+                    logger.info(
+                        "Slash commands synced globally (%d) and to %d current guild(s).",
+                        len(global_commands),
+                        synced_guilds,
+                    )
+                    self.tracker.sync_status = (
+                        f"{len(global_commands)} global command(s); synced to {synced_guilds} current server(s)"
+                    )
+                except Exception as exc:
+                    logger.warning("Global command sync from on_ready failed: %s", type(exc).__name__)
+                    self.tracker.sync_status = f"Command sync warning: {type(exc).__name__}"
+                self._guild_commands_synced = True
+                self.write_state_file()
+
             if self.user:
                 logger.info("==================================================")
                 logger.info("🎉 UBAgen Bot is ONLINE!")
