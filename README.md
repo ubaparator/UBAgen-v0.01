@@ -122,3 +122,9 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
    ```
 
 3. Open `http://localhost:3000` in your browser to view the live dashboard.
+
+### Automatic redeploy after GitHub updates
+
+The repository includes a GitHub Actions workflow that validates the Python source and builds the frontend on pushes and pull requests. To trigger a real redeploy/restart after each push to `main`, configure a repository Actions secret named `DEPLOY_WEBHOOK_URL` with the deployment provider's deploy-hook URL. Optionally set the repository Actions variable `DEPLOY_WEBHOOK_METHOD` to `GET` or `POST` if the provider requires a specific HTTP method (defaults to `POST`). The workflow sends the hook only after a successful validation run on `main`; without this provider URL, GitHub can validate the code but cannot restart an external running service by itself.
+
+On every process start, `main.py` registers the bot's slash commands and syncs them with Discord. Guild-scoped commands are attempted for servers the bot has joined; global commands are also synced. Global Discord command propagation can take up to an hour. The bot must be invited with the `applications.commands` scope.
