@@ -1,73 +1,93 @@
 """
 UBAgen — health_api.py
-Lightweight FastAPI application providing HTTP health check endpoints.
+Lightweight FastAPI application providing HTTP health check and real-time statistics endpoints.
 
 Exposes:
-- GET /health : Diagnostic status for container orchestration (Docker, Cloud Run, Render, Railway).
-- GET /       : Service identification.
+- GET /api/stats : Complete real-time host, container, and Discord bot hardware metrics.
+- GET /stats     : Alias for /api/stats for convenience.
+- GET /health    : Lightweight health probe for container orchestrators (Docker, Render, Railway, Fly.io).
+- GET /          : Serves React dashboard if built (dist/), otherwise service identification JSON.
 
-Ensures sensitive secrets (e.g. DISCORD_BOT_TOKEN) are never leaked.
+Configured with CORS support and zero secret leakage.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+import os
 import time
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-# Service start timestamp for uptime calculation
+from stats import collect_all_stats
+
 SERVICE_START_TIME = time.time()
 
 
 def create_health_app(bot: Any = None) -> FastAPI:
     """
-    Factory creating the FastAPI health check application.
-    Accepts the Discord bot instance to query real-time gateway status.
+    Factory creating the FastAPI application.
+    Mounts CORS, /health, /api/stats, and static files when present.
     """
     app = FastAPI(
-        title="UBAgen Health API",
-        description="Lightweight HTTP health check service for UBAgen Discord Bot backend",
+        title="UBAgen System Monitor & Health API",
+        description="Lightweight HTTP monitoring service for UBAgen Discord Bot backend",
         version="1.0.0",
-        docs_url=None,   # Disable interactive docs in production to save memory
+        docs_url=None,  # Disabled in production to conserve memory
         redoc_url=None,
     )
 
-    # Store bot in application state
+    # Enable CORS for cross-origin dashboard requests
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["GET", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    # Store bot instance in application state
     app.state.bot = bot
+
+    @app.get("/api/stats", summary="Real-time Hardware & Bot Statistics")
+    @app.get("/stats", summary="Real-time Hardware & Bot Statistics (Alias)")
+    async def get_stats_api() -> JSONResponse:
+        """
+        Returns full live hardware statistics (CPU, RAM, Disk, Uptime, Process, Toolchain, Bot).
+        Runs non-blocking inside asyncio.to_thread to avoid blocking gateway loop.
+        """
+        current_bot = getattr(app.state, "bot", None)
+        stats = await asyncio.to_thread(collect_all_stats, current_bot)
+        return JSONResponse(
+            content=stats,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
 
     @app.get("/health", summary="Backend Health Check")
     async def health_check() -> JSONResponse:
         """
-        Returns JSON status indicating whether HTTP server is alive
-        and whether the Discord bot gateway connection is established.
+        Lightweight health check endpoint for container orchestrators.
         """
         current_bot = getattr(app.state, "bot", None)
-
-        bot_is_ready = bool(current_bot and current_bot.is_ready())
+        bot_is_ready = bool(current_bot and hasattr(current_bot, "is_ready") and current_bot.is_ready())
         latency_ms = (
             round(current_bot.latency * 1000, 2)
-            if (bot_is_ready and current_bot.latency is not None)
+            if (bot_is_ready and current_bot and getattr(current_bot, "latency", None) is not None)
             else None
         )
-        bot_user = str(current_bot.user) if (bot_is_ready and current_bot.user) else None
-
-        # Calculate uptime
+        bot_user = str(current_bot.user) if (bot_is_ready and current_bot and getattr(current_bot, "user", None)) else None
         uptime_sec = int(time.time() - SERVICE_START_TIME)
 
-        # Determine overall health state
-        # Note: During the initial 5-10 seconds of container boot, the bot may still be connecting
-        if bot_is_ready:
-            overall_status = "healthy"
-            http_code = 200
-        else:
-            overall_status = "starting"
-            http_code = 200  # Return 200 so orchestrator doesn't kill container during gateway handshake
-
         payload = {
-            "status": overall_status,
+            "status": "healthy" if bot_is_ready else "starting",
             "service": "ubagen-backend",
             "http": "alive",
             "discord_bot": {
@@ -80,16 +100,22 @@ def create_health_app(bot: Any = None) -> FastAPI:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        return JSONResponse(content=payload, status_code=http_code)
+        return JSONResponse(content=payload, status_code=200)
 
-    @app.get("/", summary="Root Index")
-    async def root_index() -> dict[str, Any]:
-        """Root endpoint confirming service identity."""
-        return {
-            "service": "UBAgen Discord Bot Backend",
-            "status": "online",
-            "health_endpoint": "/health",
-            "version": "1.0.0",
-        }
+    # Mount static frontend files if dist/ directory exists (production container deployment)
+    if os.path.isdir("dist"):
+        app.mount("/", StaticFiles(directory="dist", html=True), name="static")
+    else:
+        @app.get("/", summary="Root Status")
+        async def root_index() -> dict[str, Any]:
+            return {
+                "service": "UBAgen System Monitor Backend",
+                "status": "online",
+                "endpoints": {
+                    "stats": "/api/stats",
+                    "health": "/health",
+                },
+                "version": "1.0.0",
+            }
 
     return app

@@ -2,8 +2,9 @@
 UBAgen — stats.py
 Diagnostic system statistics collector and Discord '/stats' slash command.
 
-Gathers comprehensive host, container, process, toolchain, and credential status
+Gathers comprehensive host, container, process, toolchain, and status telemetry
 without blocking the Discord event loop or leaking sensitive tokens.
+Provides real data for both the Discord slash command and the GET /api/stats endpoint.
 """
 
 from __future__ import annotations
@@ -16,16 +17,22 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
-import discord
-from discord import app_commands
+try:
+    import discord
+    from discord import app_commands
+except ImportError:
+    discord = None
+    app_commands = None
+
 import psutil
 
 logger = logging.getLogger("ubagen.stats")
 
-# Timestamp when the UBAgen bot process started
+# Process start time for uptime calculation
 PROCESS_START_TIME = time.time()
 
 
@@ -33,24 +40,25 @@ PROCESS_START_TIME = time.time()
 # Formatting Utilities
 # ------------------------------------------------------------------------------
 def format_bytes(num_bytes: int | float | None) -> str:
-    """Format bytes into a human-readable string (KB, MB, GB, TB)."""
+    """Format bytes into a human-readable string (B, KB, MB, GB, TB)."""
     if num_bytes is None or num_bytes < 0:
         return "Unavailable"
+    num = float(num_bytes)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if abs(num_bytes) < 1024.0:
-            return f"{num_bytes:3.2f} {unit}"
-        num_bytes /= 1024.0
-    return f"{num_bytes:.2f} PB"
+        if abs(num) < 1024.0:
+            return f"{num:3.2f} {unit}"
+        num /= 1024.0
+    return f"{num:.2f} PB"
 
 
 def format_duration(seconds: float | None) -> str:
     """Format duration in seconds to a human-readable string (e.g., 2d 4h 12m 30s)."""
     if seconds is None or seconds < 0:
         return "Unavailable"
-    seconds = int(seconds)
-    days, remainder = divmod(seconds, 86400)
+    secs = int(seconds)
+    days, remainder = divmod(secs, 86400)
     hours, remainder = divmod(remainder, 3600)
-    minutes, secs = divmod(remainder, 60)
+    minutes, s = divmod(remainder, 60)
 
     parts: list[str] = []
     if days > 0:
@@ -59,13 +67,13 @@ def format_duration(seconds: float | None) -> str:
         parts.append(f"{hours}h")
     if minutes > 0 or hours > 0 or days > 0:
         parts.append(f"{minutes}m")
-    parts.append(f"{secs}s")
+    parts.append(f"{s}s")
 
-    return " ".join(parts)
+    return " ".join(parts) if parts else "0s"
 
 
 # ------------------------------------------------------------------------------
-# Container & Resource Limit Detection
+# Container & Resource Limit Detection (Cgroups v1 & v2)
 # ------------------------------------------------------------------------------
 def detect_container_memory_limit() -> dict[str, Any]:
     """
@@ -73,11 +81,13 @@ def detect_container_memory_limit() -> dict[str, Any]:
     Distinguishes between visible host RAM and container quota.
     """
     result: dict[str, Any] = {
-        "limit_bytes": None,
-        "usage_bytes": None,
         "is_limited": False,
+        "limit_bytes": None,
+        "limit_str": "No container limit enforced",
+        "usage_bytes": None,
+        "usage_str": None,
         "type": "None",
-        "description": "Host-level execution or unlimited container",
+        "description": "Full host memory visible (No container quota ceiling)",
     }
 
     # 1. Check cgroups v2 (modern Linux kernels & Docker / Podman)
@@ -89,17 +99,19 @@ def detect_container_memory_limit() -> dict[str, Any]:
                 val = f.read().strip()
             if val.isdigit():
                 limit_int = int(val)
-                # If set to a realistic byte limit (less than 1 Petabyte)
+                # Realistic container limit (less than 1 Petabyte)
                 if limit_int < 10**15:
                     result["limit_bytes"] = limit_int
+                    result["limit_str"] = format_bytes(limit_int)
                     result["is_limited"] = True
                     result["type"] = "cgroups v2"
-                    result["description"] = f"{format_bytes(limit_int)} (Container Limit)"
+                    result["description"] = f"{format_bytes(limit_int)} container limit enforced"
             if os.path.exists(cg2_curr_path):
                 with open(cg2_curr_path, "r", encoding="utf-8") as f:
                     u_val = f.read().strip()
                 if u_val.isdigit():
                     result["usage_bytes"] = int(u_val)
+                    result["usage_str"] = format_bytes(int(u_val))
             if result["is_limited"]:
                 return result
         except Exception as e:
@@ -114,17 +126,18 @@ def detect_container_memory_limit() -> dict[str, Any]:
                 val = f.read().strip()
             if val.isdigit():
                 limit_int = int(val)
-                # In cgroups v1, 'unlimited' is usually ~ 9223372036854771712 (0x7ffffffffffff000)
                 if limit_int < (1024**5):  # Under 1 Petabyte
                     result["limit_bytes"] = limit_int
+                    result["limit_str"] = format_bytes(limit_int)
                     result["is_limited"] = True
                     result["type"] = "cgroups v1"
-                    result["description"] = f"{format_bytes(limit_int)} (Container Limit)"
+                    result["description"] = f"{format_bytes(limit_int)} container limit enforced"
             if os.path.exists(cg1_curr_path):
                 with open(cg1_curr_path, "r", encoding="utf-8") as f:
                     u_val = f.read().strip()
                 if u_val.isdigit():
                     result["usage_bytes"] = int(u_val)
+                    result["usage_str"] = format_bytes(int(u_val))
             if result["is_limited"]:
                 return result
         except Exception as e:
@@ -151,14 +164,13 @@ def check_binary(binary_name: str, version_arg: str = "-version") -> dict[str, A
             [binary_name, version_arg],
             capture_output=True,
             text=True,
-            timeout=3.0,
+            timeout=2.5,
             check=False,
         )
         output = proc.stdout.strip() or proc.stderr.strip()
         first_line = output.splitlines()[0] if output else "Installed (Version unknown)"
-        # Clean up overly verbose banner lines
-        if len(first_line) > 50:
-            first_line = first_line[:47] + "..."
+        if len(first_line) > 55:
+            first_line = first_line[:52] + "..."
         return {
             "installed": True,
             "version": first_line,
@@ -173,85 +185,16 @@ def check_binary(binary_name: str, version_arg: str = "-version") -> dict[str, A
         }
 
 
-def check_google_drive_credentials() -> dict[str, Any]:
-    """
-    Check if Google Drive credentials are configured without exposing secret values.
-    Inspects standard environment variables and local credential files.
-    """
-    # Environment variables commonly used for Google Workspace / Cloud auth
-    gdrive_env_keys = [
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "GOOGLE_DRIVE_CREDENTIALS",
-        "GDRIVE_SERVICE_ACCOUNT_JSON",
-        "GDRIVE_CREDENTIALS_FILE",
-        "GDRIVE_TOKEN_JSON",
-    ]
-
-    for key in gdrive_env_keys:
-        val = os.getenv(key, "").strip()
-        if not val:
-            continue
-
-        # Check if it points to an existing file
-        if os.path.exists(val):
-            return {
-                "configured": True,
-                "status": "Configured",
-                "detail": f"File present via ${key}",
-            }
-
-        # Check if it contains raw JSON content
-        if val.startswith("{") and val.endswith("}"):
-            try:
-                parsed = json.loads(val)
-                type_name = parsed.get("type", "credentials")
-                return {
-                    "configured": True,
-                    "status": "Configured",
-                    "detail": f"Raw JSON ({type_name}) via ${key}",
-                }
-            except Exception:
-                return {
-                    "configured": True,
-                    "status": "Configured",
-                    "detail": f"JSON payload via ${key}",
-                }
-
-        # Value is set but not a file or JSON
-        return {
-            "configured": True,
-            "status": "Configured",
-            "detail": f"Set via ${key}",
-        }
-
-    # Also check well-known default file locations in project directory
-    default_files = ["service-account.json", "credentials.json", "token.json"]
-    for filename in default_files:
-        if os.path.isfile(filename):
-            return {
-                "configured": True,
-                "status": "Configured",
-                "detail": f"Local '{filename}' file found",
-            }
-
-    return {
-        "configured": False,
-        "status": "Not Configured",
-        "detail": "Optional for /stats test",
-    }
-
-
 def check_environment_variables() -> list[dict[str, str]]:
     """
     Verify the configuration state of key environment variables
-    without printing any secret values or sensitive tokens.
+    without exposing secret values or sensitive tokens.
     """
     results: list[dict[str, str]] = []
 
     # 1. DISCORD_BOT_TOKEN
     token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
     if token:
-        # Validate minimal Discord token structure without leaking contents
         is_plausible = len(token) > 20 and "." in token
         results.append({
             "name": "DISCORD_BOT_TOKEN",
@@ -267,7 +210,7 @@ def check_environment_variables() -> list[dict[str, str]]:
             "type": "Required",
         })
 
-    # 2. PORT (FastAPI health endpoint)
+    # 2. PORT
     port = os.getenv("PORT", "").strip()
     if port:
         results.append({
@@ -284,7 +227,7 @@ def check_environment_variables() -> list[dict[str, str]]:
             "type": "HTTP Server",
         })
 
-    # 3. DISCORD_GUILD_ID (Fast slash command development sync)
+    # 3. DISCORD_GUILD_ID
     guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
     if guild_id:
         results.append({
@@ -301,13 +244,13 @@ def check_environment_variables() -> list[dict[str, str]]:
             "type": "Development",
         })
 
-    # 4. Google Drive Credentials
-    gdrive_status = check_google_drive_credentials()
+    # 4. ENVIRONMENT
+    env_name = os.getenv("ENVIRONMENT", "production").strip()
     results.append({
-        "name": "GOOGLE_DRIVE",
-        "status": gdrive_status["status"],
-        "indicator": "✅" if gdrive_status["configured"] else "⚪",
-        "type": "Workspace",
+        "name": "ENVIRONMENT",
+        "status": env_name,
+        "indicator": "✅",
+        "type": "Configuration",
     })
 
     return results
@@ -317,7 +260,6 @@ def get_operating_system_info() -> str:
     """Retrieve friendly operating system and distribution name."""
     system_name = platform.system()
     if system_name == "Linux":
-        # Attempt to read Linux distribution name
         try:
             if os.path.exists("/etc/os-release"):
                 with open("/etc/os-release", "r", encoding="utf-8") as f:
@@ -334,24 +276,32 @@ def get_operating_system_info() -> str:
 # ------------------------------------------------------------------------------
 # Full Diagnostic Gathering (Synchronous Worker)
 # ------------------------------------------------------------------------------
-def collect_all_stats(bot: discord.Client) -> dict[str, Any]:
+def collect_all_stats(bot: Any = None) -> dict[str, Any]:
     """
     Gathers all backend metrics synchronously.
-    This function must be invoked inside asyncio.to_thread() to avoid blocking
-    the Discord gateway event loop.
+    Handles bot being None, starting up, or disconnected gracefully.
+    Used by both the Discord /stats slash command and the GET /api/stats endpoint.
     """
     now = time.time()
 
     # 1. Bot Connection Status
-    is_ready = bot.is_ready()
-    latency_ms = round(bot.latency * 1000, 1) if bot.latency is not None and is_ready else None
-    bot_uptime_sec = now - PROCESS_START_TIME
-    bot_user_str = str(bot.user) if bot.user else "Unavailable"
-    guild_count = len(bot.guilds) if is_ready else 0
+    is_ready = bool(bot and hasattr(bot, "is_ready") and bot.is_ready())
+    latency_ms = (
+        round(bot.latency * 1000, 1)
+        if (is_ready and bot and getattr(bot, "latency", None) is not None)
+        else None
+    )
+    bot_uptime_sec = (now - PROCESS_START_TIME) if is_ready else None
+    bot_user_str = (
+        str(bot.user)
+        if (is_ready and bot and getattr(bot, "user", None))
+        else ("Offline / Disconnected" if bot else "Bot Service Standalone / Disconnected")
+    )
+    guild_count = len(bot.guilds) if (is_ready and bot and getattr(bot, "guilds", None)) else 0
 
     # 2. CPU Metrics
     try:
-        # Sample CPU load with a tiny interval (non-blocking because inside worker thread)
+        # Non-blocking tiny sample
         cpu_usage_pct = psutil.cpu_percent(interval=0.1)
     except Exception:
         cpu_usage_pct = None
@@ -365,17 +315,19 @@ def collect_all_stats(bot: discord.Client) -> dict[str, Any]:
         system_ram_total = vm.total
         system_ram_used = vm.used
         system_ram_avail = vm.available
+        system_ram_free = vm.free
         system_ram_pct = vm.percent
     except Exception:
         system_ram_total = None
         system_ram_used = None
         system_ram_avail = None
+        system_ram_free = None
         system_ram_pct = None
 
     # 4. Container Cgroups Limit
     container_limit_info = detect_container_memory_limit()
 
-    # 5. Process Memory (UBAgen itself)
+    # 5. Process Memory (UBAgen process itself)
     try:
         current_proc = psutil.Process()
         proc_mem = current_proc.memory_info()
@@ -398,28 +350,34 @@ def collect_all_stats(bot: discord.Client) -> dict[str, Any]:
         disk_free = None
         disk_pct = None
 
-    # 7. System Uptime
+    # 7. System & Backend Uptime
     try:
         boot_time = psutil.boot_time()
         system_uptime_sec = now - boot_time if boot_time > 0 else None
     except Exception:
         system_uptime_sec = None
 
-    # 8. External Binaries
+    backend_uptime_sec = now - PROCESS_START_TIME
+
+    # 8. External Binaries (FFmpeg & aria2)
     ffmpeg_info = check_binary("ffmpeg", "-version")
     aria2_info = check_binary("aria2c", "--version")
 
-    # 9. Google Drive & Environment Status
-    gdrive_status = check_google_drive_credentials()
+    # 9. Environment Variables
     env_statuses = check_environment_variables()
 
     return {
+        "status": "online",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "epoch_time": now,
         "bot": {
             "is_ready": is_ready,
+            "connected": is_ready,
             "latency_ms": latency_ms,
             "user": bot_user_str,
             "guild_count": guild_count,
             "uptime_seconds": bot_uptime_sec,
+            "uptime_str": format_duration(bot_uptime_sec),
         },
         "compute": {
             "cpu_usage_pct": cpu_usage_pct,
@@ -429,27 +387,38 @@ def collect_all_stats(bot: discord.Client) -> dict[str, Any]:
             "python_version": platform.python_version(),
             "python_impl": platform.python_implementation(),
             "system_uptime_sec": system_uptime_sec,
+            "system_uptime_str": format_duration(system_uptime_sec),
+            "backend_uptime_sec": backend_uptime_sec,
+            "backend_uptime_str": format_duration(backend_uptime_sec),
         },
         "memory": {
-            "system_total": system_ram_total,
-            "system_used": system_ram_used,
-            "system_available": system_ram_avail,
+            "system_total_bytes": system_ram_total,
+            "system_total_str": format_bytes(system_ram_total),
+            "system_used_bytes": system_ram_used,
+            "system_used_str": format_bytes(system_ram_used),
+            "system_available_bytes": system_ram_avail,
+            "system_available_str": format_bytes(system_ram_avail),
+            "system_free_bytes": system_ram_free,
+            "system_free_str": format_bytes(system_ram_free),
             "system_percent": system_ram_pct,
             "container_limit": container_limit_info,
-            "process_rss": proc_ram_rss,
-            "process_percent": proc_ram_pct,
+            "process_rss_bytes": proc_ram_rss,
+            "process_rss_str": format_bytes(proc_ram_rss),
+            "process_percent": round(proc_ram_pct, 2) if proc_ram_pct is not None else None,
         },
         "disk": {
-            "total": disk_total,
-            "used": disk_used,
-            "free": disk_free,
+            "total_bytes": disk_total,
+            "total_str": format_bytes(disk_total),
+            "used_bytes": disk_used,
+            "used_str": format_bytes(disk_used),
+            "free_bytes": disk_free,
+            "free_str": format_bytes(disk_free),
             "percent": disk_pct,
         },
         "binaries": {
             "ffmpeg": ffmpeg_info,
             "aria2": aria2_info,
         },
-        "gdrive": gdrive_status,
         "env_vars": env_statuses,
     }
 
@@ -457,28 +426,29 @@ def collect_all_stats(bot: discord.Client) -> dict[str, Any]:
 # ------------------------------------------------------------------------------
 # Discord Embed Builder
 # ------------------------------------------------------------------------------
-def build_stats_embed(stats: dict[str, Any]) -> discord.Embed:
+def build_stats_embed(stats: dict[str, Any]) -> Any:
     """
     Constructs a clear, professional Discord embed conforming to all constraints.
     Separates System RAM, Process RAM, and Container limits.
     """
+    if discord is None:
+        return None
+
     bot_info = stats["bot"]
     compute = stats["compute"]
     mem = stats["memory"]
     disk = stats["disk"]
     binaries = stats["binaries"]
-    gdrive = stats["gdrive"]
     env_vars = stats["env_vars"]
 
-    # Choose embed color based on bot readiness and resource pressure
     is_ready = bot_info["is_ready"]
     cpu_pct = compute["cpu_usage_pct"] or 0
     ram_pct = mem["system_percent"] or 0
 
     if not is_ready:
-        color = discord.Color.red()
-    elif cpu_pct > 85 or ram_pct > 85:
         color = discord.Color.gold()
+    elif cpu_pct > 85 or ram_pct > 85:
+        color = discord.Color.red()
     else:
         color = discord.Color.from_rgb(88, 101, 242)  # Discord Blurple
 
@@ -496,12 +466,12 @@ def build_stats_embed(stats: dict[str, Any]) -> discord.Embed:
             f"**Status:** 🟢 Connected (`{bot_latency_str}` ping)",
             f"**Account:** `{bot_info['user']}`",
             f"**Guilds:** {bot_info['guild_count']} server(s) connected",
-            f"**UBAgen Uptime:** {format_duration(bot_info['uptime_seconds'])}",
+            f"**Backend Uptime:** {compute['backend_uptime_str']}",
         ]
     else:
         bot_status_lines = [
-            "**Status:** 🔴 Connecting / Disconnected",
-            "**UBAgen Uptime:** " + format_duration(bot_info["uptime_seconds"]),
+            "**Status:** 🔴 Gateway Offline / Disconnected",
+            f"**Backend Uptime:** {compute['backend_uptime_str']}",
         ]
     embed.add_field(
         name="🤖 Bot Gateway Connection",
@@ -513,7 +483,7 @@ def build_stats_embed(stats: dict[str, Any]) -> discord.Embed:
     cpu_pct_str = f"{compute['cpu_usage_pct']:.1f}%" if compute["cpu_usage_pct"] is not None else "Unavailable"
     logical_cores = compute["logical_cores"] if compute["logical_cores"] is not None else "Unavailable"
     physical_cores = compute["physical_cores"] if compute["physical_cores"] is not None else "Unavailable"
-    sys_uptime_str = format_duration(compute["system_uptime_sec"])
+    sys_uptime_str = compute["system_uptime_str"]
 
     compute_lines = [
         f"**CPU Usage:** `{cpu_pct_str}`",
@@ -529,17 +499,17 @@ def build_stats_embed(stats: dict[str, Any]) -> discord.Embed:
     )
 
     # 3. Memory & Container Limits (Distinctly separated)
-    sys_ram_total = format_bytes(mem["system_total"])
-    sys_ram_avail = format_bytes(mem["system_available"])
-    sys_ram_used = format_bytes(mem["system_used"])
+    sys_ram_total = mem["system_total_str"]
+    sys_ram_avail = mem["system_available_str"]
+    sys_ram_used = mem["system_used_str"]
     sys_ram_pct_str = f"{mem['system_percent']:.1f}%" if mem["system_percent"] is not None else "Unavailable"
 
-    proc_rss_str = format_bytes(mem["process_rss"])
+    proc_rss_str = mem["process_rss_str"]
     proc_pct_str = f"{mem['process_percent']:.2f}%" if mem["process_percent"] is not None else "Unavailable"
 
     container_limit = mem["container_limit"]
     if container_limit["is_limited"]:
-        container_note = f"⚠️ Limited to `{format_bytes(container_limit['limit_bytes'])}` ({container_limit['type']})"
+        container_note = f"⚠️ Limited to `{container_limit['limit_str']}` ({container_limit['type']})"
     else:
         container_note = "⚪ No cgroup limit (Full host memory)"
 
@@ -556,9 +526,9 @@ def build_stats_embed(stats: dict[str, Any]) -> discord.Embed:
     )
 
     # 4. Storage (Disk Space)
-    disk_total_str = format_bytes(disk["total"])
-    disk_used_str = format_bytes(disk["used"])
-    disk_free_str = format_bytes(disk["free"])
+    disk_total_str = disk["total_str"]
+    disk_used_str = disk["used_str"]
+    disk_free_str = disk["free_str"]
     disk_pct_str = f"{disk['percent']:.1f}%" if disk["percent"] is not None else "Unavailable"
 
     disk_lines = [
@@ -589,19 +559,12 @@ def build_stats_embed(stats: dict[str, Any]) -> discord.Embed:
     for item in env_vars:
         env_lines.append(f"{item['indicator']} **{item['name']}:** {item['status']}")
 
-    gdrive_detail = f" ({gdrive['detail']})" if gdrive["configured"] else ""
-    # Append gdrive summary if not already covered
-    if not any(item["name"] == "GOOGLE_DRIVE" for item in env_vars):
-        gdrive_icon = "✅" if gdrive["configured"] else "⚪"
-        env_lines.append(f"{gdrive_icon} **Google Drive:** {gdrive['status']}{gdrive_detail}")
-
     embed.add_field(
-        name="🔑 Environment & Credentials",
+        name="🔑 Environment & Configuration",
         value="\n".join(env_lines),
         inline=True,
     )
 
-    # Embed Footer with Container Context Note
     embed.set_footer(
         text="UBAgen Diagnostics • Note: Reported RAM & CPU may represent container allocation rather than host capacity."
     )
@@ -612,26 +575,27 @@ def build_stats_embed(stats: dict[str, Any]) -> discord.Embed:
 # ------------------------------------------------------------------------------
 # Discord Slash Command Registration
 # ------------------------------------------------------------------------------
-def register_stats_command(tree: app_commands.CommandTree, bot: discord.Client) -> None:
+def register_stats_command(tree: Any, bot: Any) -> None:
     """
     Registers the /stats slash command with the Discord CommandTree.
     Uses interaction.response.defer() to prevent Discord 3-second timeouts.
     """
+    if discord is None or tree is None:
+        logger.warning("discord.py is not available; slash command registration omitted.")
+        return
 
     @tree.command(name="stats", description="Displays backend infrastructure health, RAM, CPU, and dependencies.")
     async def stats_command(interaction: discord.Interaction) -> None:
-        # Step 1: Immediately defer interaction to prevent gateway timeout
         await interaction.response.defer(ephemeral=False, thinking=True)
 
         try:
-            # Step 2: Offload blocking system/disk/binary stat collection to worker thread
+            # Offload blocking stat collection to thread
             stats = await asyncio.to_thread(collect_all_stats, bot)
-
-            # Step 3: Construct Discord embed
             embed = build_stats_embed(stats)
-
-            # Step 4: Send the completed embed as followup
-            await interaction.followup.send(embed=embed)
+            if embed:
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.followup.send("Failed to construct stats embed.")
         except Exception as exc:
             logger.exception("Error executing /stats command: %s", exc)
             error_embed = discord.Embed(
@@ -640,3 +604,17 @@ def register_stats_command(tree: app_commands.CommandTree, bot: discord.Client) 
                 color=discord.Color.red(),
             )
             await interaction.followup.send(embed=error_embed)
+
+
+# ------------------------------------------------------------------------------
+# Direct CLI Execution (JSON Output for API / Local Inspection)
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    if "--json" in sys.argv or "-j" in sys.argv:
+        all_stats = collect_all_stats(None)
+        print(json.dumps(all_stats, default=str))
+        sys.exit(0)
+    else:
+        # Pretty print for terminal debugging
+        all_stats = collect_all_stats(None)
+        print(json.dumps(all_stats, indent=2, default=str))

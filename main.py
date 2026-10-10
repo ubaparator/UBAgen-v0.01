@@ -1,8 +1,8 @@
 """
 UBAgen — main.py
-Entry point for UBAgen Discord Bot and FastAPI Health Service.
+Entry point for UBAgen Discord Bot and FastAPI Monitoring Service.
 
-Runs both the Discord gateway client (discord.py) and the HTTP health endpoint (FastAPI/uvicorn)
+Runs both the Discord gateway client (discord.py) and the HTTP monitoring endpoint (FastAPI/uvicorn)
 concurrently within a single unified asyncio event loop, with clean signal handling and zero leaked secrets.
 """
 
@@ -16,8 +16,13 @@ import signal
 import sys
 from typing import Optional
 
-import discord
-from discord.ext import commands
+try:
+    import discord
+    from discord.ext import commands
+except ImportError:
+    discord = None
+    commands = None
+
 from dotenv import load_dotenv
 import uvicorn
 
@@ -39,62 +44,60 @@ logger = logging.getLogger("ubagen.main")
 # ------------------------------------------------------------------------------
 # UBAgen Bot Class
 # ------------------------------------------------------------------------------
-class UBAgenBot(commands.Bot):
-    """
-    Custom Bot instance managing slash command lifecycle and events.
-    Uses discord.Intents.default() without requiring privileged intents.
-    """
+if commands is not None:
+    class UBAgenBot(commands.Bot):
+        """
+        Custom Bot instance managing slash command lifecycle and events.
+        Uses discord.Intents.default() without requiring privileged intents.
+        """
 
-    def __init__(self, guild_id: Optional[int] = None) -> None:
-        # discord.Intents.default() includes GUILDS intent, sufficient for slash commands.
-        # Privileged intents (Message Content, Server Members) are NOT required.
-        intents = discord.Intents.default()
-
-        super().__init__(
-            command_prefix="!",  # Prefix is fallback; /stats is registered as slash command
-            intents=intents,
-            help_command=None,
-        )
-        self.dev_guild_id = guild_id
-
-    async def setup_hook(self) -> None:
-        """Called automatically before bot login. Registers commands and syncs tree."""
-        logger.info("Registering slash commands...")
-        register_stats_command(self.tree, self)
-
-        # Sync slash commands
-        if self.dev_guild_id:
-            dev_guild = discord.Object(id=self.dev_guild_id)
-            self.tree.copy_global_to(guild=dev_guild)
-            synced = await self.tree.sync(guild=dev_guild)
-            logger.info(
-                "⚡ Instantly synced %d slash command(s) to development guild ID: %d",
-                len(synced),
-                self.dev_guild_id,
+        def __init__(self, guild_id: Optional[int] = None) -> None:
+            intents = discord.Intents.default()
+            super().__init__(
+                command_prefix="!",
+                intents=intents,
+                help_command=None,
             )
-        else:
-            synced = await self.tree.sync()
-            logger.info(
-                "🌐 Synced %d global slash command(s). (Note: Global sync may take up to 1 hour to propagate)",
-                len(synced),
-            )
+            self.dev_guild_id = guild_id
 
-    async def on_ready(self) -> None:
-        """Fires when Discord gateway connection is established."""
-        if self.user:
-            logger.info("==================================================")
-            logger.info("🎉 UBAgen Bot is ONLINE!")
-            logger.info("Logged in as : %s (ID: %s)", self.user, self.user.id)
-            logger.info("Connected to : %d guild(s)", len(self.guilds))
-            logger.info("Gateway Ping : %.1f ms", self.latency * 1000)
-            logger.info("==================================================")
+        async def setup_hook(self) -> None:
+            """Called automatically before bot login. Registers commands and syncs tree."""
+            logger.info("Registering slash commands...")
+            register_stats_command(self.tree, self)
 
-            # Set bot activity
-            activity = discord.Activity(
-                type=discord.ActivityType.listening,
-                name="/stats",
-            )
-            await self.change_presence(status=discord.Status.online, activity=activity)
+            if self.dev_guild_id:
+                dev_guild = discord.Object(id=self.dev_guild_id)
+                self.tree.copy_global_to(guild=dev_guild)
+                synced = await self.tree.sync(guild=dev_guild)
+                logger.info(
+                    "⚡ Instantly synced %d slash command(s) to development guild ID: %d",
+                    len(synced),
+                    self.dev_guild_id,
+                )
+            else:
+                synced = await self.tree.sync()
+                logger.info(
+                    "🌐 Synced %d global slash command(s). (Note: Global sync may take up to 1 hour to propagate)",
+                    len(synced),
+                )
+
+        async def on_ready(self) -> None:
+            """Fires when Discord gateway connection is established."""
+            if self.user:
+                logger.info("==================================================")
+                logger.info("🎉 UBAgen Bot is ONLINE!")
+                logger.info("Logged in as : %s (ID: %s)", self.user, self.user.id)
+                logger.info("Connected to : %d guild(s)", len(self.guilds))
+                logger.info("Gateway Ping : %.1f ms", self.latency * 1000)
+                logger.info("==================================================")
+
+                activity = discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name="/stats",
+                )
+                await self.change_presence(status=discord.Status.online, activity=activity)
+else:
+    UBAgenBot = None
 
 
 # ------------------------------------------------------------------------------
@@ -106,19 +109,18 @@ async def run_fastapi_server(app, host: str, port: int, shutdown_event: asyncio.
         app=app,
         host=host,
         port=port,
-        log_level="warning",  # Keep health check spam out of logs
+        log_level="info",
         access_log=False,
     )
     server = uvicorn.Server(config)
 
-    # Monitor shutdown event
     async def watch_shutdown():
         await shutdown_event.wait()
         server.should_exit = True
 
     watcher_task = asyncio.create_task(watch_shutdown())
     try:
-        logger.info("Starting FastAPI health endpoint on http://%s:%d/health", host, port)
+        logger.info("Starting UBAgen Monitor on http://%s:%d/api/stats", host, port)
         await server.serve()
     finally:
         watcher_task.cancel()
@@ -128,18 +130,9 @@ async def run_fastapi_server(app, host: str, port: int, shutdown_event: asyncio.
 
 async def main() -> None:
     """Main application loop coordinating bot and web service."""
-    # 1. Load local environment variables from .env if present
     load_dotenv()
 
-    # 2. Extract configuration
     bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-    if not bot_token:
-        logger.critical(
-            "CRITICAL: 'DISCORD_BOT_TOKEN' environment variable is missing or empty! "
-            "Please set DISCORD_BOT_TOKEN in your environment or hosting dashboard."
-        )
-        sys.exit(1)
-
     port_str = os.getenv("PORT", "8080").strip()
     try:
         http_port = int(port_str)
@@ -158,13 +151,13 @@ async def main() -> None:
         except ValueError:
             logger.warning("Invalid DISCORD_GUILD_ID '%s'. Ignoring development guild sync.", guild_id_env)
 
-    # 3. Instantiate bot and health API
-    bot = UBAgenBot(guild_id=dev_guild_id)
+    # Instantiate bot if discord.py is available
+    bot = UBAgenBot(guild_id=dev_guild_id) if UBAgenBot is not None else None
     health_app = create_health_app(bot=bot)
 
     shutdown_event = asyncio.Event()
 
-    # 4. Attach OS signal handlers for graceful shutdown (SIGINT, SIGTERM)
+    # OS signal handlers for graceful shutdown (SIGINT, SIGTERM)
     loop = asyncio.get_running_loop()
 
     def handle_signal(sig_name: str) -> None:
@@ -175,55 +168,56 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, lambda s=sig.name: handle_signal(s))
         except (NotImplementedError, RuntimeError):
-            # Windows or restricted environments might not support signal handlers
             pass
 
-    # 5. Launch both tasks
     fastapi_task = asyncio.create_task(
         run_fastapi_server(health_app, host=http_host, port=http_port, shutdown_event=shutdown_event)
     )
 
-    async def start_discord_bot():
-        try:
-            logger.info("Connecting to Discord Gateway...")
-            await bot.start(bot_token)
-        except discord.errors.LoginFailure:
-            logger.critical(
-                "CRITICAL: Failed to log in to Discord. The provided DISCORD_BOT_TOKEN is invalid or expired."
-            )
-            shutdown_event.set()
-        except discord.errors.PrivilegedIntentsRequired:
-            logger.critical(
-                "CRITICAL: Privileged intents error. Ensure default intents are enabled in code."
-            )
-            shutdown_event.set()
-        except Exception as exc:
-            logger.exception("Unexpected error during Discord bot execution: %s", exc)
-            shutdown_event.set()
+    tasks_to_wait = [fastapi_task]
 
-    bot_task = asyncio.create_task(start_discord_bot())
+    # Start Discord bot only if token is supplied and discord is available
+    bot_task = None
+    if bot and bot_token:
+        async def start_discord_bot():
+            try:
+                logger.info("Connecting to Discord Gateway...")
+                await bot.start(bot_token)
+            except Exception as exc:
+                logger.error("Discord bot encountered error: %s", exc)
+                # Do not kill the web server if Discord connection fails; keep monitoring active
+                if hasattr(bot, "is_ready") and not bot.is_ready():
+                    logger.warning("Web API will remain online while Discord is disconnected.")
 
-    # Wait for either shutdown trigger or abnormal completion
+        bot_task = asyncio.create_task(start_discord_bot())
+        tasks_to_wait.append(bot_task)
+    else:
+        if not bot_token:
+            logger.warning(
+                "NOTICE: 'DISCORD_BOT_TOKEN' is not set. UBAgen is running in Web Monitor mode. "
+                "Discord bot will remain disconnected until DISCORD_BOT_TOKEN is set in your environment."
+            )
+        elif not bot:
+            logger.warning("NOTICE: discord.py is not installed; running in Web Monitor mode.")
+
     shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+    tasks_to_wait.append(shutdown_waiter)
+
     done, pending = await asyncio.wait(
-        [fastapi_task, bot_task, shutdown_waiter],
+        tasks_to_wait,
         return_when=asyncio.FIRST_COMPLETED,
     )
 
     logger.info("Shutdown initiated. Cleaning up active tasks...")
-
-    # Signal HTTP server to exit
     shutdown_event.set()
 
-    # Gracefully close Discord connection
-    if not bot.is_closed():
+    if bot and not bot.is_closed():
         logger.info("Closing Discord bot connection...")
         try:
             await bot.close()
         except Exception as e:
             logger.debug("Error while closing bot: %s", e)
 
-    # Await remaining tasks
     for task in pending:
         task.cancel()
         with suppress(asyncio.CancelledError):
