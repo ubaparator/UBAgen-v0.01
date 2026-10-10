@@ -1,29 +1,36 @@
-# UBAgen deployment secrets and runtime configuration
+# UBAgen secrets for Google AI Studio
 
-Do not commit a real `.env` file or any live credentials. The repository's GitHub Actions workflow only uses the deploy hook; the Discord bot token belongs in the **actual long-running host's runtime environment**.
+Do not commit a real `.env` file or live credentials. This repository is run from Google AI Studio Build mode, and the public `*.ai.studio` URL is published separately from GitHub Actions.
 
-## Required for a live Discord bot
+## Required for the live Discord bot
 
-- `DISCORD_BOT_TOKEN` — the bot token from Discord Developer Portal → Applications → your application → Bot. Set it as a secret/environment variable in the service that actually runs `python main.py`. Do not put the token in source code, a commit, Google AI Studio frontend code, or this document.
-- `DEPLOY_WEBHOOK_URL` — the private deploy/restart hook URL supplied by the hosting provider. Add it under GitHub repository **Settings → Secrets and variables → Actions → Secrets**. The workflow now fails the deploy job if this secret is missing, rather than claiming deployment succeeded.
-- `DEPLOY_WEBHOOK_METHOD` — a GitHub Actions **Variable** (not a secret), normally `POST`; set under Settings → Secrets and variables → Actions → Variables. Use `GET` only if the host's documented hook requires it.
+- `DISCORD_BOT_TOKEN` — the bot token from Discord Developer Portal → Applications → your application → Bot. Add it as a server-side secret in the **same Google AI Studio app's Secrets panel**. Do not put it in browser/frontend code, a commit, the README, or a public issue. The Node server spawns `python3 main.py` and passes its environment to the worker, so the worker can read this variable.
+- If using the local development workflow, put the token in a local `.env` file copied from `.env.example`; keep it untracked.
 
-## Optional runtime variables
+## Optional runtime configuration
 
-- `DISCORD_GUILD_ID` — the numeric ID of the test Discord server; speeds up slash-command propagation during development. Set in the bot host's runtime environment, not in GitHub Actions unless the workflow explicitly passes it to the service.
-- `PORT` — normally provided by the host; the app defaults to `8080`.
-- `HOST` — defaults to `0.0.0.0`.
-- `ENVIRONMENT` — informational label, e.g. `production`.
+- `DISCORD_GUILD_ID` — numeric ID of your test Discord server. Add it to the same AI Studio app's server-side secrets/environment settings if you want faster guild-scoped slash-command sync.
+- `PORT` — provided by the hosting environment in production; Express uses port 3000 in development mode.
+- `HOST` — Python backend defaults to `0.0.0.0`.
+- `BACKEND_URL` — only needed if the Node server should query a separate Python backend. In the normal AI Studio Run path, `server.ts` starts its own Python worker on port 5050, so leave this unset.
 
-## Where each value goes
+## Which system to use
 
-- **GitHub:** only `DEPLOY_WEBHOOK_URL` as a repository Actions secret and `DEPLOY_WEBHOOK_METHOD=POST` as an Actions variable.
-- **Bot host (Render/Railway/Cloud Run/other actual runtime):** `DISCORD_BOT_TOKEN` as a protected runtime secret, plus optional runtime variables.
-- **Google AI Studio:** do not paste the bot token into browser/frontend code. If AI Studio is only your editor, it is not the bot's runtime secret store.
-- **Local development:** copy `.env.example` to `.env`, enter the token locally, and keep `.env` untracked.
+- **Google AI Studio → your app → Secrets:** put `DISCORD_BOT_TOKEN` here for the Run/published app's server-side environment.
+- **GitHub → Settings → Secrets and variables → Actions:** no deploy webhook is required for the normal AI Studio workflow. GitHub Actions validates source code; it does not restart AI Studio Run or publish the public app.
+- **GitHub repository:** source code only; never commit actual credentials.
+- **AI Studio Run:** tests the current code in the Build workspace.
+- **AI Studio Publish/Republish:** updates the public `*.ai.studio` app after you sync the intended code into AI Studio and test it.
 
-## Important limitations
+## Correct update flow after a GitHub commit
 
-A Discord interaction attachment must first be accepted by Discord, so increasing the bot-side validation cap to 1.5 GB does not override Discord's account/server upload limit. For files larger than Discord accepts, use the command's `magnet_uri` option or a controlled external upload/storage flow.
+1. Merge the reviewed pull request into the intended branch.
+2. In the same AI Studio Build project, open Settings → GitHub and sync/pull the latest repository changes into the workspace. Review conflicts if prompted.
+3. Run the app in AI Studio and confirm the Discord bot connects.
+4. Use Publish/Republish to update the public `*.ai.studio` deployment.
 
-The `/altyazi_ayikla` command processes files in a temporary directory, which is cleaned automatically when processing ends. The bot's successful result message is configured to disappear after six minutes; a slash-command attachment itself is not a bot-owned message that the bot can delete from Discord's UI.
+A GitHub commit alone does not guarantee that an already-running Run session or the public deployment has restarted.
+
+## Video upload limitation
+
+The bot's 1.5 GB limit is an application-side validation limit. It does not override Discord's own upload cap for interaction attachments. For larger videos, use the command's `magnet_uri` input or implement a separate upload/storage flow. The successful result message is configured to disappear after six minutes; a command attachment is not a bot-owned Discord message that the bot can delete from the UI.
