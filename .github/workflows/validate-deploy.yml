@@ -1,0 +1,72 @@
+name: Validate and deploy UBAgen
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Compile Python modules
+        run: python -m compileall -q main.py subtitle_extract.py stats.py health_api.py tests
+
+      - name: Run Python regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Type-check frontend
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build production Docker image
+        run: docker build --tag ubagen-ci-test .
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger hosting provider deploy hook
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+          DEPLOY_WEBHOOK_METHOD: ${{ vars.DEPLOY_WEBHOOK_METHOD }}
+        run: |
+          if [ -z "$DEPLOY_WEBHOOK_URL" ]; then
+            echo "::notice::DEPLOY_WEBHOOK_URL is not configured; validation passed, but no external service was restarted."
+            exit 0
+          fi
+          METHOD="${DEPLOY_WEBHOOK_METHOD:-POST}"
+          case "$METHOD" in
+            GET|POST) ;;
+            *) echo "DEPLOY_WEBHOOK_METHOD must be GET or POST"; exit 1 ;;
+          esac
+          curl --fail --silent --show-error --max-time 30 -X "$METHOD" "$DEPLOY_WEBHOOK_URL"
