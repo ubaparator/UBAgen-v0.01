@@ -52,6 +52,36 @@ function ensurePythonWorker() {
   }
 }
 
+function degradedStats(reason: string) {
+  return {
+    status: 'degraded',
+    timestamp: new Date().toISOString(),
+    diagnostic_message: reason,
+    bot: { status: 'unavailable', connected: false, is_ready: false,
+      diagnostic_message: 'Bot statistics are temporarily unavailable.', latency_ms: null,
+      user: 'Unavailable', guild_count: 0, uptime_seconds: null, uptime_str: 'Unavailable',
+      sync_status: null, client_id: null, invite_url: null },
+    compute: { cpu_usage_pct: null, logical_cores: null, physical_cores: null,
+      os_name: 'Unavailable', python_version: 'Unavailable', python_impl: 'Unavailable',
+      system_uptime_sec: null, system_uptime_str: 'Unavailable',
+      backend_uptime_sec: null, backend_uptime_str: 'Unavailable' },
+    memory: { system_total_bytes: null, system_total_str: 'Unavailable',
+      system_used_bytes: null, system_used_str: 'Unavailable',
+      system_available_bytes: null, system_available_str: 'Unavailable',
+      system_free_bytes: null, system_free_str: 'Unavailable', system_percent: null,
+      container_limit: { is_limited: false, memory_limited: false, cpu_limited: false,
+        limit_bytes: null, limit_str: 'Unavailable', usage_bytes: null, usage_str: null,
+        cpu_quota_cores: null, cpu_quota_str: 'Unavailable', type: 'Unavailable',
+        description: 'Container metrics unavailable' },
+      process_rss_bytes: null, process_rss_str: 'Unavailable', process_percent: null },
+    disk: { total_bytes: null, total_str: 'Unavailable', used_bytes: null,
+      used_str: 'Unavailable', free_bytes: null, free_str: 'Unavailable', percent: null },
+    binaries: { ffmpeg: { installed: false, version: 'Unavailable', path: null },
+      aria2: { installed: false, version: 'Unavailable', path: null } },
+    env_vars: [],
+  };
+}
+
 async function startServer() {
   const app = express();
   const isProduction = process.env.NODE_ENV === 'production';
@@ -121,12 +151,12 @@ async function startServer() {
         }
       }
 
-      console.error('stats.py execution error:', error?.message || stderr);
-      return res.status(503).json({
-        status: 'error',
-        error: 'Backend statistics collection failed',
-        details: error?.message || stderr || 'Unknown error',
-      });
+      const reason = 'Backend statistics collection is temporarily unavailable.';
+      console.error('stats.py execution error:', error?.message || stderr || 'Unknown error');
+      // Return a valid dashboard payload instead of HTTP 503; the next poll retries.
+      const fallback = degradedStats(reason);
+      statsCache = { expiresAt: Date.now() + 1000, data: fallback };
+      return res.status(200).json(fallback);
     });
   });
 
