@@ -267,7 +267,7 @@ export default function App() {
       // endpointUrl may be a full URL ending in /api/stats or a same-origin path.
       let restartUrl = '/api/admin/restart-bot';
       try {
-        if (/^https?:\\/\\//i.test(endpointUrl)) {
+        if (endpointUrl.startsWith('http://') || endpointUrl.startsWith('https://')) {
           restartUrl = new URL('/api/admin/restart-bot', endpointUrl).toString();
         }
       } catch {
