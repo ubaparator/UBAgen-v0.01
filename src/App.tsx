@@ -131,6 +131,7 @@ export default function App() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
+  const [restartingBot, setRestartingBot] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -255,6 +256,34 @@ export default function App() {
     fetchStats(true);
   };
 
+  const handleRestartBot = async () => {
+    if (!window.confirm('Discord botunu yeniden başlatmak istiyor musun? Bot birkaç saniyeliğine çevrimdışı olabilir.')) return;
+    const adminToken = window.prompt('Sunucuda tanımlı UBAGEN_ADMIN_TOKEN değerini gir:');
+    if (!adminToken?.trim()) return;
+
+    setRestartingBot(true);
+    try {
+      const response = await fetch('/api/admin/restart-bot', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${adminToken.trim()}`,
+        },
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || `HTTP ${response.status}`);
+      }
+      window.alert('Yeniden başlatma isteği alındı. Botun tekrar bağlanması birkaç saniye sürebilir.');
+      window.setTimeout(() => fetchStats(true), 5000);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Bilinmeyen hata';
+      window.alert(`Bot yeniden başlatılamadı: ${message}`);
+    } finally {
+      setRestartingBot(false);
+    }
+  };
+
   const handleSaveEndpoint = (e: React.FormEvent) => {
     e.preventDefault();
     const cleanUrl = customUrlInput.trim() || '/api/stats';
@@ -356,6 +385,18 @@ export default function App() {
           >
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
             <span>{refreshing ? 'Reading...' : 'Refresh'}</span>
+          </button>
+
+          {/* Secure Bot Restart Button */}
+          <button
+            type="button"
+            onClick={handleRestartBot}
+            disabled={restartingBot}
+            className="px-3 py-1.5 text-xs font-medium rounded-lg bg-rose-600/15 text-rose-300 border border-rose-500/30 hover:bg-rose-600/25 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Restart the Discord bot worker (requires UBAGEN_ADMIN_TOKEN)"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${restartingBot ? 'animate-spin' : ''}`} />
+            <span>{restartingBot ? 'Restarting Bot…' : 'Restart Bot'}</span>
           </button>
 
           {/* Connection Settings Toggle */}

@@ -65,6 +65,7 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 | Variable | Required | Default | Purpose |
 | :--- | :---: | :---: | :--- |
 | `DISCORD_BOT_TOKEN` | Optional | *Empty* | Your bot token from the Discord Developer Portal. If left empty, UBAgen runs in web-only monitoring mode. |
+| `UBAGEN_ADMIN_TOKEN` | Optional | *Empty* | Private bearer token required by the dashboard's authenticated Discord bot restart button. Keep it in host-side Secrets only. |
 | `DISCORD_GUILD_ID` | Optional | *Empty* | Your Discord Server (Guild) ID for **instant** slash command registration during testing. If omitted, global sync is used. |
 | `PORT` | Optional | `8080` (or `3000`) | HTTP server port. Injected automatically by hosting platforms. |
 | `HOST` | Optional | `0.0.0.0` | Network binding interface. |
@@ -82,6 +83,7 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
   Headers: `Cache-Control: no-store, no-cache, max-age=0`.
 - **`GET /health`**:
   Returns lightweight JSON status (`{"status":"healthy","service":"ubagen-backend","http":"alive","discord_bot":{...}}`) for container health checks.
+- **`POST /api/admin/restart-bot`**: Restarts only the Python Discord worker (the dashboard stays online). Requires `Authorization: Bearer <UBAGEN_ADMIN_TOKEN>`, returns `401` for invalid tokens, `503` when not configured/unavailable, and rate-limits repeated requests. The host automatically starts a fresh worker after the old one exits.
 
 ---
 
@@ -101,6 +103,7 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
      --restart unless-stopped \
      -p 8080:8080 \
      -e DISCORD_BOT_TOKEN="your_discord_bot_token" \
+     -e UBAGEN_ADMIN_TOKEN="set_a_long_random_private_value" \
      -e DISCORD_GUILD_ID="your_server_id_optional" \
      ubagen:latest
    ```
