@@ -56,6 +56,7 @@ import uvicorn
 
 from health_api import create_health_app
 from stats import register_stats_command, BotTracker
+from subtitle_extract import register_subtitle_extract_command
 
 # ------------------------------------------------------------------------------
 # Logging Configuration
@@ -101,6 +102,7 @@ if commands is not None:
             """Called automatically before bot login. Registers commands and syncs tree."""
             logger.info("Registering slash commands...")
             register_stats_command(self.tree, self)
+            register_subtitle_extract_command(self.tree)
 
             # Sync slash commands with robust fallback
             if self.dev_guild_id:
