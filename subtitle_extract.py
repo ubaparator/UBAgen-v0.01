@@ -26,8 +26,16 @@ def _run(args, timeout):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
 
 
+def subtitle_format(codec: str) -> tuple[str, str]:
+    """Return (file suffix, FFmpeg subtitle encoder) without losing ASS styling."""
+    normalized = codec.strip().lower()
+    if normalized in {"ass", "ssa"}:
+        return ".ass", "ass"
+    return ".srt", "srt"
+
+
 def clean_srt_file(path: Path) -> None:
-    """Remove HTML and ASS/SSA override tags from extracted SRT text."""
+    """Remove markup from SRT text while keeping subtitle timing and content."""
     raw = path.read_text(encoding="utf-8-sig", errors="replace")
     raw = re.sub(r"(?is)<br\s*/?>", "\n", raw)
     raw = re.sub(r"(?is)</?(?:i|b|u|font|span|ruby|rt|c)(?:\s+[^>]*)?>", "", raw)
@@ -180,13 +188,14 @@ def register_subtitle_extract_command(tree):
                         "Seçilen altyazı görüntü tabanlı; metne dönüştürmek için OCR gerekir."
                     )
                     return
-                output = workdir / "extracted.srt"
+                suffix, subtitle_encoder = subtitle_format(codec)
+                output = workdir / f"extracted{suffix}"
                 result = await asyncio.to_thread(
                     _run,
                     [
                         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                         "-i", str(selected), "-map", f"0:{selected_stream['index']}",
-                        "-vn", "-an", "-c:s", "srt", str(output),
+                        "-vn", "-an", "-c:s", subtitle_encoder, str(output),
                     ],
                     120,
                 )
@@ -194,7 +203,10 @@ def register_subtitle_extract_command(tree):
                     logger.warning("Subtitle extraction failed: %s", result.stderr[-1000:])
                     await interaction.followup.send("Altyazı çıkarılamadı; akış desteklenmiyor olabilir.")
                     return
-                clean_srt_file(output)
+                # ASS/SSA override tags and style metadata are meaningful; only
+                # sanitize SRT text, never strip formatting from ASS output.
+                if suffix == ".srt":
+                    clean_srt_file(output)
                 if output.stat().st_size > MAX_OUTPUT:
                     await interaction.followup.send("Çıktı 8 MB sınırını aşıyor.")
                     return
@@ -202,7 +214,7 @@ def register_subtitle_extract_command(tree):
                     await interaction.followup.send("Çıkarılan altyazı boş.")
                     return
 
-                filename = f"{selected.stem[:70]}_{lang}.srt"
+                filename = f"{selected.stem[:70]}_{lang}{suffix}"
                 await interaction.followup.send(
                     f"Altyazı çıkarıldı: {selected.name} (hedef dil: {lang}; akış kodu: {codec or 'bilinmiyor'}).",
                     file=discord.File(str(output), filename=filename),
