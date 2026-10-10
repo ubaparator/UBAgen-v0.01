@@ -29,6 +29,50 @@ from stats import collect_all_stats
 SERVICE_START_TIME = time.time()
 
 
+def _degraded_stats(reason: str) -> dict[str, Any]:
+    """Return the same public schema without inventing unavailable measurements."""
+    return {
+        "status": "degraded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "diagnostic_message": reason,
+        "bot": {
+            "status": "unavailable", "connected": False, "is_ready": False,
+            "diagnostic_message": "Bot statistics are temporarily unavailable.",
+            "latency_ms": None, "user": "Unavailable", "guild_count": 0,
+            "uptime_seconds": None, "uptime_str": "Unavailable",
+            "sync_status": None, "client_id": None, "invite_url": None,
+        },
+        "compute": {
+            "cpu_usage_pct": None, "logical_cores": None, "physical_cores": None,
+            "os_name": "Unavailable", "python_version": "Unavailable", "python_impl": "Unavailable",
+            "system_uptime_sec": None, "system_uptime_str": "Unavailable",
+            "backend_uptime_sec": None, "backend_uptime_str": "Unavailable",
+        },
+        "memory": {
+            "system_total_bytes": None, "system_total_str": "Unavailable",
+            "system_used_bytes": None, "system_used_str": "Unavailable",
+            "system_available_bytes": None, "system_available_str": "Unavailable",
+            "system_free_bytes": None, "system_free_str": "Unavailable", "system_percent": None,
+            "container_limit": {
+                "is_limited": False, "memory_limited": False, "cpu_limited": False,
+                "limit_bytes": None, "limit_str": "Unavailable", "usage_bytes": None,
+                "usage_str": None, "cpu_quota_cores": None, "cpu_quota_str": "Unavailable",
+                "type": "Unavailable", "description": "Container metrics unavailable",
+            },
+            "process_rss_bytes": None, "process_rss_str": "Unavailable", "process_percent": None,
+        },
+        "disk": {
+            "total_bytes": None, "total_str": "Unavailable", "used_bytes": None,
+            "used_str": "Unavailable", "free_bytes": None, "free_str": "Unavailable", "percent": None,
+        },
+        "binaries": {
+            "ffmpeg": {"installed": False, "version": "Unavailable", "path": None},
+            "aria2": {"installed": False, "version": "Unavailable", "path": None},
+        },
+        "env_vars": [],
+    }
+
+
 def create_health_app(bot: Any = None) -> FastAPI:
     """
     Factory creating the FastAPI application.
@@ -51,8 +95,9 @@ def create_health_app(bot: Any = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Store bot instance in application state
+    # Store bot instance and last valid snapshot in application state.
     app.state.bot = bot
+    app.state.last_stats = None
 
     @app.get("/api/stats", summary="Real-time Hardware & Bot Statistics")
     @app.get("/stats", summary="Real-time Hardware & Bot Statistics (Alias)")
@@ -62,9 +107,20 @@ def create_health_app(bot: Any = None) -> FastAPI:
         Runs non-blocking inside asyncio.to_thread to avoid blocking gateway loop.
         """
         current_bot = getattr(app.state, "bot", None)
-        stats = await asyncio.to_thread(collect_all_stats, current_bot)
+        try:
+            stats = await asyncio.to_thread(collect_all_stats, current_bot)
+            app.state.last_stats = stats
+        except Exception as exc:
+            # Keep a last known good snapshot if possible; otherwise return a typed
+            # degraded payload with HTTP 200 so every frontend can render/retry cleanly.
+            import logging
+            logging.getLogger("ubagen.health").exception("Statistics collection failed")
+            stats = getattr(app.state, "last_stats", None) or _degraded_stats(
+                f"Statistics temporarily unavailable ({type(exc).__name__})."
+            )
         return JSONResponse(
             content=stats,
+            status_code=200,
             headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",
