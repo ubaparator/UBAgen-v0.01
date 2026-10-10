@@ -46,7 +46,7 @@ def create_health_app(bot: Any = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["GET", "OPTIONS"],
         allow_headers=["*"],
     )

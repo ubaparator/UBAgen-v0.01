@@ -217,7 +217,7 @@ export default function App() {
     [endpointUrl]
   );
 
-  // Polling loop: every 2 seconds
+  // Polling loop: every 5 seconds to reduce background resource usage
   useEffect(() => {
     fetchStats(false);
 
@@ -226,7 +226,7 @@ export default function App() {
     if (!isPaused) {
       timerRef.current = setInterval(() => {
         fetchStats(false);
-      }, 2000);
+      }, 5000);
     }
 
     return () => {
