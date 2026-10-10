@@ -31,6 +31,7 @@ interface StatsResponse {
   timestamp: string;
   epoch_time: number;
   bot: {
+    status?: string;
     is_ready: boolean;
     connected: boolean;
     latency_ms: number | null;
@@ -38,6 +39,8 @@ interface StatsResponse {
     guild_count: number;
     uptime_seconds: number | null;
     uptime_str: string;
+    diagnostic_message?: string;
+    sync_status?: string | null;
   };
   compute: {
     cpu_usage_pct: number | null;
@@ -130,21 +133,11 @@ export default function App() {
           cache: 'no-store',
         });
 
-        const contentType = response.headers.get('content-type') || '';
-        const rawText = await response.text();
-
-        // Guard against HTML warmup pages, proxy 502/504 pages, or non-JSON responses
-        if (!contentType.includes('application/json') || rawText.trim().startsWith('<')) {
-          console.warn('Backend returned HTML (warming up). Retrying in next polling cycle...');
-          setError('Backend is initializing or warming up... Connecting in 2s');
-          return;
-        }
-
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
 
-        const data: StatsResponse = JSON.parse(rawText);
+        const data: StatsResponse = await response.json();
         setStats(data);
         setError(null);
         setLastUpdated(new Date());
@@ -398,10 +391,30 @@ export default function App() {
                 <CheckCircle2 className="w-3.5 h-3.5" />
                 Connected ({stats.bot.latency_ms ?? 0} ms)
               </span>
+            ) : stats?.bot?.status === 'invalid_token' ? (
+              <span className="flex items-center gap-1 text-rose-400 font-semibold" title="Authentication failed: verify DISCORD_BOT_TOKEN">
+                <XCircle className="w-3.5 h-3.5" />
+                Auth Failed (Invalid Token)
+              </span>
+            ) : stats?.bot?.status === 'connecting' ? (
+              <span className="flex items-center gap-1 text-sky-400 font-semibold">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                Connecting...
+              </span>
+            ) : stats?.bot?.status === 'not_configured' ? (
+              <span className="flex items-center gap-1 text-slate-400 font-semibold" title="Running in Web Monitor mode">
+                <HelpCircle className="w-3.5 h-3.5" />
+                Web Monitor Mode
+              </span>
+            ) : stats?.bot?.status === 'network_error' ? (
+              <span className="flex items-center gap-1 text-amber-400 font-semibold">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                Network Reconnecting
+              </span>
             ) : (
               <span className="flex items-center gap-1 text-rose-400 font-semibold">
                 <XCircle className="w-3.5 h-3.5" />
-                Offline
+                Disconnected
               </span>
             )}
           </div>
@@ -658,15 +671,41 @@ export default function App() {
                     className={`px-2 py-0.5 text-xs font-semibold rounded-md border flex items-center gap-1 ${
                       stats.bot.connected
                         ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                        : stats.bot.status === 'invalid_token'
+                        ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+                        : stats.bot.status === 'connecting'
+                        ? 'bg-sky-500/10 text-sky-400 border-sky-500/30'
+                        : stats.bot.status === 'network_error'
+                        ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                        : stats.bot.status === 'not_configured'
+                        ? 'bg-slate-800 text-slate-400 border-slate-700'
                         : 'bg-rose-500/10 text-rose-400 border-rose-500/30'
                     }`}
                   >
                     <span
                       className={`w-1.5 h-1.5 rounded-full ${
-                        stats.bot.connected ? 'bg-emerald-400' : 'bg-rose-400'
+                        stats.bot.connected
+                          ? 'bg-emerald-400'
+                          : stats.bot.status === 'connecting'
+                          ? 'bg-sky-400 animate-pulse'
+                          : stats.bot.status === 'network_error'
+                          ? 'bg-amber-400'
+                          : stats.bot.status === 'not_configured'
+                          ? 'bg-slate-400'
+                          : 'bg-rose-400'
                       }`}
                     />
-                    {stats.bot.connected ? 'Connected' : 'Disconnected'}
+                    {stats.bot.connected
+                      ? 'Connected'
+                      : stats.bot.status === 'invalid_token'
+                      ? 'Auth Failed'
+                      : stats.bot.status === 'connecting'
+                      ? 'Connecting'
+                      : stats.bot.status === 'network_error'
+                      ? 'Network Error'
+                      : stats.bot.status === 'not_configured'
+                      ? 'Not Configured'
+                      : 'Disconnected'}
                   </span>
                 </div>
 
@@ -676,20 +715,44 @@ export default function App() {
                 <p className="text-xs text-slate-400 mt-1">
                   {stats.bot.connected
                     ? `Connected to ${stats.bot.guild_count} Discord server(s)`
-                    : 'Set DISCORD_BOT_TOKEN in hosting env to connect'}
+                    : stats.bot.status === 'invalid_token'
+                    ? 'DISCORD_BOT_TOKEN rejected by Discord Gateway'
+                    : stats.bot.status === 'not_configured'
+                    ? 'Running in Web Monitor mode (token not provided)'
+                    : 'Backend attempting connection to Discord'}
                 </p>
 
-                <div className="mt-3 text-xs space-y-1 text-slate-300">
+                {/* Safe Diagnostic Message Box */}
+                {stats.bot.diagnostic_message && (
+                  <div className="mt-3 p-2 rounded-xl bg-slate-950/70 border border-slate-800/80 text-[11px] text-slate-300">
+                    <span className="font-semibold text-slate-400 block text-[10px] uppercase tracking-wider mb-0.5">
+                      Diagnostic Status
+                    </span>
+                    <span className="leading-relaxed block">
+                      {stats.bot.diagnostic_message}
+                    </span>
+                  </div>
+                )}
+
+                <div className="mt-3 text-xs space-y-1.5 text-slate-300">
                   <div className="flex justify-between">
                     <span className="text-slate-400">Gateway Latency:</span>
-                    <span className="font-mono text-indigo-300">
+                    <span className="font-mono text-indigo-300 font-semibold">
                       {stats.bot.latency_ms !== null ? `${stats.bot.latency_ms} ms` : 'Offline'}
                     </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-400">Slash Command:</span>
-                    <span className="font-mono text-emerald-400">/stats Active</span>
+                    <span className="font-mono text-emerald-400">/stats Available</span>
                   </div>
+                  {stats.bot.sync_status && (
+                    <div className="flex justify-between text-[11px] pt-0.5 border-t border-slate-800/60">
+                      <span className="text-slate-400">Sync:</span>
+                      <span className="font-mono text-slate-300 truncate max-w-[180px]" title={stats.bot.sync_status}>
+                        {stats.bot.sync_status}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
 

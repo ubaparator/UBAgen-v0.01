@@ -75,26 +75,43 @@ def create_health_app(bot: Any = None) -> FastAPI:
     async def health_check() -> JSONResponse:
         """
         Lightweight health check endpoint for container orchestrators.
+        Always returns HTTP 200 while HTTP service is alive, detailing bot gateway status.
         """
         current_bot = getattr(app.state, "bot", None)
-        bot_is_ready = bool(current_bot and hasattr(current_bot, "is_ready") and current_bot.is_ready())
-        latency_ms = (
-            round(current_bot.latency * 1000, 2)
-            if (bot_is_ready and current_bot and getattr(current_bot, "latency", None) is not None)
-            else None
-        )
-        bot_user = str(current_bot.user) if (bot_is_ready and current_bot and getattr(current_bot, "user", None)) else None
+        tracker = getattr(current_bot, "tracker", None) if current_bot else None
+
+        if tracker:
+            bot_is_ready = tracker.is_ready
+            bot_connected = tracker.connected
+            latency_ms = tracker.latency_ms
+            bot_user = tracker.user
+            diagnostic_msg = tracker.diagnostic_message
+            bot_state = tracker.status
+        else:
+            bot_is_ready = bool(current_bot and hasattr(current_bot, "is_ready") and current_bot.is_ready())
+            bot_connected = bot_is_ready
+            latency_ms = (
+                round(current_bot.latency * 1000, 2)
+                if (bot_is_ready and current_bot and getattr(current_bot, "latency", None) is not None)
+                else None
+            )
+            bot_user = str(current_bot.user) if (bot_is_ready and current_bot and getattr(current_bot, "user", None)) else None
+            bot_state = "connected" if bot_is_ready else "disconnected"
+            diagnostic_msg = "Bot is connected." if bot_is_ready else "Bot is disconnected."
+
         uptime_sec = int(time.time() - SERVICE_START_TIME)
 
         payload = {
-            "status": "healthy" if bot_is_ready else "starting",
+            "status": "healthy",
             "service": "ubagen-backend",
             "http": "alive",
             "discord_bot": {
-                "connected": bot_is_ready,
+                "status": bot_state,
+                "connected": bot_connected,
+                "ready": bot_is_ready,
                 "latency_ms": latency_ms,
                 "user": bot_user,
-                "ready": bot_is_ready,
+                "diagnostic_message": diagnostic_msg,
             },
             "uptime_seconds": uptime_sec,
             "timestamp": datetime.now(timezone.utc).isoformat(),
