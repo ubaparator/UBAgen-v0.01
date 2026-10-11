@@ -77,6 +77,7 @@ from subtitle_extract import (
     select_subtitle_stream,
     subtitle_format,
     validate_magnet_uri,
+    validate_video_source,
 )
 
 logger = logging.getLogger("ubagen.encoder")
@@ -1364,6 +1365,36 @@ def dispatch_encode_job_background(job_id: str, *, allow_retry: bool = False) ->
 
     discover_and_apply_runtime_config()
     env_details = detect_cloud_run_environment_details()
+
+    # Explicit no-Job-IAM mode: run the isolated worker process inside this service container.
+    # This avoids the Cloud Run Jobs API and its run.jobs.run permission entirely.
+    encoder_mode = os.getenv("UBAGEN_ENCODER_MODE", "cloud_run_job").strip().lower()
+    if encoder_mode in {"service_worker", "local_service_worker"}:
+        worker_script = Path(__file__).resolve()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-B", str(worker_script), "--job-id", job_id],
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "UBAGEN_JOB_ID": job_id},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            reason = f"Servis içi encoder worker başlatılamadı: {sanitize_process_output(str(exc), max_chars=300)}"
+            store.mark_job_failed(job_id, reason)
+            return {"dispatched": False, "mode": "service_worker_error", "reason": reason}
+        log_thread = threading.Thread(
+            target=_stream_worker_subprocess_logs,
+            args=(proc, job_id),
+            name=f"ubagen-worker-log-{job_id}",
+            daemon=True,
+        )
+        log_thread.start()
+        store.update_job_progress(job_id, worker_execution_name=f"service-worker-pid-{proc.pid}")
+        return {"dispatched": True, "mode": "service_worker", "pid": proc.pid}
+
     if env_details.get("cloud_run_job_configured") and not _is_local_worker_fallback_allowed():
         res = trigger_cloud_run_job_execution(job_id)
         if res.get("dispatched"):
@@ -1453,7 +1484,7 @@ async def submit_encode_job_from_interaction(
             await interaction.edit_original_response(content="❌ Kullanıcı kimliği doğrulanamadı.")
         return None
 
-    valid_mag, mag_or_err = validate_magnet_uri(magnet)
+    valid_mag, mag_or_err = validate_video_source(magnet)
     if not valid_mag:
         if hasattr(interaction, "edit_original_response"):
             await interaction.edit_original_response(content=f"❌ {mag_or_err}")
@@ -1989,10 +2020,10 @@ def register_encoder_commands(tree: Any, bot: Optional[Any] = None) -> list[Any]
     if tree.get_command(ENCODE_COMMAND_NAME) is None:
         @tree.command(
             name=ENCODE_COMMAND_NAME,
-            description="Magnetten videoyu indirir, ASS/SRT altyazı ve intro ile H.264/H.265 encode eder.",
+            description="URL veya magnet videoyu indirir, altyazı/intro ile H.264/H.265 encode eder.",
         )
         @app_commands.describe(
-            magnet="Zorunlu torrent magnet bağlantısı (magnet:?xt=urn:btih:...)",
+            magnet="Doğrudan HTTP/HTTPS video URL’si veya torrent magnet bağlantısı",
             codec="Video codec seçimi: h264 (libx264) veya h265 (libx265)",
             dil="Altyazı dil kodu (varsayılan: tur)",
             altyazi_url="İsteğe bağlı harici .ass veya .srt altyazı dosyası URL'si",
@@ -2026,10 +2057,10 @@ def register_encoder_commands(tree: Any, bot: Optional[Any] = None) -> list[Any]
     if tree.get_command(ENCODEAL_COMMAND_NAME) is None:
         @tree.command(
             name=ENCODEAL_COMMAND_NAME,
-            description="Magnet, isteğe bağlı ASS/SRT altyazı ve intro dosya ekiyle H.264/H.265 encode eder.",
+            description="URL veya magnet videoyu, isteğe bağlı altyazı/intro ekiyle encode eder.",
         )
         @app_commands.describe(
-            magnet="Zorunlu torrent magnet bağlantısı (magnet:?xt=urn:btih:...)",
+            magnet="Doğrudan HTTP/HTTPS video URL’si veya torrent magnet bağlantısı",
             altyazi="İsteğe bağlı .ass veya .srt altyazı dosyası eki (GCS staging'e yüklenir)",
             intro="İsteğe bağlı intro video dosyası eki (.mp4/.mkv, GCS staging'e yüklenir)",
             codec="Video codec seçimi: h264 (libx264) veya h265 (libx265)",

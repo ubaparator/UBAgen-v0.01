@@ -36,7 +36,7 @@ from job_store import (
 )
 from stats import collect_all_stats, get_recent_logs, install_log_buffer_handler
 from storage_manager import get_storage_manager
-from subtitle_extract import normalize_language_code, validate_magnet_uri
+from subtitle_extract import normalize_language_code, validate_magnet_uri, validate_video_source
 
 SERVICE_START_TIME = time.time()
 logger = logging.getLogger("ubagen.health")
@@ -443,7 +443,7 @@ def create_health_app(
                 headers={"Cache-Control": "no-store"},
             )
 
-        ok_mag, mag_or_err = validate_magnet_uri(magnet)
+        ok_mag, mag_or_err = validate_video_source(magnet)
         if not ok_mag:
             return JSONResponse(
                 content={"error": mag_or_err},
