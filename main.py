@@ -514,8 +514,46 @@ async def run_discord_bot(
         try:
             logger.info("Connecting to Discord Gateway...")
             await bot.start(token)
-            # If bot.start returns normally without error (e.g. clean close during restart/shutdown)
-            break
+            # A normal return is expected only when shutdown/restart was requested. If the
+            # Gateway session ends unexpectedly, keep the HTTP service alive and reconnect.
+            if _should_stop():
+                break
+
+            tracker.reconnect_attempts = getattr(tracker, "reconnect_attempts", 0) + 1
+            tracker.last_error_time = time.time()
+            tracker.status = "disconnected"
+            tracker.connected = False
+            tracker.is_ready = False
+            tracker.diagnostic_message = (
+                f"Discord Gateway session ended unexpectedly. Reconnecting in {int(reconnect_delay)}s..."
+            )
+            if hasattr(bot, "write_state_file"):
+                with suppress(Exception):
+                    bot.write_state_file()
+            logger.warning(
+                "Discord Gateway session ended without a shutdown request. Retrying in %ds...",
+                int(reconnect_delay),
+            )
+            if hasattr(bot, "close") and callable(bot.close):
+                with suppress(Exception):
+                    await bot.close()
+
+            wait_events: list[asyncio.Event] = [shutdown_event]
+            if stop_event is not None:
+                wait_events.append(stop_event)
+            if wake_event is not None:
+                wait_events.append(wake_event)
+            try:
+                await _wait_for_any_event(wait_events, timeout=reconnect_delay)
+            except asyncio.TimeoutError:
+                reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+                continue
+            if _should_stop():
+                break
+            if wake_event is not None and wake_event.is_set():
+                wake_event.clear()
+                reconnect_delay = initial_retry_delay
+            continue
         except asyncio.CancelledError:
             break
         except Exception as exc:
