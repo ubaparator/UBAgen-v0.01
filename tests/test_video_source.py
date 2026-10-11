@@ -112,7 +112,7 @@ class ValidateVideoSourceTests(unittest.TestCase):
                 job_store=store,
                 download_runner=fake_download_runner,
             )
-            self.assertEqual(completed.status, "completed", f"Expected completed, got {completed.status}: {completed.error_message}")
+            self.assertEqual(completed.status, "completed", f"Expected completed, got {completed.status}: {completed.error}")
             self.assertTrue(completed.gcs_upload_verified)
 
 

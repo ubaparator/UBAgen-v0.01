@@ -29,6 +29,10 @@ from fastapi.staticfiles import StaticFiles
 
 from discord_interactions import handle_discord_interaction_request
 from encoder_worker import dispatch_encode_job_background
+from google_drive_oauth import (
+    get_drive_oauth_config_status,
+    handle_google_oauth_callback_request,
+)
 from job_store import (
     FirestoreUnavailableError,
     discover_and_apply_runtime_config,
@@ -461,6 +465,79 @@ def create_health_app(
         return JSONResponse(
             content=payload,
             status_code=status_code,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/oauth/google/status", summary="Google Drive OAuth 2.0 Configuration Status")
+    async def google_oauth_config_status_api() -> JSONResponse:
+        """Return non-sensitive Google Drive OAuth 2.0 configuration readiness."""
+        return JSONResponse(
+            content=get_drive_oauth_config_status(),
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.api_route(
+        "/api/oauth/google/callback",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        summary="Google Drive OAuth 2.0 Authorization Code Callback",
+    )
+    @app.api_route(
+        "/oauth/google/callback",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        summary="Google Drive OAuth 2.0 Authorization Code Callback (Alias)",
+    )
+    async def google_oauth_callback_api(
+        request: Request,
+        state: Optional[str] = None,
+        code: Optional[str] = None,
+        error: Optional[str] = None,
+        error_description: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> Response:
+        """
+        Official Google OAuth 2.0 Callback Endpoint:
+        - Strictly enforces GET method (405 otherwise).
+        - Validates and atomically consumes the server-side single-use `state` parameter (CSRF protection).
+        - Never trusts user-supplied `discord_user_id` parameters; binds tokens strictly to the server-side state record.
+        - Encrypts refresh and access tokens with `TOKEN_ENCRYPTION_KEY` before saving to persistent storage.
+        """
+        method = request.method.upper() if (request is not None and getattr(request, "method", None)) else "GET"
+        if method != "GET":
+            return JSONResponse(
+                content={"error": "Method not allowed. Use GET /api/oauth/google/callback."},
+                status_code=405,
+                headers={"Allow": "GET, OPTIONS", "Cache-Control": "no-store"},
+            )
+
+        oauth_store = getattr(app.state, "drive_oauth_store", None)
+        status_code, json_payload, html_body = await asyncio.to_thread(
+            handle_google_oauth_callback_request,
+            state=state,
+            code=code,
+            error=error,
+            error_description=error_description,
+            store=oauth_store,
+        )
+
+        accept_hdr = ""
+        if request is not None and hasattr(request, "headers"):
+            accept_hdr = str(request.headers.get("accept") or "").lower()
+
+        wants_json = (
+            (format or "").strip().lower() == "json"
+            or ("application/json" in accept_hdr and "text/html" not in accept_hdr)
+        )
+        if wants_json:
+            return JSONResponse(
+                content=json_payload,
+                status_code=status_code,
+                headers={"Cache-Control": "no-store"},
+            )
+        return Response(
+            content=html_body,
+            status_code=status_code,
+            media_type="text/html; charset=utf-8",
             headers={"Cache-Control": "no-store"},
         )
 

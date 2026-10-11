@@ -63,11 +63,19 @@ def redact_sensitive_text(text: str) -> str:
     if not text:
         return ""
     cleaned = text
-    for env_key in ("DISCORD_BOT_TOKEN", "UBAGEN_ADMIN_TOKEN", "GOOGLE_DRIVE_CREDENTIALS"):
+    for env_key in (
+        "DISCORD_BOT_TOKEN",
+        "UBAGEN_ADMIN_TOKEN",
+        "GOOGLE_DRIVE_CREDENTIALS",
+        "GOOGLE_CLIENT_SECRET",
+        "TOKEN_ENCRYPTION_KEY",
+    ):
         secret_val = os.getenv(env_key, "").strip()
         if secret_val and len(secret_val) >= 6:
             cleaned = cleaned.replace(secret_val, "[REDACTED]")
     cleaned = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._\-+/=]+", r"\1[REDACTED]", cleaned)
+    cleaned = re.sub(r"\bya29\.[A-Za-z0-9._\-]+", "[REDACTED_GOOGLE_ACCESS_TOKEN]", cleaned)
+    cleaned = re.sub(r"\b1//[A-Za-z0-9._\-]{16,}", "[REDACTED_GOOGLE_REFRESH_TOKEN]", cleaned)
     return cleaned
 
 
@@ -766,6 +774,39 @@ def check_environment_variables() -> list[dict[str, str]]:
         "status": "Configured (Explicit Admin IDs + Bot Owner/Server Admin)" if discord_admins else "Default (Bot Owner & Server Administrators)",
         "indicator": "✅",
         "type": "Discord Security",
+    })
+
+    g_client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    g_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    g_redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+    token_enc_key = os.getenv("TOKEN_ENCRYPTION_KEY", "").strip()
+    oauth_ready = bool(
+        g_client_id
+        and g_client_secret
+        and g_redirect_uri
+        and len(token_enc_key) >= 16
+        and g_client_id not in ("your_google_client_id_here", "CHANGE_ME")
+        and g_client_secret not in ("your_google_client_secret_here", "CHANGE_ME")
+    )
+    results.append({
+        "name": "GOOGLE_CLIENT_ID / GOOGLE_REDIRECT_URI",
+        "status": (
+            "Configured (Google Drive OAuth 2.0 • scope: drive.file)"
+            if oauth_ready
+            else "Not configured (Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, TOKEN_ENCRYPTION_KEY)"
+        ),
+        "indicator": "✅" if oauth_ready else "⚪",
+        "type": "Google Drive OAuth 2.0",
+    })
+    results.append({
+        "name": "TOKEN_ENCRYPTION_KEY",
+        "status": (
+            "Configured (Encrypted Refresh Token Storage Active)"
+            if len(token_enc_key) >= 16 and token_enc_key not in ("your_token_encryption_key_here", "CHANGE_ME")
+            else "Not configured (Required to encrypt OAuth refresh tokens at rest)"
+        ),
+        "indicator": "✅" if (len(token_enc_key) >= 16 and token_enc_key not in ("your_token_encryption_key_here", "CHANGE_ME")) else "⚪",
+        "type": "OAuth Security",
     })
 
     return results

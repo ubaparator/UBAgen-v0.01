@@ -192,3 +192,65 @@ This project is designed to run as a full-stack AI Studio app in development mod
 GitHub Actions validates the code and builds the frontend/Docker image. It does not stop or restart the AI Studio Run session and does not publish the AI Studio app. Do not configure a fictitious `DEPLOY_WEBHOOK_URL` for this workflow.
 
 On every process start, `main.py` registers the bot's slash commands and syncs them with Discord. Guild-scoped copies are attempted for servers the bot has joined; global commands are also synced. Global Discord command propagation can take up to an hour. The bot must be invited with the `applications.commands` scope.
+
+---
+
+## 🔗 Discord Kullanıcıları İçin Google Drive OAuth 2.0 Entegrasyonu
+
+UBAgen, her Discord kullanıcısının kendi Google Drive hesabını resmi **Google OAuth 2.0 Authorization Code Flow + PKCE (S256)** ile bağımsız ve güvenli şekilde bağlamasını destekler. En az yetki ilkesi gereği yalnızca `https://www.googleapis.com/auth/drive.file` kapsamı istenir (tüm Drive dosyalarına erişim istenmez).
+
+### Eklenen Discord Slash Komutları
+
+| Komut | Açıklama |
+| :--- | :--- |
+| `/drive_bagla` | Kullanıcının Discord kimliğine bağlı, tek kullanımlık (10 dk geçerli) ve CSRF (`state`) korumalı Google OAuth 2.0 yetkilendirme bağlantısı üretir (ephemeral/gizli yanıt). |
+| `/drive_durum` | Kullanıcının bağlı Google Drive hesabını, izin kapsamını (`drive.file`) ve bağlantı durumunu gösterir. |
+| `/drive_ayir` | Kullanıcının Google OAuth erişim iznini iptal eder (`oauth2.googleapis.com/revoke`) ve şifreli token kayıtlarını veritabanından siler. |
+| `/drive_yardim` | Hesap bağlama adımlarını, güvenlik ilkelerini ve olası OAuth hata/sorun giderme çözümlerini gösterir. |
+
+### Gerekli Ortam Değişkenleri (Secrets)
+
+| Değişken | Zorunluluk | Açıklama |
+| :--- | :--- | :--- |
+| `GOOGLE_CLIENT_ID` | Drive OAuth için Zorunlu | Google Cloud Console üzerinde oluşturulan **Web application** türündeki OAuth 2.0 Client ID değeri. |
+| `GOOGLE_CLIENT_SECRET` | Drive OAuth için Zorunlu | Google Cloud Console OAuth 2.0 Client Secret değeri (**Gizli tutulmalıdır**). |
+| `GOOGLE_REDIRECT_URI` | Drive OAuth için Zorunlu | OAuth geri dönüş adresi. Örn. Yerel: `http://localhost:8080/api/oauth/google/callback`, Üretim: `https://<sizin-servis-adresiniz>/api/oauth/google/callback` |
+| `TOKEN_ENCRYPTION_KEY` | Drive OAuth için Zorunlu | Refresh ve access token'ların veritabanında şifreli (`Fernet` / `PBKDF2-HMAC-SHA256`) saklanması için kullanılan şifreleme anahtarı. |
+
+### Adım Adım Google Cloud Console ve Secret Kurulum Rehberi
+
+1. **Google Cloud Console'da Proje Oluşturma veya Mevcut Projeyi Seçme:**
+   - [Google Cloud Console — Proje Seçici](https://console.cloud.google.com/projectselector2/home/dashboard) sayfasına gidin.
+   - Mevcut projenizi seçin veya **Create Project** ile yeni bir proje oluşturun.
+2. **Google Drive API'yi Etkinleştirme:**
+   - [Google Drive API Kütüphane Sayfası](https://console.cloud.google.com/apis/library/drive.googleapis.com) adresini açın ve **Enable (Etkinleştir)** düğmesine tıklayın.
+3. **OAuth Consent Screen ve Test Kullanıcılarını Yapılandırma:**
+   - [Google Auth Platform / OAuth Consent Screen](https://console.cloud.google.com/apis/credentials/consent) sayfasına gidin.
+   - **External** (veya kurum içi ise **Internal**) seçeneğini belirleyin; uygulama adını, destek e-postasını ve geliştirici iletişim bilgilerini girin.
+   - **Scopes (Kapsamlar)** adımında yalnızca `https://www.googleapis.com/auth/drive.file` kapsamını ekleyin ([Google Drive API Scopes Dokümantasyonu](https://developers.google.com/drive/api/guides/api-specific-auth)).
+   - Uygulama **Testing** (Test) modundayken **Test users** bölümüne Google Drive hesabını bağlayacak Discord kullanıcılarının Google e-posta adreslerini ekleyin.
+4. **OAuth Client ID Oluşturma ve Doğru Uygulama Türünü Seçme:**
+   - [Google Cloud Console — Credentials (Kimlik Bilgileri)](https://console.cloud.google.com/apis/credentials) sayfasına gidin.
+   - **+ Create Credentials** -> **OAuth client ID** seçeneğine tıklayın.
+   - **Application type** olarak **Web application** seçin ([Web Server OAuth 2.0 Dokümantasyonu](https://developers.google.com/identity/protocols/oauth2/web-server)).
+5. **Authorized Redirect URI Yapılandırma:**
+   - Oluşturduğunuz OAuth istemcisinin **Authorized redirect URIs** listesine tam geri dönüş adresinizi ekleyin:
+     - Yerel geliştirme için: `http://localhost:8080/api/oauth/google/callback` (veya port 3000 kullanıyorsanız `http://localhost:3000/api/oauth/google/callback`)
+     - Cloud Run / Production için: `https://<sizin-cloud-run-veya-alan-adiniz>/api/oauth/google/callback`
+6. **Client ID ve Client Secret Değerlerini Ortama Ekleme:**
+   - Google Cloud Console'un verdiği `Client ID` ve `Client Secret` değerlerini kopyalayın; **asla Git deposuna veya kaynak koda yazmayın**.
+7. **Token Şifreleme Anahtarını (`TOKEN_ENCRYPTION_KEY`) Güvenli Şekilde Oluşturma:**
+   - Terminalde aşağıdaki komutla 32 baytlık kriptografik anahtar üretin:
+     ```bash
+     python3 -c "import secrets, base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+     ```
+   - Üretilen değeri `TOKEN_ENCRYPTION_KEY` olarak kaydedin.
+8. **Ortam Değişkenlerini Yerel Geliştirme ve Production Ortamında Ayarlama:**
+   - **Yerel geliştirme (`.env`):** `.env.example` dosyasını `.env` olarak kopyalayın (`.gitignore` içinde olduğundan Git'e eklenmez) ve `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` alanlarını doldurun.
+   - **Google Cloud Run / Secret Manager:** [Google Cloud Secret Manager](https://console.cloud.google.com/security/secret-manager) ve [Cloud Run Services](https://console.cloud.google.com/run) üzerinden ilgili servisin *Variables & Secrets* sekmesine bu 4 değişkeni ekleyin.
+   - **GitHub Actions Secrets (İsteğe Bağlı CI/CD):** Repo içindeki `Settings -> Secrets and variables -> Actions` sayfasına ekleyebilirsiniz.
+9. **OAuth Test Modu, Test Kullanıcıları ve Production'a Geçiş Kısıtları:**
+   - Uygulama *Publishing status: Testing* durumundayken yalnızca *Test users* listesine eklenen Google hesapları (en fazla 100 test kullanıcısı) `/drive_bagla` ile giriş yapabilir; listede olmayan kullanıcılar `Error 403: access_denied` alır.
+   - Ayrıca Google OAuth dokümantasyonuna göre *Testing* modundaki uygulamaların verdiği refresh token'lar 7 gün sonra sona erebilir.
+   - Herkese açık kullanıma geçmek için *OAuth consent screen* sayfasında **Publish App** düğmesiyle uygulamayı *In production* durumuna geçirin (`drive.file` kapsamı hassas olmayan/önerilen kapsam kategorisinde yer aldığı için tam Drive erişimine kıyasla doğrulama süreci çok daha basittir).
+

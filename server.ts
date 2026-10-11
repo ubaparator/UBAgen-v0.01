@@ -453,6 +453,124 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     });
   });
 
+  // GET /api/oauth/google/status: Non-sensitive Google Drive OAuth 2.0 configuration status
+  app.get('/api/oauth/google/status', async (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1500);
+      try {
+        const upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/oauth/google/status`, {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+        if (upstreamRes.ok) {
+          return res.json(await upstreamRes.json());
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    execFile(
+      'python3',
+      ['-B', '-c', 'import json; from google_drive_oauth import get_drive_oauth_config_status; print(json.dumps(get_drive_oauth_config_status()))'],
+      { timeout: 3000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        if (!error && stdout) {
+          try {
+            return res.json(JSON.parse(stdout));
+          } catch {}
+        }
+        return res.status(200).json({ configured: false });
+      }
+    );
+  });
+
+  // GET /api/oauth/google/callback: Google Drive OAuth 2.0 Authorization Code Callback
+  app.get(['/api/oauth/google/callback', '/oauth/google/callback'], async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const error = typeof req.query.error === 'string' ? req.query.error : '';
+    const errorDescription = typeof req.query.error_description === 'string' ? req.query.error_description : '';
+    const format = typeof req.query.format === 'string' ? req.query.format : '';
+
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    const qs = new URLSearchParams();
+    if (state) qs.set('state', state);
+    if (code) qs.set('code', code);
+    if (error) qs.set('error', error);
+    if (errorDescription) qs.set('error_description', errorDescription);
+    if (format) qs.set('format', format);
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        const upstreamRes = await fetchFn(
+          `${standaloneBackendUrl}/api/oauth/google/callback${qs.toString() ? `?${qs.toString()}` : ''}`,
+          {
+            method: 'GET',
+            signal: controller.signal,
+            headers: {
+              Accept: req.header('accept') || 'text/html,application/json',
+            },
+          }
+        );
+        const contentType = upstreamRes.headers.get('content-type') || '';
+        const textBody = await upstreamRes.text();
+        res.status(upstreamRes.status);
+        if (contentType) {
+          res.setHeader('Content-Type', contentType);
+        }
+        return res.send(textBody);
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {
+      execFile(
+        'python3',
+        [
+          '-B',
+          '-c',
+          'import json, sys; from google_drive_oauth import handle_google_oauth_callback_request; st, js, ht = handle_google_oauth_callback_request(state=sys.argv[1] or None, code=sys.argv[2] or None, error=sys.argv[3] or None, error_description=sys.argv[4] or None); print(json.dumps({"status_code": st, "json": js, "html": ht}))',
+          state,
+          code,
+          error,
+          errorDescription,
+        ],
+        { timeout: 10000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+        (err, stdout) => {
+          if (!err && stdout) {
+            try {
+              const parsed = JSON.parse(stdout);
+              const acceptHdr = String(req.header('accept') || '').toLowerCase();
+              const wantsJson =
+                format.toLowerCase() === 'json' ||
+                (acceptHdr.includes('application/json') && !acceptHdr.includes('text/html'));
+              if (wantsJson) {
+                return res.status(parsed.status_code || 400).json(parsed.json || {});
+              }
+              res.setHeader('Content-Type', 'text/html; charset=utf-8');
+              return res.status(parsed.status_code || 400).send(parsed.html || '');
+            } catch {}
+          }
+          return res.status(500).json({ status: 'error', error: 'oauth_callback_unavailable' });
+        }
+      );
+    }
+  });
+
+  app.all(['/api/oauth/google/callback', '/oauth/google/callback'], (_req, res) => {
+    res.setHeader('Allow', 'GET, OPTIONS');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(405).json({
+      error: 'Method not allowed. Use GET /api/oauth/google/callback.',
+    });
+  });
+
   // GET /api/stats: Fetches live hardware metrics from backend
   app.get(['/api/stats', '/stats'], async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');

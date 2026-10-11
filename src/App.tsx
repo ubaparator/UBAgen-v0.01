@@ -333,7 +333,6 @@ export default function App() {
         }
 
         // Preserve the last good snapshot instead of blanking the dashboard.
-        console.error('Failed to fetch backend statistics:', lastFailure);
         setError((current) => current || (
           lastFailure?.message ||
           'Unable to connect to UBAgen backend. Please verify the backend is running.'

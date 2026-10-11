@@ -56,6 +56,7 @@ except ImportError:
 import uvicorn
 
 from encoder_worker import notify_discord_webhook_sync, register_encoder_commands
+from google_drive_oauth import register_drive_oauth_commands
 from health_api import create_health_app
 from job_store import discover_and_apply_runtime_config, get_job_store
 from stats import BotTracker, install_log_buffer_handler, register_stats_command
@@ -124,6 +125,7 @@ if commands is not None:
             register_stats_command(self.tree, self)
             register_subtitle_extract_command(self.tree)
             register_encoder_commands(self.tree, bot=self)
+            register_drive_oauth_commands(self.tree)
 
             # Sync slash commands with robust fallback (avoiding duplicate syncs)
             if self.dev_guild_id:
@@ -717,6 +719,10 @@ class BotLifecycleManager:
             logger.warning("NOTICE: discord.py is not installed; running in Web Monitor mode.")
         return None
 
+    async def stop(self) -> None:
+        """Alias for stop_bot() to cleanly stop the managed Discord bot worker."""
+        await self.stop_bot()
+
     async def stop_bot(self) -> None:
         """Cleanly close the active Discord bot connection and stop its task without stopping FastAPI."""
         self._stop_bot_event.set()
@@ -762,6 +768,7 @@ class BotLifecycleManager:
         self,
         reason: str = "command_trigger",
         wait_for_ready_timeout: float = 0.0,
+        wait_for_ready_seconds: Optional[float] = None,
     ) -> tuple[int, dict[str, Any]]:
         """
         Idempotent, single-flight Wake-on-Command handler:
@@ -775,7 +782,9 @@ class BotLifecycleManager:
         if self.is_bot_ready():
             return 200, {
                 "status": "already_ready",
+                "woke": False,
                 "woken": False,
+                "ready": True,
                 "deduplicated": False,
                 "http_alive": True,
                 "discord_connected": True,
@@ -788,7 +797,9 @@ class BotLifecycleManager:
         if is_placeholder_bot_token(bot_token):
             return 503, {
                 "status": "not_configured",
+                "woke": False,
                 "woken": False,
+                "ready": False,
                 "http_alive": True,
                 "discord_connected": False,
                 "bot_ready": False,
@@ -796,13 +807,16 @@ class BotLifecycleManager:
             }
 
         if self.is_restarting or self._restart_lock.locked() or self._wake_lock.locked():
+            ready_now = self.is_bot_ready()
             return 202, {
                 "status": "wake_in_progress",
+                "woke": False,
                 "woken": False,
+                "ready": ready_now,
                 "deduplicated": True,
                 "http_alive": True,
                 "discord_connected": self.is_gateway_connected(),
-                "bot_ready": self.is_bot_ready(),
+                "bot_ready": ready_now,
                 "reason": clean_reason,
                 "message": "A bot wake or reconnect operation is already in progress.",
             }
@@ -811,7 +825,9 @@ class BotLifecycleManager:
             if self.is_bot_ready():
                 return 200, {
                     "status": "already_ready",
+                    "woke": False,
                     "woken": False,
+                    "ready": True,
                     "deduplicated": False,
                     "http_alive": True,
                     "discord_connected": True,
@@ -829,7 +845,9 @@ class BotLifecycleManager:
                 self._wake_event.set()
                 return 202, {
                     "status": "connecting",
+                    "woke": False,
                     "woken": False,
+                    "ready": False,
                     "deduplicated": True,
                     "http_alive": True,
                     "discord_connected": self.is_gateway_connected(),
@@ -844,7 +862,9 @@ class BotLifecycleManager:
                 self._wake_event.set()
                 return 429, {
                     "status": "cooldown",
+                    "woke": False,
                     "woken": False,
+                    "ready": False,
                     "deduplicated": True,
                     "http_alive": True,
                     "discord_connected": self.is_gateway_connected(),
@@ -873,7 +893,9 @@ class BotLifecycleManager:
                 if new_bot is None:
                     return 503, {
                         "status": "unavailable",
+                        "woke": False,
                         "woken": False,
+                        "ready": False,
                         "http_alive": True,
                         "discord_connected": False,
                         "bot_ready": False,
@@ -907,8 +929,13 @@ class BotLifecycleManager:
                     )
                 )
 
-            if wait_for_ready_timeout > 0:
-                deadline = time.monotonic() + min(float(wait_for_ready_timeout), 10.0)
+            effective_wait = (
+                float(wait_for_ready_seconds)
+                if wait_for_ready_seconds is not None
+                else float(wait_for_ready_timeout)
+            )
+            if effective_wait > 0:
+                deadline = time.monotonic() + min(effective_wait, 10.0)
                 while time.monotonic() < deadline:
                     if self.is_bot_ready():
                         break
@@ -917,7 +944,9 @@ class BotLifecycleManager:
             ready_now = self.is_bot_ready()
             return (200 if ready_now else 202), {
                 "status": "ready" if ready_now else "waking",
+                "woke": True,
                 "woken": True,
+                "ready": ready_now,
                 "deduplicated": False,
                 "http_alive": True,
                 "discord_connected": self.is_gateway_connected(),

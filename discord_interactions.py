@@ -58,6 +58,10 @@ CALLBACK_TYPE_PONG = 1
 CALLBACK_TYPE_CHANNEL_MESSAGE_WITH_SOURCE = 4
 CALLBACK_TYPE_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE = 5
 
+INTERACTION_RESPONSE_PONG = CALLBACK_TYPE_PONG
+INTERACTION_RESPONSE_CHANNEL_MESSAGE_WITH_SOURCE = CALLBACK_TYPE_CHANNEL_MESSAGE_WITH_SOURCE
+INTERACTION_RESPONSE_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE = CALLBACK_TYPE_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+
 # Ephemeral message flag (1 << 6)
 DISCORD_FLAG_EPHEMERAL = 64
 
@@ -254,8 +258,9 @@ def verify_discord_ed25519_signature(
     *,
     public_key_hex: str,
     signature_hex: Optional[str],
-    timestamp: Optional[str],
-    raw_body: bytes,
+    timestamp: Optional[str] = None,
+    timestamp_header: Optional[str] = None,
+    raw_body: bytes = b"",
     max_timestamp_skew_seconds: Optional[float] = None,
 ) -> tuple[bool, str]:
     """
@@ -267,7 +272,8 @@ def verify_discord_ed25519_signature(
         return False, "DISCORD_PUBLIC_KEY yapılandırılmamış."
 
     clean_sig = (signature_hex or "").strip()
-    clean_ts = (timestamp or "").strip()
+    effective_ts = timestamp if timestamp is not None else timestamp_header
+    clean_ts = (effective_ts or "").strip()
     if not clean_sig or not clean_ts:
         return False, "Eksik imza başlığı (X-Signature-Ed25519 veya X-Signature-Timestamp bulunamadı)."
 
@@ -607,6 +613,37 @@ async def execute_http_command_background(
             await adapter.edit_original_response(content=summary_text, embed=embed)
             return {"command": cmd_name, "status": "completed", "wake": wake_result}
 
+        if cmd_name in ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim"):
+            from google_drive_oauth import (
+                build_drive_help_message,
+                handle_drive_ayir_for_user,
+                handle_drive_bagla_for_user,
+                handle_drive_durum_for_user,
+            )
+
+            uid = str(adapter.user.id or "").strip()
+            uname = str(adapter.user)
+            if cmd_name == "drive_bagla":
+                msg = await asyncio.to_thread(
+                    handle_drive_bagla_for_user,
+                    discord_user_id=uid,
+                    discord_user_name=uname,
+                )
+            elif cmd_name == "drive_durum":
+                msg = await asyncio.to_thread(
+                    handle_drive_durum_for_user,
+                    discord_user_id=uid,
+                )
+            elif cmd_name == "drive_ayir":
+                msg = await asyncio.to_thread(
+                    handle_drive_ayir_for_user,
+                    discord_user_id=uid,
+                )
+            else:
+                msg = build_drive_help_message()
+            await adapter.edit_original_response(content=msg)
+            return {"command": cmd_name, "status": "completed", "wake": wake_result}
+
         # Any other command (e.g. /altyazı_ayıklama) wakes the Gateway bot and informs the user accurately
         wake_status = (wake_result or {}).get("status", "unknown")
         if wake_status in ("already_ready",):
@@ -777,6 +814,12 @@ async def handle_discord_interaction_request(
             await bg_coro
         else:
             asyncio.create_task(bg_coro)
+
+        if cmd_name in ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim"):
+            return 200, {
+                "type": INTERACTION_RESPONSE_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+                "data": {"flags": 64},
+            }
 
         return 200, {"type": INTERACTION_RESPONSE_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE}
 
