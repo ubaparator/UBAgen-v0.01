@@ -1296,6 +1296,8 @@ def execute_encode_job_sync(
                 "codec": canonical_codec,
                 "retention_seconds": str(job.retention_seconds),
             },
+            retention_seconds=job.retention_seconds,
+            job_id=job.job_id,
         )
 
         # Strictly verify upload before marking completed
@@ -2242,6 +2244,16 @@ def register_encoder_commands(tree: Any, bot: Optional[Any] = None) -> list[Any]
     discord_cmd = register_discord_restart_command(tree, bot=bot)
     if discord_cmd is not None:
         registered.append(discord_cmd)
+
+    with suppress(Exception):
+        from google_drive_oauth import scrub_legacy_drive_commands_from_tree
+        scrub_legacy_drive_commands_from_tree(tree)
+
+    with suppress(Exception):
+        from rclone_manager import register_log_command
+        log_cmd = register_log_command(tree, bot=bot)
+        if log_cmd is not None:
+            registered.append(log_cmd)
 
     return registered
 

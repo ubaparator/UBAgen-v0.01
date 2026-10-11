@@ -133,7 +133,8 @@ function degradedStats(reason: string) {
     storage: null,
     binaries: { ffmpeg: { installed: false, version: 'Unavailable', path: null },
       ffprobe: { installed: false, version: 'Unavailable', path: null },
-      aria2: { installed: false, version: 'Unavailable', path: null } },
+      aria2: { installed: false, version: 'Unavailable', path: null },
+      rclone: { installed: false, version: 'Unavailable', path: null } },
     env_vars: [],
   };
 }
@@ -867,6 +868,243 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     } catch {}
 
     return res.json({ status: 'online', count: 0, logs: [] });
+  });
+
+  // GET /api/diagnostics/log: Comprehensive redacted diagnostic report (/log equivalent)
+  app.get('/api/diagnostics/log', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const liveTests = req.query.live_tests === '1' || req.query.live_tests === 'true';
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const upstreamRes = await fetchFn(
+          `${standaloneBackendUrl}/api/diagnostics/log?live_tests=${liveTests ? 'true' : 'false'}`,
+          { signal: controller.signal, headers: { Accept: 'application/json' } }
+        );
+        if (upstreamRes.ok) {
+          return res.json(await upstreamRes.json());
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    execFile(
+      'python3',
+      [
+        '-B',
+        '-c',
+        'import json, sys; from rclone_manager import collect_log_diagnostics, format_log_diagnostics_report; d = collect_log_diagnostics(run_live_remote_tests=(sys.argv[1]=="1")); print(json.dumps({"status":"online","diagnostics":d,"formatted_report":format_log_diagnostics_report(d)}))',
+        liveTests ? '1' : '0',
+      ],
+      { timeout: 6000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        if (!error && stdout) {
+          try {
+            return res.json(JSON.parse(stdout));
+          } catch {}
+        }
+        return res.status(200).json({ status: 'degraded', diagnostics: null, formatted_report: 'Tanılama verisi alınamadı.' });
+      }
+    );
+  });
+
+  // GET /api/rclone/status: Multi-account MEGA & Google Drive Rclone status
+  app.get('/api/rclone/status', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      try {
+        const upstreamRes = await fetchFn(
+          `${standaloneBackendUrl}/api/rclone/status?refresh=${refresh ? 'true' : 'false'}`,
+          { signal: controller.signal, headers: { Accept: 'application/json' } }
+        );
+        if (upstreamRes.ok) {
+          return res.json(await upstreamRes.json());
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    execFile(
+      'python3',
+      [
+        '-B',
+        '-c',
+        'import json, sys; from rclone_manager import get_rclone_manager; m = get_rclone_manager(); print(json.dumps(m.get_status_summary(refresh_storage=(sys.argv[1]=="1"))))',
+        refresh ? '1' : '0',
+      ],
+      { timeout: 6000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        if (!error && stdout) {
+          try {
+            return res.json(JSON.parse(stdout));
+          } catch {}
+        }
+        return res.status(200).json({
+          rclone_binary: { installed: false, version: 'Unavailable', path: null },
+          accounts: [],
+          storage_summary: { total_accounts: 0, connected_accounts: 0, enabled_accounts: 0, total_bytes: 0, used_bytes: 0, free_bytes: 0 },
+          pending_deletions: [],
+          pending_deletions_count: 0,
+        });
+      }
+    );
+  });
+
+  // Helper to proxy or execute Rclone POST mutations
+  const proxyOrExecRclonePost = async (
+    req: express.Request,
+    res: express.Response,
+    upstreamPath: string,
+    pythonSnippet: string,
+    pyArgs: string[],
+    successStatus = 200
+  ) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        const upstreamRes = await fetchFn(`${standaloneBackendUrl}${upstreamPath}`, {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(req.body || {}),
+        });
+        const payload = await upstreamRes.json().catch(() => ({}));
+        statsCache = null;
+        return res.status(upstreamRes.status).json(payload);
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    execFile(
+      'python3',
+      ['-B', '-c', pythonSnippet, ...pyArgs],
+      { timeout: 12000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        statsCache = null;
+        if (!error && stdout) {
+          try {
+            const parsed = JSON.parse(stdout);
+            const code = parsed._http_status || (parsed.ok ? successStatus : 400);
+            delete parsed._http_status;
+            return res.status(code).json(parsed);
+          } catch {}
+        }
+        return res.status(500).json({ ok: false, error: 'Rclone işlemi yürütülemedi.' });
+      }
+    );
+  };
+
+  app.post('/api/rclone/accounts/mega', (req, res) => {
+    const bodyJson = JSON.stringify(req.body || {});
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      '/api/rclone/accounts/mega',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); ok, out = get_rclone_manager().add_mega_account(display_name=str(b.get("display_name") or ""), email=str(b.get("email") or ""), password=str(b.get("password") or ""), remote_name=str(b.get("remote_name") or "").strip() or None, root_folder=str(b.get("root_folder") or "UBAgen_Outputs").strip(), enabled=bool(b.get("enabled", True)), skip_verify=bool(b.get("skip_verify", False))); out["_http_status"] = 201 if ok else 400; print(json.dumps(out))',
+      [bodyJson],
+      201
+    );
+  });
+
+  app.post('/api/rclone/accounts/gdrive/start', (req, res) => {
+    const bodyJson = JSON.stringify(req.body || {});
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      '/api/rclone/accounts/gdrive/start',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); ok, out = get_rclone_manager().start_gdrive_auth_session(display_name=str(b.get("display_name") or "Google Drive"), remote_name=str(b.get("remote_name") or "").strip() or None, scope=str(b.get("scope") or "drive.file").strip(), root_folder=str(b.get("root_folder") or "UBAgen_Outputs").strip()); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      [bodyJson],
+      200
+    );
+  });
+
+  app.post('/api/rclone/accounts/gdrive/complete', (req, res) => {
+    const bodyJson = JSON.stringify(req.body || {});
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      '/api/rclone/accounts/gdrive/complete',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); ok, out = get_rclone_manager().complete_gdrive_auth(session_id=str(b.get("session_id") or "").strip() or None, remote_name=str(b.get("remote_name") or "").strip() or None, display_name=str(b.get("display_name") or "").strip() or None, code_or_token=str(b.get("code_or_token") or b.get("token") or b.get("code") or ""), root_folder=str(b.get("root_folder") or "UBAgen_Outputs").strip(), scope=str(b.get("scope") or "drive.file").strip(), skip_verify=bool(b.get("skip_verify", False))); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      [bodyJson],
+      200
+    );
+  });
+
+  app.post('/api/rclone/accounts/:remoteName/test', (req, res) => {
+    const remoteName = String(req.params.remoteName || '').trim();
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      `/api/rclone/accounts/${encodeURIComponent(remoteName)}/test`,
+      'import json, sys; from rclone_manager import get_rclone_manager; ok, out = get_rclone_manager().test_account_connection(sys.argv[1]); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      [remoteName],
+      200
+    );
+  });
+
+  app.post('/api/rclone/accounts/:remoteName/reconnect', (req, res) => {
+    const remoteName = String(req.params.remoteName || '').trim();
+    const bodyJson = JSON.stringify(req.body || {});
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      `/api/rclone/accounts/${encodeURIComponent(remoteName)}/reconnect`,
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[2]); ok, out = get_rclone_manager().reconnect_account(sys.argv[1], password=str(b.get("password") or "").strip() or None, code_or_token=str(b.get("code_or_token") or b.get("token") or "").strip() or None, email=str(b.get("email") or "").strip() or None, skip_verify=bool(b.get("skip_verify", False))); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      [remoteName, bodyJson],
+      200
+    );
+  });
+
+  app.post('/api/rclone/accounts/:remoteName/disconnect', (req, res) => {
+    const remoteName = String(req.params.remoteName || '').trim();
+    const bodyJson = JSON.stringify(req.body || {});
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      `/api/rclone/accounts/${encodeURIComponent(remoteName)}/disconnect`,
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[2]); ok, out = get_rclone_manager().disconnect_account(sys.argv[1], remove_record=bool(b.get("remove_record", False))); out["_http_status"] = 200 if ok else 404; print(json.dumps(out))',
+      [remoteName, bodyJson],
+      200
+    );
+  });
+
+  app.post('/api/rclone/accounts/:remoteName/toggle', (req, res) => {
+    const remoteName = String(req.params.remoteName || '').trim();
+    const bodyJson = JSON.stringify(req.body || {});
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      `/api/rclone/accounts/${encodeURIComponent(remoteName)}/toggle`,
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[2]); ok, out = get_rclone_manager().set_account_enabled(sys.argv[1], bool(b.get("enabled", True))); out["_http_status"] = 200 if ok else 404; print(json.dumps(out))',
+      [remoteName, bodyJson],
+      200
+    );
+  });
+
+  app.post('/api/rclone/pending-deletions/process', (req, res) => {
+    return proxyOrExecRclonePost(
+      req,
+      res,
+      '/api/rclone/pending-deletions/process',
+      'import json; from rclone_manager import get_rclone_manager; out = get_rclone_manager().process_pending_deletions(); out["_http_status"] = 200; print(json.dumps(out))',
+      [],
+      200
+    );
   });
 
   // GET /api/outputs/:filename: Serve stored video or subtitle output file with Range support

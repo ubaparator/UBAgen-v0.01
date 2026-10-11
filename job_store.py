@@ -565,7 +565,14 @@ class GCSOutputStorage:
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.bucket_name)
+        if self.bucket_name:
+            return True
+        with suppress(Exception):
+            from rclone_manager import get_rclone_manager
+
+            if get_rclone_manager().select_active_remote() is not None:
+                return True
+        return False
 
     def _mirror_object_path(self, bucket: str, object_name: str) -> Optional[Path]:
         if self.local_mirror_dir is None:
@@ -582,46 +589,70 @@ class GCSOutputStorage:
         object_name: str,
         content_type: str = "video/mp4",
         metadata: Optional[dict[str, str]] = None,
+        *,
+        retention_seconds: Optional[int] = None,
+        job_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Upload `local_path` to GCS and strictly verify that the uploaded object exists
-        and has the exact same non-zero byte size before returning `verified=True`.
+        Upload `local_path` via Rclone (MEGA / Google Drive) or local mirror in tests,
+        and strictly verify that the uploaded object exists and has the exact same non-zero byte size
+        before returning `verified=True`.
         """
         if not local_path.is_file():
             raise FileNotFoundError(f"Yüklenecek yerel çıktı dosyası bulunamadı: {local_path}")
 
         expected_size = local_path.stat().st_size
         if expected_size <= 0:
-            raise RuntimeError("Encode çıktı dosyası boş (0 byte); GCS yüklemesi iptal edildi.")
+            raise RuntimeError("Encode çıktı dosyası boş (0 byte); yükleme iptal edildi.")
 
+        clean_object = object_name.lstrip("/")
         bucket = (self.bucket_name or "").strip()
+
+        # 1. If local mirror is active (used for deterministic integration testing)
+        if self.local_mirror_dir is not None and bucket:
+            mirror_target = self._mirror_object_path(bucket, clean_object)
+            if mirror_target is not None:
+                mirror_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(local_path, mirror_target)
+                verified = self.verify_object(bucket, clean_object, expected_size=expected_size)
+                if not verified:
+                    raise RuntimeError("Nesne doğrulaması (boyut/varlık kontrolü) başarısız oldu.")
+                return {
+                    "uploaded": True,
+                    "verified": True,
+                    "bucket": bucket,
+                    "object_name": clean_object,
+                    "gcs_uri": f"gs://{bucket}/{clean_object}",
+                    "size_bytes": expected_size,
+                    "backend": "gcs_local_mirror",
+                }
+
+        # 2. Primary Runtime Backend: Rclone (MEGA / Google Drive)
+        with suppress(ImportError):
+            from rclone_manager import get_rclone_manager
+
+            rclone_mgr = get_rclone_manager()
+            active_remote = rclone_mgr.select_active_remote(preferred_remote=bucket or None)
+            if active_remote is not None:
+                job_id_meta = job_id or ((metadata or {}).get("job_id") if isinstance(metadata, dict) else None)
+                effective_retention = (
+                    retention_seconds if retention_seconds is not None else get_configured_retention_seconds()
+                )
+                return rclone_mgr.upload_file(
+                    local_path,
+                    clean_object,
+                    preferred_remote=active_remote.remote_name,
+                    retention_seconds=effective_retention,
+                    job_id=job_id_meta,
+                )
+
         if not bucket:
             raise RuntimeError(
-                "Google Cloud Storage bucket (`UBAGEN_GCS_BUCKET`) yapılandırılmamış. "
+                "Rclone depolama hesabı (MEGA / Google Drive) veya (`UBAGEN_GCS_BUCKET`) yapılandırılmamış. "
                 "Kalıcı çıktı yüklemesi tamamlanamadı."
             )
 
-        clean_object = object_name.lstrip("/")
-
-        # 1. If local mirror is active (used for deterministic integration testing)
-        mirror_target = self._mirror_object_path(bucket, clean_object)
-        if mirror_target is not None:
-            mirror_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(local_path, mirror_target)
-            verified = self.verify_object(bucket, clean_object, expected_size=expected_size)
-            if not verified:
-                raise RuntimeError("GCS nesne doğrulaması (boyut/varlık kontrolü) başarısız oldu.")
-            return {
-                "uploaded": True,
-                "verified": True,
-                "bucket": bucket,
-                "object_name": clean_object,
-                "gcs_uri": f"gs://{bucket}/{clean_object}",
-                "size_bytes": expected_size,
-                "backend": "gcs_local_mirror",
-            }
-
-        # 2. Try google-cloud-storage Python SDK if installed
+        # 3. Try google-cloud-storage Python SDK if installed
         sdk_tried = False
         try:
             from google.cloud import storage as gcs_sdk  # type: ignore
@@ -655,12 +686,11 @@ class GCSOutputStorage:
                 logger.warning("google-cloud-storage SDK upload error (%s): %s", type(exc).__name__, exc)
                 raise RuntimeError(f"GCS yükleme hatası: {exc}") from exc
 
-        # 3. Direct Google Cloud Storage JSON API v1 via ADC / Metadata Server token
+        # 4. Direct REST fallback
         token = get_gcp_access_token()
         if not token:
             raise RuntimeError(
-                "Google Cloud kimlik doğrulama token'ı (ADC / Service Account) alınamadı. "
-                "Cloud Run servis hesabının GCS erişim yetkilerini kontrol edin."
+                "Aktif bir rclone (MEGA / Google Drive) hesabı bulunamadı ve kimlik doğrulama token'ı alınamadı."
             )
 
         encoded_name = urllib.parse.quote(clean_object, safe="")
@@ -705,7 +735,7 @@ class GCSOutputStorage:
         }
 
     def verify_object(self, bucket: str, object_name: str, expected_size: Optional[int] = None) -> bool:
-        """Verify that `gs://{bucket}/{object_name}` exists and matches `expected_size`."""
+        """Verify that remote object exists and matches `expected_size`."""
         clean_object = object_name.lstrip("/")
         mirror_target = self._mirror_object_path(bucket, clean_object)
         if mirror_target is not None:
@@ -717,6 +747,13 @@ class GCSOutputStorage:
             if expected_size is not None and actual_size != expected_size:
                 return False
             return True
+
+        with suppress(Exception):
+            from rclone_manager import get_rclone_manager
+
+            rclone_mgr = get_rclone_manager()
+            if rclone_mgr.get_account(bucket) is not None or rclone_mgr.select_active_remote(bucket) is not None:
+                return rclone_mgr.verify_object(bucket, clean_object, expected_size=expected_size)
 
         try:
             from google.cloud import storage as gcs_sdk  # type: ignore
@@ -759,8 +796,8 @@ class GCSOutputStorage:
 
     def delete_object(self, bucket: str, object_name: str) -> bool:
         """
-        Actively delete `gs://{bucket}/{object_name}` from Google Cloud Storage.
-        Returns True if the object was deleted or already absent.
+        Actively delete remote object via rclone (or local mirror in tests).
+        If the rclone remote is disconnected, preserves the deletion task in `rclone_pending_deletions`.
         """
         clean_object = (object_name or "").lstrip("/")
         if not bucket or not clean_object:
@@ -771,6 +808,13 @@ class GCSOutputStorage:
             if mirror_target.exists():
                 mirror_target.unlink(missing_ok=True)
             return not mirror_target.exists()
+
+        with suppress(Exception):
+            from rclone_manager import get_rclone_manager
+
+            rclone_mgr = get_rclone_manager()
+            if rclone_mgr.get_account(bucket) is not None:
+                return rclone_mgr.delete_object(bucket, clean_object)
 
         try:
             from google.cloud import storage as gcs_sdk  # type: ignore
@@ -806,7 +850,7 @@ class GCSOutputStorage:
 
     def open_download_stream_or_path(self, bucket: str, object_name: str) -> tuple[Optional[Path], Optional[bytes]]:
         """
-        Retrieve either a local verified mirror Path or download bytes from GCS
+        Retrieve either a local verified mirror Path or download bytes via rclone
         after authorization and expiration checks have passed.
         """
         clean_object = object_name.lstrip("/")
@@ -815,6 +859,21 @@ class GCSOutputStorage:
             if mirror_target.is_file():
                 return mirror_target, None
             return None, None
+
+        with suppress(Exception):
+            from rclone_manager import get_rclone_manager
+
+            rclone_mgr = get_rclone_manager()
+            if rclone_mgr.get_account(bucket) is not None or rclone_mgr.select_active_remote(bucket) is not None:
+                with tempfile.NamedTemporaryFile(prefix="ubagen_rclone_dl_", delete=False) as tmp_f:
+                    tmp_path = Path(tmp_f.name)
+                try:
+                    rclone_mgr.download_to_path(bucket, clean_object, tmp_path)
+                    data = tmp_path.read_bytes()
+                    return None, data
+                finally:
+                    with suppress(Exception):
+                        tmp_path.unlink(missing_ok=True)
 
         try:
             from google.cloud import storage as gcs_sdk  # type: ignore
@@ -1702,11 +1761,20 @@ class PersistentJobStore:
             expired_count += 1
             purged_job_ids.append(job.job_id)
 
+        rclone_pending_cleanup: Optional[dict[str, Any]] = None
+        if self.gcs.local_mirror_dir is None:
+            with suppress(Exception):
+                from rclone_manager import get_rclone_manager
+
+                rclone_pending_cleanup = get_rclone_manager().process_pending_deletions(now=cur)
+                gcs_deleted_count += int(rclone_pending_cleanup.get("deleted") or 0)
+
         return {
             "checked_at": _iso_utc(cur),
             "expired_jobs_processed": expired_count,
             "gcs_objects_deleted": gcs_deleted_count,
             "job_ids": purged_job_ids,
+            "rclone_pending_cleanup": rclone_pending_cleanup,
         }
 
     def recover_stale_running_jobs(

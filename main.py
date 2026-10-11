@@ -56,9 +56,18 @@ except ImportError:
 import uvicorn
 
 from encoder_worker import notify_discord_webhook_sync, register_encoder_commands
-from google_drive_oauth import register_drive_oauth_commands
+from google_drive_oauth import (
+    REMOVED_DRIVE_SLASH_COMMANDS,
+    register_drive_oauth_commands,
+    scrub_legacy_drive_commands_from_tree,
+)
 from health_api import create_health_app
 from job_store import discover_and_apply_runtime_config, get_job_store
+from rclone_manager import (
+    LOG_COMMAND_NAME,
+    install_rclone_error_buffer_handler,
+    register_log_command,
+)
 from stats import BotTracker, install_log_buffer_handler, register_stats_command
 
 from storage_manager import get_storage_manager
@@ -78,7 +87,51 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 install_log_buffer_handler()
+install_rclone_error_buffer_handler()
 logger = logging.getLogger("ubagen.main")
+
+CANONICAL_SLASH_COMMAND_NAMES: tuple[str, ...] = (
+    "stats",
+    "altyazi",
+    "encode",
+    "encodeal",
+    "is_durumu",
+    "discord",
+    LOG_COMMAND_NAME,
+)
+
+
+def register_all_unique_slash_commands(tree: Any, bot: Optional[Any] = None) -> list[str]:
+    """
+    Register the canonical UBAgen slash commands on `tree` idempotently,
+    remove any legacy `/drive_*` commands, and guarantee zero duplicate definitions.
+    """
+    if tree is None:
+        return []
+
+    scrub_legacy_drive_commands_from_tree(tree)
+    register_stats_command(tree, bot)
+    register_subtitle_extract_command(tree)
+    register_encoder_commands(tree, bot=bot)
+    register_log_command(tree, bot=bot)
+    register_drive_oauth_commands(tree)
+    scrub_legacy_drive_commands_from_tree(tree)
+
+    registered_names: list[str] = []
+    if hasattr(tree, "get_commands") and callable(tree.get_commands):
+        seen: set[str] = set()
+        for cmd in list(tree.get_commands()):
+            cmd_name = str(getattr(cmd, "name", "") or "").strip()
+            if not cmd_name:
+                continue
+            if cmd_name in REMOVED_DRIVE_SLASH_COMMANDS or cmd_name in seen:
+                if hasattr(tree, "remove_command"):
+                    with suppress(Exception):
+                        tree.remove_command(cmd_name)
+                continue
+            seen.add(cmd_name)
+            registered_names.append(cmd_name)
+    return registered_names
 
 
 # ------------------------------------------------------------------------------
@@ -120,26 +173,26 @@ if commands is not None:
                 pass
 
         async def setup_hook(self) -> None:
-            """Called automatically before bot login. Registers commands and syncs tree."""
-            logger.info("Registering slash commands...")
-            register_stats_command(self.tree, self)
-            register_subtitle_extract_command(self.tree)
-            register_encoder_commands(self.tree, bot=self)
-            register_drive_oauth_commands(self.tree)
+            """Called automatically before bot login. Registers unique commands and syncs tree in a single controlled scope."""
+            logger.info("Registering unique slash commands...")
+            registered_names = register_all_unique_slash_commands(self.tree, self)
+            logger.info("Registered %d unique slash command definition(s): %s", len(registered_names), ", ".join(registered_names))
 
-            # Sync slash commands with robust fallback (avoiding duplicate syncs)
+            # Controlled single-scope sync: avoid registering both guild and global copies simultaneously
             if self.dev_guild_id:
                 try:
                     dev_guild = discord.Object(id=self.dev_guild_id)
+                    self.tree.clear_commands(guild=dev_guild)
                     self.tree.copy_global_to(guild=dev_guild)
                     synced = await self.tree.sync(guild=dev_guild)
                     self._synced_guild_ids.add(int(self.dev_guild_id))
+                    self._guild_commands_synced = True
                     logger.info(
-                        "⚡ Instantly synced %d slash command(s) to development guild ID: %d",
+                        "⚡ Instantly synced %d unique slash command(s) to development guild ID: %d",
                         len(synced),
                         self.dev_guild_id,
                     )
-                    self.tracker.sync_status = f"Synced {len(synced)} command(s) to dev guild {self.dev_guild_id}"
+                    self.tracker.sync_status = f"Synced {len(synced)} unique command(s) to dev guild {self.dev_guild_id}"
                 except discord.errors.Forbidden as exc:
                     logger.warning(
                         "Could not sync slash commands to dev guild ID %d (403 Forbidden: %s). "
@@ -182,14 +235,13 @@ if commands is not None:
                     synced = await self.tree.sync()
                     self._global_commands_synced = True
                     logger.info(
-                        "🌐 Synced %d global slash command(s). (Note: Global sync may take up to 1 hour to propagate)",
+                        "🌐 Synced %d unique global slash command(s).",
                         len(synced),
                     )
-                    self.tracker.sync_status = f"Synced {len(synced)} global command(s)"
+                    self.tracker.sync_status = f"Synced {len(synced)} unique global command(s)"
                 except Exception as exc:
                     logger.warning("Global slash command sync warning (%s): %s", type(exc).__name__, exc)
                     self.tracker.sync_status = f"Global sync warning: {type(exc).__name__}"
-
 
             self.write_state_file()
 
@@ -244,45 +296,38 @@ if commands is not None:
                 except Exception:
                     pass
 
-            # Guild-scoped copies appear immediately in every server the bot has joined.
-            # Keep global registration too, without re-syncing guilds or global commands already synced in setup_hook.
+            # Clean up any legacy duplicate guild-scoped command registrations when global sync is active
+            # so commands never appear twice (global + guild) and removed /drive_* commands are purged.
             if not self._guild_commands_synced:
-                synced_guilds = len(self._synced_guild_ids)
+                cleaned_guilds = 0
                 global_sync_succeeded = bool(self._global_commands_synced)
-                for guild in list(self.guilds):
-                    gid = getattr(guild, "id", None)
-                    if gid is not None and int(gid) in self._synced_guild_ids:
-                        continue
-                    try:
-                        self.tree.copy_global_to(guild=guild)
-                        await self.tree.sync(guild=guild)
-                        if gid is not None:
-                            self._synced_guild_ids.add(int(gid))
-                        synced_guilds += 1
-                    except Exception as exc:
-                        logger.warning("Could not sync commands to guild %s: %s", gid, type(exc).__name__)
-                if not self._global_commands_synced:
+                if not global_sync_succeeded and not self.dev_guild_id:
                     try:
                         global_commands = await self.tree.sync()
                         global_sync_succeeded = True
                         self._global_commands_synced = True
-                        logger.info(
-                            "Slash commands synced globally (%d) and to %d current guild(s).",
-                            len(global_commands),
-                            synced_guilds,
-                        )
-                        self.tracker.sync_status = (
-                            f"{len(global_commands)} global command(s); synced to {synced_guilds} current server(s)"
-                        )
+                        self.tracker.sync_status = f"Synced {len(global_commands)} unique global command(s)"
                     except Exception as exc:
                         logger.warning("Global command sync from on_ready failed: %s", type(exc).__name__)
                         self.tracker.sync_status = f"Command sync warning: {type(exc).__name__}"
-                else:
+
+                if global_sync_succeeded:
+                    for guild in list(self.guilds):
+                        gid = getattr(guild, "id", None)
+                        if gid is not None and int(gid) in self._synced_guild_ids:
+                            continue
+                        try:
+                            self.tree.clear_commands(guild=guild)
+                            await self.tree.sync(guild=guild)
+                            if gid is not None:
+                                self._synced_guild_ids.add(int(gid))
+                            cleaned_guilds += 1
+                        except Exception as exc:
+                            logger.debug("Could not clear duplicate guild commands in guild %s: %s", gid, type(exc).__name__)
                     cmd_count = len(self.tree.get_commands())
                     self.tracker.sync_status = (
-                        f"{cmd_count} global command(s); synced to {synced_guilds} current server(s)"
+                        f"Synced {cmd_count} unique global command(s) (deduplicated {cleaned_guilds} server(s))"
                     )
-                # Only mark sync complete after Discord confirms the global sync.
                 self._guild_commands_synced = global_sync_succeeded
                 self.write_state_file()
 

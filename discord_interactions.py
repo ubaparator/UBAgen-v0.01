@@ -598,6 +598,15 @@ async def execute_http_command_background(
             )
             return {"command": cmd_name, "status": "completed", "http_status": code, "result": res_payload}
 
+        if cmd_name == "log":
+            from rclone_manager import handle_log_slash_command
+            code, res_payload = await handle_log_slash_command(
+                adapter,
+                bot=active_bot,
+                bot_manager=bot_manager,
+            )
+            return {"command": cmd_name, "status": "completed", "http_status": code, "result": res_payload}
+
         if cmd_name == "stats":
             stats_data = await asyncio.to_thread(collect_all_stats, active_bot)
             embed = build_stats_embed(stats_data)
@@ -613,36 +622,13 @@ async def execute_http_command_background(
             await adapter.edit_original_response(content=summary_text, embed=embed)
             return {"command": cmd_name, "status": "completed", "wake": wake_result}
 
-        if cmd_name in ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim"):
-            from google_drive_oauth import (
-                build_drive_help_message,
-                handle_drive_ayir_for_user,
-                handle_drive_bagla_for_user,
-                handle_drive_durum_for_user,
+        if cmd_name in ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim", "drive bağla", "drive yardım"):
+            msg = (
+                "ℹ️ **Komut Kaldırıldı:** Google Drive ve MEGA bulut depolama bağlantıları artık Discord slash komutlarıyla değil, "
+                "doğrudan **UBAgen Yönetim Paneli (Rclone Bulut Depolama)** arayüzünden yönetilmektedir."
             )
-
-            uid = str(adapter.user.id or "").strip()
-            uname = str(adapter.user)
-            if cmd_name == "drive_bagla":
-                msg = await asyncio.to_thread(
-                    handle_drive_bagla_for_user,
-                    discord_user_id=uid,
-                    discord_user_name=uname,
-                )
-            elif cmd_name == "drive_durum":
-                msg = await asyncio.to_thread(
-                    handle_drive_durum_for_user,
-                    discord_user_id=uid,
-                )
-            elif cmd_name == "drive_ayir":
-                msg = await asyncio.to_thread(
-                    handle_drive_ayir_for_user,
-                    discord_user_id=uid,
-                )
-            else:
-                msg = build_drive_help_message()
             await adapter.edit_original_response(content=msg)
-            return {"command": cmd_name, "status": "completed", "wake": wake_result}
+            return {"command": cmd_name, "status": "removed_legacy_command", "wake": wake_result}
 
         # Any other command (e.g. /altyazı_ayıklama) wakes the Gateway bot and informs the user accurately
         wake_status = (wake_result or {}).get("status", "unknown")
@@ -815,7 +801,7 @@ async def handle_discord_interaction_request(
         else:
             asyncio.create_task(bg_coro)
 
-        if cmd_name in ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim"):
+        if cmd_name in ("log", "drive_bagla", "drive_durum", "drive_ayir", "drive_yardim", "drive bağla", "drive yardım"):
             return 200, {
                 "type": INTERACTION_RESPONSE_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
                 "data": {"flags": 64},

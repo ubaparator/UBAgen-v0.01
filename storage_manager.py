@@ -306,13 +306,30 @@ def detect_external_cloud_storage() -> dict[str, Any]:
     if gdrive_creds or gdrive_files:
         providers.append("Google Drive Credentials")
 
+    rclone_accounts: list[dict[str, Any]] = []
+    rclone_connected_remotes: list[str] = []
+    with suppress(Exception):
+        from rclone_manager import get_rclone_manager
+
+        mgr = get_rclone_manager()
+        for acc in mgr.list_accounts():
+            acc_dict = acc.to_public_dict() if hasattr(acc, "to_public_dict") else dict(acc)
+            rclone_accounts.append(acc_dict)
+            if acc_dict.get("is_active") and acc_dict.get("status") == "connected":
+                prov = acc_dict.get("provider", "remote")
+                rname = acc_dict.get("remote_name", "unknown")
+                rclone_connected_remotes.append(f"rclone:{prov} ({rname})")
+                providers.append(f"rclone:{prov} ({rname})")
+
     return {
         "configured": bool(providers),
         "providers": providers,
         "gcs_bucket": gcs_bucket or None,
         "s3_bucket": s3_bucket or None,
         "r2_bucket": r2_bucket or None,
-        "google_drive_configured": bool(gdrive_creds or gdrive_files),
+        "google_drive_configured": bool(gdrive_creds or gdrive_files or any(a.get("provider") == "drive" and a.get("status") == "connected" for a in rclone_accounts)),
+        "rclone_connected_remotes": rclone_connected_remotes,
+        "rclone_accounts": rclone_accounts,
     }
 
 

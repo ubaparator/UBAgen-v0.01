@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
+from contextlib import suppress
 from datetime import datetime, timezone
 import json
 import logging
@@ -776,37 +777,35 @@ def check_environment_variables() -> list[dict[str, str]]:
         "type": "Discord Security",
     })
 
-    g_client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
-    g_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
-    g_redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
-    token_enc_key = os.getenv("TOKEN_ENCRYPTION_KEY", "").strip()
-    oauth_ready = bool(
-        g_client_id
-        and g_client_secret
-        and g_redirect_uri
-        and len(token_enc_key) >= 16
-        and g_client_id not in ("your_google_client_id_here", "CHANGE_ME")
-        and g_client_secret not in ("your_google_client_secret_here", "CHANGE_ME")
-    )
+    rclone_accounts_count = 0
+    rclone_connected_count = 0
+    with suppress(Exception):
+        from rclone_manager import get_rclone_manager
+        rc_mgr = get_rclone_manager()
+        accs = rc_mgr.list_accounts()
+        rclone_accounts_count = len(accs)
+        rclone_connected_count = sum(1 for a in accs if a.get("status") == "connected" and a.get("enabled", True))
+
     results.append({
-        "name": "GOOGLE_CLIENT_ID / GOOGLE_REDIRECT_URI",
+        "name": "RCLONE (MEGA & Google Drive)",
         "status": (
-            "Configured (Google Drive OAuth 2.0 • scope: drive.file)"
-            if oauth_ready
-            else "Not configured (Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, TOKEN_ENCRYPTION_KEY)"
+            f"Active ({rclone_connected_count}/{rclone_accounts_count} remote connected • Built-in OAuth)"
+            if rclone_accounts_count > 0
+            else "Ready (Built-in Rclone OAuth • Manage via Web Panel)"
         ),
-        "indicator": "✅" if oauth_ready else "⚪",
-        "type": "Google Drive OAuth 2.0",
+        "indicator": "✅" if rclone_connected_count > 0 else "⚪",
+        "type": "Rclone Cloud Storage",
     })
+    token_enc_key = os.getenv("TOKEN_ENCRYPTION_KEY", "").strip()
     results.append({
         "name": "TOKEN_ENCRYPTION_KEY",
         "status": (
-            "Configured (Encrypted Refresh Token Storage Active)"
+            "Configured (Encrypted Token Storage Active)"
             if len(token_enc_key) >= 16 and token_enc_key not in ("your_token_encryption_key_here", "CHANGE_ME")
-            else "Not configured (Required to encrypt OAuth refresh tokens at rest)"
+            else "Auto-Managed (Rclone Protected Config & SQLite Store)"
         ),
         "indicator": "✅" if (len(token_enc_key) >= 16 and token_enc_key not in ("your_token_encryption_key_here", "CHANGE_ME")) else "⚪",
-        "type": "OAuth Security",
+        "type": "Storage Security",
     })
 
     return results
@@ -1133,10 +1132,21 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
 
     backend_uptime_sec = now - PROCESS_START_TIME
 
-    # 8. External Binaries (FFmpeg, ffprobe & aria2)
+    # 8. External Binaries (FFmpeg, ffprobe, aria2 & rclone)
     ffmpeg_info = check_binary("ffmpeg", "-version")
     ffprobe_info = check_binary("ffprobe", "-version")
     aria2_info = check_binary("aria2c", "--version")
+    rclone_info = check_binary("rclone", "version")
+    if not rclone_info.get("installed"):
+        with suppress(Exception):
+            from rclone_manager import get_rclone_manager
+            rc_bin = get_rclone_manager().check_rclone_binary()
+            if rc_bin.get("installed"):
+                rclone_info = {
+                    "installed": True,
+                    "version": rc_bin.get("version") or "Installed",
+                    "path": rc_bin.get("path"),
+                }
 
     # 9. Environment Variables
     env_statuses = check_environment_variables()
@@ -1226,6 +1236,7 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             "ffmpeg": ffmpeg_info,
             "ffprobe": ffprobe_info,
             "aria2": aria2_info,
+            "rclone": rclone_info,
         },
         "env_vars": env_statuses,
     }

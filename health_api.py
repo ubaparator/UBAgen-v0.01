@@ -41,11 +41,18 @@ from job_store import (
 )
 from stats import collect_all_stats, get_recent_logs, install_log_buffer_handler
 from storage_manager import get_storage_manager
+from rclone_manager import (
+    collect_log_diagnostics,
+    format_log_diagnostics_report,
+    get_rclone_manager,
+    install_rclone_error_buffer_handler,
+)
 from subtitle_extract import normalize_language_code, validate_magnet_uri, validate_video_source
 
 SERVICE_START_TIME = time.time()
 logger = logging.getLogger("ubagen.health")
 install_log_buffer_handler()
+install_rclone_error_buffer_handler()
 
 
 def verify_admin_token(authorization_header: Optional[str], expected_token: str) -> bool:
@@ -1048,6 +1055,229 @@ def create_health_app(
                 "count": len(entries),
                 "logs": entries,
             },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/diagnostics/log", summary="System & Rclone Diagnostics Report (/log Equivalent)")
+    async def get_diagnostics_log_api(live_tests: bool = False) -> JSONResponse:
+        """Return the comprehensive redacted diagnostic report used by the Discord `/log` command."""
+        current_bot = getattr(app.state, "bot", None)
+        current_mgr = getattr(app.state, "bot_manager", None)
+        diag = await asyncio.to_thread(
+            collect_log_diagnostics,
+            bot=current_bot,
+            bot_manager=current_mgr,
+            run_live_remote_tests=bool(live_tests),
+        )
+        report_text = format_log_diagnostics_report(diag)
+        return JSONResponse(
+            content={
+                "status": "online",
+                "diagnostics": diag,
+                "formatted_report": report_text,
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/rclone/status", summary="Rclone Multi-Account Storage & Pending Deletions Status")
+    async def get_rclone_status_api(refresh: bool = False) -> JSONResponse:
+        """Return all configured MEGA and Google Drive rclone remotes, quota metrics, and persistent pending deletions."""
+        rc_mgr = get_rclone_manager()
+        summary = await asyncio.to_thread(rc_mgr.get_status_summary, refresh_storage=bool(refresh))
+        return JSONResponse(
+            content=summary,
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/accounts/mega", summary="Add or Update MEGA Account via Rclone")
+    async def add_rclone_mega_account_api(request: Request) -> JSONResponse:
+        """Configure and verify a MEGA account in rclone using rclone obscure password authentication."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                content={"ok": False, "error": "Geçersiz JSON gövdesi."},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                content={"ok": False, "error": "İstek gövdesi JSON nesnesi olmalıdır."},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        rc_mgr = get_rclone_manager()
+        ok, payload = await asyncio.to_thread(
+            rc_mgr.add_mega_account,
+            display_name=str(body.get("display_name") or ""),
+            email=str(body.get("email") or ""),
+            password=str(body.get("password") or ""),
+            remote_name=str(body.get("remote_name") or "").strip() or None,
+            root_folder=str(body.get("root_folder") or "UBAgen_Outputs").strip(),
+            enabled=bool(body.get("enabled", True)),
+            skip_verify=bool(body.get("skip_verify", False)),
+        )
+        return JSONResponse(
+            content=payload,
+            status_code=201 if ok else 400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/accounts/gdrive/start", summary="Start Google Drive Built-In Rclone OAuth Flow")
+    async def start_rclone_gdrive_auth_api(request: Request) -> JSONResponse:
+        """
+        Start a Google Drive authorization flow using rclone's built-in OAuth client
+        (no Google Cloud project or custom client_id/client_secret required).
+        """
+        body: dict[str, Any] = {}
+        with suppress(Exception):
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+
+        rc_mgr = get_rclone_manager()
+        ok, payload = await asyncio.to_thread(
+            rc_mgr.start_gdrive_auth_session,
+            display_name=str(body.get("display_name") or "Google Drive"),
+            remote_name=str(body.get("remote_name") or "").strip() or None,
+            scope=str(body.get("scope") or "drive.file").strip(),
+            root_folder=str(body.get("root_folder") or "UBAgen_Outputs").strip(),
+        )
+        return JSONResponse(
+            content=payload,
+            status_code=200 if ok else 400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/accounts/gdrive/complete", summary="Complete Google Drive Rclone OAuth Authorization")
+    async def complete_rclone_gdrive_auth_api(request: Request) -> JSONResponse:
+        """Complete Google Drive rclone authorization using verification code or rclone authorize token."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                content={"ok": False, "error": "Geçersiz JSON gövdesi."},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                content={"ok": False, "error": "İstek gövdesi JSON nesnesi olmalıdır."},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        rc_mgr = get_rclone_manager()
+        ok, payload = await asyncio.to_thread(
+            rc_mgr.complete_gdrive_auth,
+            session_id=str(body.get("session_id") or "").strip() or None,
+            remote_name=str(body.get("remote_name") or "").strip() or None,
+            display_name=str(body.get("display_name") or "").strip() or None,
+            code_or_token=str(body.get("code_or_token") or body.get("token") or body.get("code") or ""),
+            root_folder=str(body.get("root_folder") or "UBAgen_Outputs").strip(),
+            scope=str(body.get("scope") or "drive.file").strip(),
+            skip_verify=bool(body.get("skip_verify", False)),
+        )
+        return JSONResponse(
+            content=payload,
+            status_code=200 if ok else 400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/accounts/{remote_name}/test", summary="Test Rclone Remote Connection & Quota")
+    async def test_rclone_account_api(remote_name: str) -> JSONResponse:
+        """Test connectivity and refresh storage usage for a configured MEGA or Google Drive remote."""
+        rc_mgr = get_rclone_manager()
+        ok, payload = await asyncio.to_thread(rc_mgr.test_account_connection, remote_name)
+        return JSONResponse(
+            content=payload,
+            status_code=200 if ok else 400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/accounts/{remote_name}/reconnect", summary="Reconnect Disconnected or Error Rclone Account")
+    async def reconnect_rclone_account_api(remote_name: str, request: Request = None) -> JSONResponse:
+        """Reconnect an existing MEGA or Google Drive account, optionally supplying updated credentials/token."""
+        body: dict[str, Any] = {}
+        if request is not None:
+            with suppress(Exception):
+                parsed = await request.json()
+                if isinstance(parsed, dict):
+                    body = parsed
+
+        rc_mgr = get_rclone_manager()
+        ok, payload = await asyncio.to_thread(
+            rc_mgr.reconnect_account,
+            remote_name,
+            password=str(body.get("password") or "").strip() or None,
+            code_or_token=str(body.get("code_or_token") or body.get("token") or "").strip() or None,
+            email=str(body.get("email") or "").strip() or None,
+            skip_verify=bool(body.get("skip_verify", False)),
+        )
+        return JSONResponse(
+            content=payload,
+            status_code=200 if ok else 400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/accounts/{remote_name}/disconnect", summary="Safely Disconnect Rclone Account Without Deleting Remote Files")
+    async def disconnect_rclone_account_api(remote_name: str, request: Request = None) -> JSONResponse:
+        """
+        Safely disconnect a MEGA or Google Drive account:
+        - Removes active credentials from rclone.conf.
+        - Does NOT delete any remote files on MEGA or Google Drive.
+        - Preserves all pending deletion records in SQLite so scheduled deletions are never lost.
+        """
+        body: dict[str, Any] = {}
+        if request is not None:
+            with suppress(Exception):
+                parsed = await request.json()
+                if isinstance(parsed, dict):
+                    body = parsed
+
+        rc_mgr = get_rclone_manager()
+        ok, payload = await asyncio.to_thread(
+            rc_mgr.disconnect_account,
+            remote_name,
+            remove_record=bool(body.get("remove_record", False)),
+        )
+        return JSONResponse(
+            content=payload,
+            status_code=200 if ok else 404,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/accounts/{remote_name}/toggle", summary="Enable or Disable Rclone Account for Uploads")
+    async def toggle_rclone_account_api(remote_name: str, request: Request) -> JSONResponse:
+        """Enable or disable a configured rclone account for active uploads."""
+        body: dict[str, Any] = {}
+        with suppress(Exception):
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+        rc_mgr = get_rclone_manager()
+        ok, payload = await asyncio.to_thread(
+            rc_mgr.set_account_enabled,
+            remote_name,
+            bool(body.get("enabled", True)),
+        )
+        return JSONResponse(
+            content=payload,
+            status_code=200 if ok else 404,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/rclone/pending-deletions/process", summary="Process Due Rclone Pending Deletions")
+    async def process_rclone_pending_deletions_api() -> JSONResponse:
+        """Process due persistent deletion tasks across connected Rclone remotes."""
+        rc_mgr = get_rclone_manager()
+        res = await asyncio.to_thread(rc_mgr.process_pending_deletions)
+        return JSONResponse(
+            content=res,
             status_code=200,
             headers={"Cache-Control": "no-store"},
         )

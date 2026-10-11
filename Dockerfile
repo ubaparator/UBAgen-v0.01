@@ -26,12 +26,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install runtime dependencies:
 # - ffmpeg: Required for multimedia tools (monitored in dashboard & /stats)
 # - aria2: High-speed download utility (monitored in dashboard & /stats)
-# - curl: For container health checks
+# - rclone: Multi-account MEGA & Google Drive cloud storage engine
+# - curl & unzip: For container health checks and binary verification
 # - procps & ca-certificates: For process monitoring and SSL
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
+    rclone \
     curl \
+    unzip \
     procps \
     ca-certificates \
     fontconfig \
@@ -39,7 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && aria2c --version >/dev/null \
     && ffmpeg -version >/dev/null \
-    && ffprobe -version >/dev/null
+    && ffprobe -version >/dev/null \
+    && rclone version >/dev/null
 
 WORKDIR /app
 

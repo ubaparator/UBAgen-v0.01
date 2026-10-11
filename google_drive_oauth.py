@@ -1197,58 +1197,20 @@ def _render_oauth_error_html(title: str, safe_message: str) -> str:
 
 
 # ------------------------------------------------------------------------------
-# Discord Slash Command Registration (`/drive_bagla`, `/drive_durum`, `/drive_ayir`, `/drive_yardim`)
+# Legacy Discord Drive Slash Commands Removal (Managed via Rclone Web Panel)
 # ------------------------------------------------------------------------------
+REMOVED_DRIVE_SLASH_COMMANDS = ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim", "drive")
+
+
 def register_drive_oauth_commands(tree: Any) -> None:
-    """Register `/drive_bagla`, `/drive_durum`, `/drive_ayir`, and `/drive_yardim` on the Discord CommandTree."""
-    if app_commands is None or tree is None:
+    """
+    Ensure legacy Discord Drive slash commands (`/drive_bagla`, `/drive_durum`, `/drive_ayir`, `/drive_yardim`)
+    are completely removed from the Discord CommandTree.
+    Google Drive and MEGA storage accounts are managed via the rclone-based UBAgen Management Panel.
+    """
+    if tree is None:
         return
+    for cmd_name in REMOVED_DRIVE_SLASH_COMMANDS:
+        with suppress(Exception):
+            tree.remove_command(cmd_name)
 
-    @tree.command(
-        name="drive_bagla",
-        description="Google Drive hesabınızı OAuth 2.0 üzerinden güvenli şekilde bağlar.",
-    )
-    async def drive_bagla_cmd(interaction: Any) -> None:
-        user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "").strip()
-        user_name = str(getattr(interaction, "user", "discord_user"))
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        msg = await asyncio.to_thread(
-            handle_drive_bagla_for_user,
-            discord_user_id=user_id,
-            discord_user_name=user_name,
-        )
-        await interaction.followup.send(msg, ephemeral=True)
-
-    @tree.command(
-        name="drive_durum",
-        description="Google Drive hesap bağlantınızın durumunu gösterir.",
-    )
-    async def drive_durum_cmd(interaction: Any) -> None:
-        user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "").strip()
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        msg = await asyncio.to_thread(
-            handle_drive_durum_for_user,
-            discord_user_id=user_id,
-            verify_live_token=False,
-        )
-        await interaction.followup.send(msg, ephemeral=True)
-
-    @tree.command(
-        name="drive_ayir",
-        description="Google Drive bağlantınızı güvenli şekilde kaldırır ve izinleri iptal eder.",
-    )
-    async def drive_ayir_cmd(interaction: Any) -> None:
-        user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "").strip()
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        msg = await asyncio.to_thread(
-            handle_drive_ayir_for_user,
-            discord_user_id=user_id,
-        )
-        await interaction.followup.send(msg, ephemeral=True)
-
-    @tree.command(
-        name="drive_yardim",
-        description="Google Drive hesap bağlama ve sorun giderme talimatlarını gösterir.",
-    )
-    async def drive_yardim_cmd(interaction: Any) -> None:
-        await interaction.response.send_message(build_drive_help_message(), ephemeral=True)
