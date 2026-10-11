@@ -371,7 +371,7 @@ export default function RcloneManagement({ onClose }: Props) {
               </form>}
             </div>}
 
-            {loading && !status ? <div className="flex items-center justify-center gap-2 p-12 text-sm text-slate-400"><Loader2 className="h-4 w-4 animate-spin" /> Rclone hesapları yükleniyor…</div> : sortedAccounts.length === 0 ? <div className="p-10 text-center"><Cloud className="mx-auto h-8 w-8 text-slate-600" /><p className="mt-3 font-medium text-slate-300">Henüz hesap eklenmemiş</p><p className="mt-1 text-sm text-slate-500">MEGA veya Google Drive ekleyerek başlayabilirsin.</p></div> : <div className="grid gap-3 p-4 lg:grid-cols-2 sm:p-5">
+            {!adminToken ? <div className="p-10 text-center"><ShieldCheck className="mx-auto h-8 w-8 text-amber-300" /><p className="mt-3 font-medium text-slate-200">Yönetici yetkisi gerekli</p><p className="mt-1 text-sm text-slate-500">Rclone hesaplarını görüntülemek ve yönetmek için yukarıdan yönetici tokenı ile yetkilendir.</p></div> : loading && !status ? <div className="flex items-center justify-center gap-2 p-12 text-sm text-slate-400"><Loader2 className="h-4 w-4 animate-spin" /> Rclone hesapları yükleniyor…</div> : sortedAccounts.length === 0 ? <div className="p-10 text-center"><Cloud className="mx-auto h-8 w-8 text-slate-600" /><p className="mt-3 font-medium text-slate-300">Henüz hesap eklenmemiş</p><p className="mt-1 text-sm text-slate-500">MEGA veya Google Drive ekleyerek başlayabilirsin.</p></div> : <div className="grid gap-3 p-4 lg:grid-cols-2 sm:p-5">
               {sortedAccounts.map(account => {
                 const usage = getUsage(account);
                 const connected = account.status === 'connected' && account.is_active;
