@@ -435,14 +435,17 @@ class TestGoogleDriveOAuth(unittest.TestCase):
             self.assertIn("/drive_ayir", yardim_msg)
             self.assertIn("/drive_yardim", yardim_msg)
 
-    def test_discord_command_tree_registers_drive_commands(self) -> None:
+    def test_discord_command_tree_removes_legacy_drive_commands(self) -> None:
         from main import UBAgenBot
 
         bot = UBAgenBot()
         asyncio.run(bot.setup_hook())
-        registered_names = {cmd.name for cmd in bot.tree.get_commands()}
-        for expected_cmd in ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim"):
-            self.assertIn(expected_cmd, registered_names)
+        command_names = [cmd.name for cmd in bot.tree.get_commands()]
+        registered_names = set(command_names)
+        for removed_cmd in ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim", "drive"):
+            self.assertNotIn(removed_cmd, registered_names)
+        self.assertIn("log", registered_names)
+        self.assertEqual(len(command_names), len(set(command_names)), "Slash command names must be unique")
 
 
 if __name__ == "__main__":
