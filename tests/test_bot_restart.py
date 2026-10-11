@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from health_api import create_health_app
-from main import BotLifecycleManager, validate_bind_host
+from main import BotLifecycleManager, run_discord_bot, validate_bind_host
 from stats import BotTracker
 
 
@@ -66,6 +66,55 @@ class FakeDiscordBot:
 
 
 class BotRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runner_reconnects_when_bot_start_returns_unexpectedly(self):
+        started: list[str] = []
+        shutdown_event = asyncio.Event()
+
+        class ImmediateReturnBot:
+            def __init__(self) -> None:
+                self.tracker = BotTracker()
+                self.closed = False
+
+            def is_closed(self) -> bool:
+                return self.closed
+
+            def write_state_file(self) -> None:
+                pass
+
+            async def start(self, token: str) -> None:
+                started.append(token)
+                # Simulate discord.py returning without a shutdown/restart request.
+
+            async def close(self) -> None:
+                self.closed = True
+                self.tracker.connected = False
+                self.tracker.is_ready = False
+
+        def factory() -> ImmediateReturnBot:
+            return ImmediateReturnBot()
+
+        bot = factory()
+        task = asyncio.create_task(
+            run_discord_bot(
+                bot,
+                "test-discord-token",
+                shutdown_event,
+                bot_factory=factory,
+                initial_retry_delay=0.02,
+                max_retry_delay=0.05,
+            )
+        )
+        try:
+            for _ in range(60):
+                if len(started) >= 2:
+                    break
+                await asyncio.sleep(0.005)
+            self.assertGreaterEqual(len(started), 2, "unexpected normal return must trigger a reconnect")
+            self.assertFalse(task.done(), "runner must stay alive until explicit shutdown")
+        finally:
+            shutdown_event.set()
+            await asyncio.wait_for(task, timeout=1.0)
+
     async def test_valid_restart_closes_old_bot_recreates_instance_and_reconnects(self):
         admin_secret = "test-admin-secret-token-12345"
         discord_token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.Ga1234.FakeTokenValueForTesting"

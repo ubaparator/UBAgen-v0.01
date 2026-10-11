@@ -100,6 +100,8 @@ async function runTests() {
   let workerKilled = 0;
   let companionCalled = false;
   let simulateCompanionAlive = false;
+  let simulateRcloneCompanionAlive = false;
+  let rcloneCompanionCalled = false;
 
   const app = createApiApp({
     cooldownMs: 5000,
@@ -114,6 +116,15 @@ async function runTests() {
       const url = String(input);
       if (url.endsWith('/api/stats')) {
         return new Response(JSON.stringify({ status: 'online', source: 'upstream' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/rclone/') && simulateRcloneCompanionAlive) {
+        rcloneCompanionCalled = true;
+        const auth = String((init?.headers as Record<string, string>)?.Authorization || '');
+        assert.equal(auth, 'Bearer node-admin-secret');
+        return new Response(JSON.stringify({ ok: true, accounts: [], pending_deletions: [] }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -150,6 +161,31 @@ async function runTests() {
 
     // 3b. Missing or wrong token -> 401
     process.env.UBAGEN_ADMIN_TOKEN = 'node-admin-secret';
+
+    // Rclone routes must never inject the server's admin token for unauthenticated callers.
+    const rclone401Status = await fetch(`${baseUrl}/api/rclone/status`);
+    assert.equal(rclone401Status.status, 401);
+    const rclone401Mutation = await fetch(`${baseUrl}/api/rclone/accounts/mega`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ remote_name: 'test', user: 'user@example.com', password: 'not-a-real-password' }),
+    });
+    assert.equal(rclone401Mutation.status, 401);
+
+    simulateRcloneCompanionAlive = true;
+    const rclone200Status = await fetch(`${baseUrl}/api/rclone/status?refresh=false`, {
+      headers: { Authorization: 'Bearer node-admin-secret' },
+    });
+    assert.equal(rclone200Status.status, 200);
+    const rclone200Mutation = await fetch(`${baseUrl}/api/rclone/accounts/mega`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer node-admin-secret', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ remote_name: 'test', user: 'user@example.com', password: 'not-a-real-password' }),
+    });
+    assert.equal(rclone200Mutation.status, 200);
+    assert.equal(rcloneCompanionCalled, true);
+    simulateRcloneCompanionAlive = false;
+
     const r401Missing = await fetch(`${baseUrl}/api/admin/restart-bot`, { method: 'POST' });
     assert.equal(r401Missing.status, 401);
     const r401Wrong = await fetch(`${baseUrl}/api/admin/restart-bot`, {

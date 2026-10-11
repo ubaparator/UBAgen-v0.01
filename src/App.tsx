@@ -251,7 +251,6 @@ export default function App() {
     return localStorage.getItem('ubagen_custom_client_id') || '';
   });
   const [permissionPreset, setPermissionPreset] = useState<'recommended' | 'admin' | 'basic'>('recommended');
-  const [showRcloneManagement, setShowRcloneManagement] = useState<boolean>(false);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -525,7 +524,7 @@ export default function App() {
           {/* Rclone storage management */}
           <button
             type="button"
-            onClick={() => setShowRcloneManagement(true)}
+            onClick={() => document.getElementById('rclone-storage-management')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
             className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-500/10 text-emerald-200 border border-emerald-500/30 hover:bg-emerald-500/20 transition-all flex items-center gap-1.5 cursor-pointer"
             title="MEGA ve Google Drive hesaplarını ve depolama kotalarını yönet"
           >
@@ -622,9 +621,7 @@ export default function App() {
         </div>
       </header>
 
-      {showRcloneManagement && (
-        <RcloneManagement onClose={() => setShowRcloneManagement(false)} />
-      )}
+      <RcloneManagement inline />
 
       {/* Endpoint Configuration Bar (Collapsible) */}
       {showConfig && (
