@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import html
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 try:
     import discord
@@ -264,6 +267,37 @@ def cleanup_stale_workdirs(base_dir: Optional[Path] = None) -> int:
             removed += mgr.cleanup_stale_temp_dirs()
             mgr.cleanup_outputs()
     return removed
+
+
+def validate_video_source(source: str) -> tuple[bool, str]:
+    """
+    Accept a torrent magnet URI or a direct HTTP(S) media URL.
+    Reject local/private literal addresses to reduce SSRF risk when fetching user-supplied URLs.
+    """
+    raw = (source or "").strip()
+    if raw.lower().startswith("magnet:"):
+        # Preserve the existing torrent validation and compatibility.
+        return validate_magnet_uri(raw)
+    try:
+        parsed = urlparse(raw)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False, "Video kaynağı magnet bağlantısı veya doğrudan HTTP/HTTPS medya URL'si olmalıdır."
+        if parsed.username or parsed.password:
+            return False, "Kimlik bilgisi içeren URL'ler kabul edilmiyor."
+        host = parsed.hostname.rstrip(".").lower()
+        if host in {"localhost", "localhost.localdomain", "metadata.google.internal", "metadata"} or host.endswith(".localhost") or host.endswith(".local"):
+            return False, "Yerel ağ/metadata adresleri video kaynağı olarak kabul edilmiyor."
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None and not ip.is_global:
+            return False, "Özel veya yerel IP adresleri video kaynağı olarak kabul edilmiyor."
+        if any(ch.isspace() for ch in raw) or len(raw) > 4096:
+            return False, "Video URL'si geçersiz veya çok uzun."
+        return True, raw
+    except Exception:
+        return False, "Video kaynağı URL formatı geçersiz."
 
 
 def validate_magnet_uri(magnet: Optional[str]) -> tuple[bool, str]:
