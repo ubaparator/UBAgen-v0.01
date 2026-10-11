@@ -116,6 +116,11 @@ interface StatsResponse {
       version: string;
       path: string | null;
     };
+    ffprobe?: {
+      installed: boolean;
+      version: string;
+      path: string | null;
+    };
     aria2: {
       installed: boolean;
       version: string;
@@ -205,7 +210,10 @@ export default function App() {
         let lastFailure: Error | null = null;
         for (const candidate of candidates) {
           try {
-            const response = await fetch(candidate, {
+            const requestUrl = isManual
+              ? `${candidate}${candidate.includes('?') ? '&' : '?'}fresh=1`
+              : candidate;
+            const response = await fetch(requestUrl, {
               headers: { Accept: 'application/json' },
               cache: 'no-store',
             });
@@ -636,7 +644,7 @@ export default function App() {
                   isPaused ? 'text-amber-400 font-semibold' : 'text-emerald-400 font-semibold'
                 }
               >
-                {isPaused ? 'Paused' : 'Every 2 seconds'}
+                {isPaused ? 'Paused' : 'Every 5 seconds'}
               </strong>
             </span>
           </div>
@@ -999,8 +1007,8 @@ export default function App() {
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-slate-400">Slash Command:</span>
-                    <span className="font-mono text-emerald-400">/stats Available</span>
+                    <span className="text-slate-400">Slash Commands:</span>
+                    <span className="font-mono text-emerald-400">/stats, /altyazı_ayıklama</span>
                   </div>
                   {stats.bot.sync_status && (
                     <div className="flex justify-between text-[11px] pt-0.5 border-t border-slate-800/60">

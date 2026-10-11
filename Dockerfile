@@ -34,7 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     procps \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && aria2c --version >/dev/null \
+    && ffmpeg -version >/dev/null \
+    && ffprobe -version >/dev/null
 
 WORKDIR /app
 

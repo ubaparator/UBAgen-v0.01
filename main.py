@@ -57,7 +57,11 @@ import uvicorn
 
 from health_api import create_health_app
 from stats import register_stats_command, BotTracker
-from subtitle_extract import register_subtitle_extract_command
+from subtitle_extract import (
+    cleanup_stale_workdirs,
+    log_runtime_binaries_status,
+    register_subtitle_extract_command,
+)
 
 # ------------------------------------------------------------------------------
 # Logging Configuration
@@ -95,6 +99,12 @@ if commands is not None:
         def write_state_file(self) -> None:
             """Write current bot state to local tmp file for process sharing."""
             try:
+                if self.is_ready():
+                    raw_lat = getattr(self, "latency", None)
+                    if isinstance(raw_lat, (int, float)) and raw_lat >= 0 and raw_lat == raw_lat and raw_lat != float("inf"):
+                        self.tracker.latency_ms = round(float(raw_lat) * 1000, 1)
+                    if getattr(self, "guilds", None) is not None:
+                        self.tracker.guild_count = len(self.guilds)
                 with open("/tmp/ubagen_bot_state.json", "w", encoding="utf-8") as f:
                     json.dump(self.tracker.to_dict(), f)
             except Exception:
@@ -171,11 +181,44 @@ if commands is not None:
             logger.info("Connected to Discord Gateway.")
             self.tracker.connected = True
             self.tracker.status = "connected"
+            if self.user:
+                self.tracker.user = str(self.user)
+                self.tracker.client_id = str(self.user.id)
             self.tracker.diagnostic_message = "Connected to Discord Gateway (caching guilds...)"
             self.write_state_file()
 
         async def on_ready(self) -> None:
             """Fires when Discord gateway connection and guild cache are fully established."""
+            if self.user:
+                logger.info("==================================================")
+                logger.info("🎉 UBAgen Bot is ONLINE!")
+                logger.info("Logged in as : %s (ID: %s)", self.user, self.user.id)
+                logger.info("Connected to : %d guild(s)", len(self.guilds))
+                logger.info("Gateway Ping : %.1f ms", self.latency * 1000)
+                logger.info("==================================================")
+
+                self.tracker.connected = True
+                self.tracker.is_ready = True
+                self.tracker.status = "connected"
+                self.tracker.user = str(self.user)
+                self.tracker.client_id = str(self.user.id)
+                self.tracker.invite_url = f"https://discord.com/oauth2/authorize?client_id={self.user.id}&permissions=2147485696&scope=bot%20applications.commands"
+                self.tracker.guild_count = len(self.guilds)
+                self.tracker.latency_ms = round(self.latency * 1000, 1)
+                if not self.tracker.last_connected_time:
+                    self.tracker.last_connected_time = time.time()
+                self.tracker.diagnostic_message = "Connected to Discord Gateway."
+                self.write_state_file()
+
+                activity = discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name="/stats",
+                )
+                try:
+                    await self.change_presence(status=discord.Status.online, activity=activity)
+                except Exception:
+                    pass
+
             # Guild-scoped copies appear immediately in every server the bot has joined.
             # Keep global registration too, so commands also propagate to future servers.
             if not self._guild_commands_synced:
@@ -206,35 +249,6 @@ if commands is not None:
                 # If it failed, a later gateway READY event can retry registration.
                 self._guild_commands_synced = global_sync_succeeded
                 self.write_state_file()
-
-            if self.user:
-                logger.info("==================================================")
-                logger.info("🎉 UBAgen Bot is ONLINE!")
-                logger.info("Logged in as : %s (ID: %s)", self.user, self.user.id)
-                logger.info("Connected to : %d guild(s)", len(self.guilds))
-                logger.info("Gateway Ping : %.1f ms", self.latency * 1000)
-                logger.info("==================================================")
-
-                self.tracker.connected = True
-                self.tracker.is_ready = True
-                self.tracker.status = "connected"
-                self.tracker.user = str(self.user)
-                self.tracker.client_id = str(self.user.id)
-                self.tracker.invite_url = f"https://discord.com/oauth2/authorize?client_id={self.user.id}&permissions=2147485696&scope=bot%20applications.commands"
-                self.tracker.guild_count = len(self.guilds)
-                self.tracker.latency_ms = round(self.latency * 1000, 1)
-                self.tracker.last_connected_time = time.time()
-                self.tracker.diagnostic_message = "Connected to Discord Gateway."
-                self.write_state_file()
-
-                activity = discord.Activity(
-                    type=discord.ActivityType.listening,
-                    name="/stats",
-                )
-                try:
-                    await self.change_presence(status=discord.Status.online, activity=activity)
-                except Exception:
-                    pass
 
         async def on_resumed(self) -> None:
             """Fires when a disconnected gateway session is successfully resumed."""
@@ -635,7 +649,7 @@ class BotLifecycleManager:
             if not is_closed and hasattr(current_bot, "close") and callable(current_bot.close):
                 logger.info("Closing active Discord bot connection...")
                 try:
-                    await asyncio.wait_for(current_bot.close(), timeout=5.0)
+                    await asyncio.wait_for(current_bot.close(), timeout=3.0)
                 except asyncio.TimeoutError:
                     logger.warning("Timed out waiting for Discord bot.close(); forcing task cleanup.")
                 except Exception as exc:
@@ -643,7 +657,7 @@ class BotLifecycleManager:
 
         if current_task is not None and not current_task.done():
             try:
-                await asyncio.wait_for(current_task, timeout=2.0)
+                await asyncio.wait_for(current_task, timeout=1.5)
             except (asyncio.TimeoutError, Exception):
                 current_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
@@ -775,6 +789,12 @@ async def main() -> None:
 
     http_host = validate_bind_host(os.getenv("HOST", "0.0.0.0"), port=http_port)
     dev_guild_id = parse_dev_guild_id()
+
+    # Clean up any leftover temporary job directories and verify aria2c, ffmpeg, and ffprobe
+    with suppress(Exception):
+        await asyncio.to_thread(cleanup_stale_workdirs)
+    with suppress(Exception):
+        await asyncio.to_thread(log_runtime_binaries_status, True)
 
     shutdown_event = asyncio.Event()
     bot_manager = BotLifecycleManager(

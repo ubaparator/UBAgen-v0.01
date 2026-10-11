@@ -117,7 +117,7 @@ class BotTracker:
         # Determine friendly display name for user
         if self.user:
             display_user = self.user
-        elif self.is_ready:
+        elif self.is_ready or self.connected or self.status == "connected":
             display_user = "Connected"
         elif self.status == "invalid_token":
             display_user = "Authentication Failed"
@@ -141,6 +141,7 @@ class BotTracker:
             "latency_ms": self.latency_ms,
             "user": display_user,
             "guild_count": self.guild_count,
+            "last_connected_time": self.last_connected_time,
             "uptime_seconds": uptime_sec,
             "uptime_str": format_duration(uptime_sec),
             "sync_status": self.sync_status,
@@ -391,30 +392,38 @@ def detect_container_resource_limits() -> dict[str, Any]:
 _BINARY_CACHE: dict[str, dict[str, Any]] = {}
 _BINARY_CACHE_EXPIRY: float = 0.0
 
+
+def clear_binary_cache() -> None:
+    """Clear the cached binary inspection results so newly installed tools are detected immediately."""
+    global _BINARY_CACHE_EXPIRY
+    _BINARY_CACHE.clear()
+    _BINARY_CACHE_EXPIRY = 0.0
+
+
 def check_binary(binary_name: str, version_arg: str = "-version") -> dict[str, Any]:
     """
     Check whether a binary is installed and retrieve its version safely.
-    Caches results for 60 seconds to avoid spawning subprocesses on every poll tick.
+    Caches positive results for 60 seconds to avoid spawning subprocesses on every poll tick.
     """
     global _BINARY_CACHE_EXPIRY
     now = time.time()
     if now < _BINARY_CACHE_EXPIRY and binary_name in _BINARY_CACHE:
-        return _BINARY_CACHE[binary_name]
+        cached = _BINARY_CACHE[binary_name]
+        if cached.get("installed"):
+            return cached
 
     path = shutil.which(binary_name)
     if not path:
-        res = {
+        _BINARY_CACHE.pop(binary_name, None)
+        return {
             "installed": False,
             "version": "Not installed",
             "path": None,
         }
-        _BINARY_CACHE[binary_name] = res
-        _BINARY_CACHE_EXPIRY = now + 60.0
-        return res
 
     try:
         proc = subprocess.run(
-            [binary_name, version_arg],
+            [path, version_arg],
             capture_output=True,
             text=True,
             timeout=1.5,
@@ -683,7 +692,7 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
     if not bot_tracker and os.path.exists(state_file):
         try:
             mtime = os.path.getmtime(state_file)
-            if now - mtime < 25.0:
+            if now - mtime < 120.0:
                 with open(state_file, "r", encoding="utf-8") as f:
                     cached_dict = json.load(f)
                 if isinstance(cached_dict, dict) and "status" in cached_dict:
@@ -694,7 +703,11 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
                     bot_user_str = cached_dict.get("user", "Disconnected")
                     guild_count = cached_dict.get("guild_count", 0)
                     bot_diag_msg = cached_dict.get("diagnostic_message", "")
-                    bot_uptime_sec = cached_dict.get("uptime_seconds")
+                    last_conn = cached_dict.get("last_connected_time")
+                    if is_ready and isinstance(last_conn, (int, float)) and last_conn > 0:
+                        bot_uptime_sec = max(0.0, now - float(last_conn))
+                    else:
+                        bot_uptime_sec = cached_dict.get("uptime_seconds")
                     sync_status = cached_dict.get("sync_status")
                     bot_client_id = cached_dict.get("client_id")
                     bot_invite_url = cached_dict.get("invite_url")
@@ -703,6 +716,31 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             logger.debug("Failed reading state file: %s", e)
 
     if bot_tracker and bot_tracker != "cached":
+        # Dynamically refresh gateway latency and guild count from the live bot instance
+        if bot is not None:
+            try:
+                live_ready = bool(hasattr(bot, "is_ready") and callable(bot.is_ready) and bot.is_ready())
+                if live_ready:
+                    bot_tracker.connected = True
+                    bot_tracker.is_ready = True
+                    bot_tracker.status = "connected"
+                    if getattr(bot, "user", None):
+                        bot_tracker.user = str(bot.user)
+                        if getattr(bot.user, "id", None):
+                            bot_tracker.client_id = str(bot.user.id)
+                    if not bot_tracker.last_connected_time:
+                        bot_tracker.last_connected_time = now
+                    raw_lat = getattr(bot, "latency", None)
+                    if isinstance(raw_lat, (int, float)) and raw_lat >= 0 and raw_lat == raw_lat and raw_lat != float("inf"):
+                        bot_tracker.latency_ms = round(float(raw_lat) * 1000, 1)
+                    live_guilds = getattr(bot, "guilds", None)
+                    if live_guilds is not None:
+                        bot_tracker.guild_count = len(live_guilds)
+                    if hasattr(bot, "write_state_file") and callable(bot.write_state_file):
+                        bot.write_state_file()
+            except Exception:
+                pass
+
         bot_dict = bot_tracker.to_dict(now)
         bot_status_str = bot_dict["status"]
         is_ready = bot_dict["is_ready"]
@@ -836,8 +874,9 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
 
     backend_uptime_sec = now - PROCESS_START_TIME
 
-    # 8. External Binaries (FFmpeg & aria2)
+    # 8. External Binaries (FFmpeg, ffprobe & aria2)
     ffmpeg_info = check_binary("ffmpeg", "-version")
+    ffprobe_info = check_binary("ffprobe", "-version")
     aria2_info = check_binary("aria2c", "--version")
 
     # 9. Environment Variables
@@ -899,6 +938,7 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
         },
         "binaries": {
             "ffmpeg": ffmpeg_info,
+            "ffprobe": ffprobe_info,
             "aria2": aria2_info,
         },
         "env_vars": env_statuses,
@@ -948,6 +988,7 @@ def build_stats_embed(stats: dict[str, Any]) -> Any:
             f"**Status:** 🟢 Connected (`{bot_latency_str}` ping)",
             f"**Account:** `{bot_info['user']}`",
             f"**Guilds:** {bot_info['guild_count']} server(s) connected",
+            f"**Bot Uptime:** {bot_info['uptime_str']}",
             f"**Backend Uptime:** {compute['backend_uptime_str']}",
         ]
         if bot_info.get("invite_url"):
@@ -1032,14 +1073,16 @@ def build_stats_embed(stats: dict[str, Any]) -> Any:
 
     # 5. External Multimedia Binaries
     ffmpeg = binaries["ffmpeg"]
+    ffprobe = binaries.get("ffprobe", {"installed": False, "version": "Not installed"})
     aria2 = binaries["aria2"]
 
     ffmpeg_line = f"**FFmpeg:** {'✅ ' + ffmpeg['version'] if ffmpeg['installed'] else '❌ Not installed'}"
+    ffprobe_line = f"**ffprobe:** {'✅ ' + ffprobe['version'] if ffprobe['installed'] else '❌ Not installed'}"
     aria2_line = f"**aria2:** {'✅ ' + aria2['version'] if aria2['installed'] else '❌ Not installed'}"
 
     embed.add_field(
         name="📦 Multimedia Toolchain",
-        value=f"{ffmpeg_line}\n{aria2_line}",
+        value=f"{ffmpeg_line}\n{ffprobe_line}\n{aria2_line}",
         inline=True,
     )
 

@@ -7,10 +7,12 @@ from contextlib import suppress
 import html
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +21,12 @@ try:
     import discord
 except ImportError:
     discord = None
+
+try:
+    from stats import clear_binary_cache
+except ImportError:
+    def clear_binary_cache() -> None:
+        pass
 
 logger = logging.getLogger("ubagen.subtitles")
 
@@ -33,6 +41,13 @@ DOWNLOAD_TEMP_DIR = Path("download_temp")
 PRIMARY_VIDEO_SUFFIXES = (".mkv", ".mp4")
 VIDEO_SUFFIXES = {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm", ".ts", ".m2ts"}
 BITMAP_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
+
+REQUIRED_BINARIES: tuple[tuple[str, str, str], ...] = (
+    ("aria2c", "--version", "aria2"),
+    ("ffmpeg", "-version", "ffmpeg"),
+    ("ffprobe", "-version", "ffmpeg"),
+)
+_INSTALL_LOCK = threading.Lock()
 
 # Colab torrent downloader tracker list (preserved for aria2c peer discovery)
 COLAB_TRACKERS: tuple[str, ...] = (
@@ -76,6 +91,163 @@ def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
 
 
+def check_runtime_binary(binary_name: str, version_arg: str = "--version") -> dict[str, Any]:
+    """
+    Verify that `binary_name` exists on PATH (`shutil.which`) and is executable.
+    Returns diagnostic metadata with path, version, and executability state.
+    """
+    resolved_path = shutil.which(binary_name)
+    if not resolved_path:
+        return {
+            "name": binary_name,
+            "installed": False,
+            "executable": False,
+            "path": None,
+            "version": "Not installed",
+        }
+
+    try:
+        proc = subprocess.run(
+            [resolved_path, version_arg],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        raw_out = (proc.stdout or proc.stderr or "").strip()
+        first_line = raw_out.splitlines()[0].strip() if raw_out else "Installed"
+        executable = proc.returncode == 0 or bool(first_line)
+        return {
+            "name": binary_name,
+            "installed": True,
+            "executable": executable,
+            "path": resolved_path,
+            "version": first_line,
+        }
+    except Exception as exc:
+        return {
+            "name": binary_name,
+            "installed": True,
+            "executable": False,
+            "path": resolved_path,
+            "version": f"Execution failed ({type(exc).__name__})",
+        }
+
+
+def ensure_runtime_binaries(auto_install: bool = True) -> dict[str, dict[str, Any]]:
+    """
+    Verify that `aria2c`, `ffmpeg`, and `ffprobe` are present and executable in the current runtime.
+    If any required binary is missing and `auto_install=True`, attempts installation via the platform's
+    official Debian/Ubuntu `apt-get` package manager when running with root privileges (such as AI Studio Run).
+    Never downloads arbitrary binaries or executes untrusted remote shell scripts.
+    """
+    statuses: dict[str, dict[str, Any]] = {}
+    missing_apt_packages: list[str] = []
+
+    for bin_name, ver_arg, apt_pkg in REQUIRED_BINARIES:
+        info = check_runtime_binary(bin_name, ver_arg)
+        statuses[bin_name] = info
+        if (not info["installed"] or not info["executable"]) and apt_pkg not in missing_apt_packages:
+            missing_apt_packages.append(apt_pkg)
+
+    if not missing_apt_packages or not auto_install:
+        return statuses
+
+    with _INSTALL_LOCK:
+        # Re-check inside lock in case another caller already completed installation
+        missing_apt_packages.clear()
+        for bin_name, ver_arg, apt_pkg in REQUIRED_BINARIES:
+            info = check_runtime_binary(bin_name, ver_arg)
+            statuses[bin_name] = info
+            if (not info["installed"] or not info["executable"]) and apt_pkg not in missing_apt_packages:
+                missing_apt_packages.append(apt_pkg)
+
+        if not missing_apt_packages:
+            return statuses
+
+        apt_get_path = shutil.which("apt-get")
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if apt_get_path and is_root:
+            logger.info(
+                "Missing system multimedia package(s) %s detected; installing via official apt-get...",
+                ", ".join(missing_apt_packages),
+            )
+            env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+            try:
+                subprocess.run(
+                    [apt_get_path, "update", "-qq"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    check=False,
+                )
+                install_res = subprocess.run(
+                    [
+                        apt_get_path,
+                        "install",
+                        "-y",
+                        "--no-install-recommends",
+                        *missing_apt_packages,
+                        "ca-certificates",
+                        "curl",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+                if install_res.returncode != 0:
+                    logger.warning(
+                        "apt-get install exited with code %s: %s",
+                        install_res.returncode,
+                        (install_res.stderr or install_res.stdout or "").strip()[-500:],
+                    )
+                clear_binary_cache()
+            except Exception as exc:
+                logger.warning("Automatic apt-get provisioning failed (%s): %s", type(exc).__name__, exc)
+
+        for bin_name, ver_arg, _ in REQUIRED_BINARIES:
+            statuses[bin_name] = check_runtime_binary(bin_name, ver_arg)
+
+    return statuses
+
+
+def log_runtime_binaries_status(auto_install: bool = True) -> dict[str, dict[str, Any]]:
+    """Verify and log the paths and versions of `aria2c`, `ffmpeg`, and `ffprobe` at startup."""
+    statuses = ensure_runtime_binaries(auto_install=auto_install)
+    for bin_name, info in statuses.items():
+        if info["installed"] and info["executable"]:
+            logger.info(
+                "Runtime binary verified: %-8s -> %s (%s)",
+                bin_name,
+                info["path"],
+                info["version"],
+            )
+        else:
+            logger.error(
+                "Runtime binary MISSING or NOT EXECUTABLE: %-8s (status: %s)",
+                bin_name,
+                info["version"],
+            )
+    return statuses
+
+
+def cleanup_stale_workdirs(base_dir: Optional[Path] = None) -> int:
+    """Remove any leftover `job_*` directories inside `download_temp` on startup."""
+    root = Path(base_dir) if base_dir is not None else DOWNLOAD_TEMP_DIR
+    if not root.exists():
+        return 0
+    removed = 0
+    for child in root.iterdir():
+        if child.is_dir() and child.name.startswith("job_"):
+            with suppress(Exception):
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+    return removed
+
+
 def validate_magnet_uri(magnet: Optional[str]) -> tuple[bool, str]:
     """Validate that a user-supplied magnet link is a well-formed BitTorrent magnet URI."""
     if not magnet or not magnet.strip():
@@ -111,17 +283,19 @@ def build_aria2c_command(magnet: str, workdir: Path) -> list[str]:
     """
     Build the aria2c command preserving the Colab torrent configuration:
     - tracker list (--bt-tracker)
-    - DHT enabled (--enable-dht=true)
-    - 16 connections per server & 16 splits (-x 16 -s 16 / --max-connection-per-server=16 --split=16)
+    - DHT enabled (--enable-dht=true) with isolated per-job DHT file (--dht-file-path)
+    - 16 connections per server & 16 splits (--max-connection-per-server=16 --split=16)
     - zero seeding (--seed-time=0)
     - isolated output directory (-d / --dir)
     """
+    dht_file = workdir / "dht.dat"
     return [
         "aria2c",
         "--seed-time=0",
         "--max-connection-per-server=16",
         "--split=16",
         "--enable-dht=true",
+        f"--dht-file-path={dht_file}",
         "--bt-enable-lpd=true",
         "--enable-peer-exchange=true",
         "--bt-max-peers=200",
@@ -352,6 +526,9 @@ async def execute_subtitle_extraction(
         return
     lang = lang_or_error
 
+    if shutil.which("aria2c") is None or shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        await asyncio.to_thread(ensure_runtime_binaries, True)
+
     if shutil.which("aria2c") is None:
         await _send_final_error(
             interaction,
@@ -520,6 +697,7 @@ async def execute_subtitle_extraction(
                     content=summary_msg,
                     file=discord_file,
                 )
+                await _update_progress(interaction, summary_msg)
             finally:
                 with suppress(Exception):
                     discord_file.close()

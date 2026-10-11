@@ -57,13 +57,13 @@ function ensurePythonWorker() {
   if (pythonWorkerProcess) return;
 
   try {
-    pythonWorkerProcess = spawn('python3', ['main.py'], {
+    pythonWorkerProcess = spawn('python3', ['-B', 'main.py'], {
       env: {
         ...process.env,
+        PYTHONDONTWRITEBYTECODE: '1',
         UBAGEN_HTTP_PORT: '5050',
-        PORT: '5050',
       },
-      stdio: 'ignore',
+      stdio: ['ignore', 'inherit', 'inherit'],
     });
 
     pythonWorkerProcess.on('error', (err) => {
@@ -121,6 +121,7 @@ function degradedStats(reason: string) {
     disk: { total_bytes: null, total_str: 'Unavailable', used_bytes: null,
       used_str: 'Unavailable', free_bytes: null, free_str: 'Unavailable', percent: null },
     binaries: { ffmpeg: { installed: false, version: 'Unavailable', path: null },
+      ffprobe: { installed: false, version: 'Unavailable', path: null },
       aria2: { installed: false, version: 'Unavailable', path: null } },
     env_vars: [],
   };
@@ -198,7 +199,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 4000);
+        const timeout = setTimeout(() => controller.abort(), 10000);
         let upstreamRes: Response;
         try {
           upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/admin/restart-bot`, {
@@ -294,8 +295,10 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     res.setHeader('Pragma', 'no-cache');
 
+    const bypassCache = req.query.fresh === '1' || req.query.fresh === 'true';
+
     // Share a short-lived snapshot between dashboard polls to avoid repeated subprocess work.
-    if (statsCache && Date.now() < statsCache.expiresAt) {
+    if (!bypassCache && statsCache && Date.now() < statsCache.expiresAt) {
       return res.json(statsCache.data);
     }
 
@@ -326,7 +329,11 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
 
     // 2. Direct measurement via Python on the local machine
     const scriptPath = path.join(__dirname, 'stats.py');
-    execFile('python3', [scriptPath, '--json'], { timeout: 3500 }, (error, stdout, stderr) => {
+    execFile(
+      'python3',
+      ['-B', scriptPath, '--json'],
+      { timeout: 3500, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout, stderr) => {
       if (!error && stdout) {
         try {
           const stats = JSON.parse(stdout);

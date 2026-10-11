@@ -17,10 +17,13 @@ from subtitle_extract import (
     COMMAND_NAME,
     MAX_INPUT,
     build_aria2c_command,
+    check_runtime_binary,
     clean_srt_file,
     create_job_workdir,
+    ensure_runtime_binaries,
     execute_subtitle_extraction,
     find_video_files,
+    log_runtime_binaries_status,
     register_subtitle_extract_command,
     select_subtitle_stream,
     subtitle_format,
@@ -239,6 +242,27 @@ class SubtitleExtractTests(unittest.IsolatedAsyncioTestCase):
             any("❌" in msg for msg in interaction.progress_updates),
             "Expected error message in progress updates",
         )
+
+    def test_runtime_binaries_verification(self):
+        statuses = log_runtime_binaries_status(auto_install=False)
+        self.assertIn("aria2c", statuses)
+        self.assertIn("ffmpeg", statuses)
+        self.assertIn("ffprobe", statuses)
+        for name in ("aria2c", "ffmpeg", "ffprobe"):
+            info = statuses[name]
+            self.assertEqual(info["name"], name)
+            self.assertIn("installed", info)
+            self.assertIn("executable", info)
+            self.assertIn("path", info)
+            self.assertIn("version", info)
+
+        missing = check_runtime_binary("nonexistent_binary_xyz_999")
+        self.assertFalse(missing["installed"])
+        self.assertFalse(missing["executable"])
+        self.assertIsNone(missing["path"])
+
+        ensured = ensure_runtime_binaries(auto_install=False)
+        self.assertEqual(set(ensured.keys()), {"aria2c", "ffmpeg", "ffprobe"})
 
 
 if __name__ == "__main__":

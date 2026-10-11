@@ -95,6 +95,7 @@ def _degraded_stats(reason: str) -> dict[str, Any]:
         },
         "binaries": {
             "ffmpeg": {"installed": False, "version": "Unavailable", "path": None},
+            "ffprobe": {"installed": False, "version": "Unavailable", "path": None},
             "aria2": {"installed": False, "version": "Unavailable", "path": None},
         },
         "env_vars": [],
@@ -303,6 +304,14 @@ def create_health_app(
         tracker = getattr(current_bot, "tracker", None) if current_bot else None
 
         if tracker:
+            if current_bot is not None:
+                try:
+                    if hasattr(current_bot, "is_ready") and callable(current_bot.is_ready) and current_bot.is_ready():
+                        raw_lat = getattr(current_bot, "latency", None)
+                        if isinstance(raw_lat, (int, float)) and raw_lat >= 0 and raw_lat == raw_lat and raw_lat != float("inf"):
+                            tracker.latency_ms = round(float(raw_lat) * 1000, 1)
+                except Exception:
+                    pass
             bot_is_ready = tracker.is_ready
             bot_connected = tracker.connected
             latency_ms = tracker.latency_ms
