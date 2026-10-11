@@ -36,7 +36,7 @@ export function resolveRestartBotUrl(endpointUrl: string): string {
   }
 
   // Full HTTP(S) URL
-  if (/^https?:\/\//i.test(raw)) {
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
     let parsed: URL;
     try {
       parsed = new URL(raw);
@@ -194,7 +194,7 @@ export async function executeBotRestartRequest(options: {
  */
 export function resolveApiUrl(path: string): string {
   const raw = (path || '').trim();
-  if (/^https?:\\/\\//i.test(raw)) return raw;
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
   if (raw.startsWith('//')) {
     throw new Error('Protocol-relative API URLs are not supported.');
   }
