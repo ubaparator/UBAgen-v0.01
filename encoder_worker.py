@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Optional
 import urllib.error
@@ -52,12 +53,16 @@ except ImportError:
 from job_store import (
     DEFAULT_RETENTION_SECONDS,
     EncodeJob,
+    FirestoreUnavailableError,
+    GCSOutputStorage,
+    JobNotFoundError,
     PersistentJobStore,
     detect_cloud_run_environment_details,
     get_gcp_access_token,
     get_job_store,
     normalize_video_codec,
 )
+from stats import redact_sensitive_text
 from storage_manager import format_storage_bytes, get_storage_manager
 from subtitle_extract import (
     BITMAP_SUBTITLE_CODECS,
@@ -76,7 +81,217 @@ from subtitle_extract import (
 logger = logging.getLogger("ubagen.encoder")
 
 ENCODE_COMMAND_NAME = "encode"
+ENCODEAL_COMMAND_NAME = "encodeal"
 JOB_STATUS_COMMAND_NAME = "is_durumu"
+DISCORD_RESTART_COMMAND_NAME = "discord"
+
+ALLOWED_SUBTITLE_EXTENSIONS = {".ass", ".ssa", ".srt"}
+ALLOWED_INTRO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
+MAX_SUBTITLE_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_INTRO_ATTACHMENT_BYTES = 200 * 1024 * 1024  # 200 MB
+
+DISALLOWED_SUBTITLE_MIME_PREFIXES = (
+    "video/",
+    "audio/",
+    "image/",
+    "application/x-msdownload",
+    "application/x-executable",
+    "application/x-dosexec",
+    "application/x-sh",
+)
+ALLOWED_INTRO_MIME_PREFIXES = (
+    "video/",
+    "application/octet-stream",
+)
+
+
+def sanitize_process_output(raw_text: Optional[str], max_chars: int = 400) -> str:
+    """
+    Sanitize subprocess (FFmpeg / aria2c / ffprobe) stderr/stdout before logging or persisting:
+    redacts magnet hashes, query tokens, signatures, and secrets while keeping diagnostic lines.
+    """
+    if not raw_text:
+        return ""
+    cleaned = redact_sensitive_text(str(raw_text))
+    cleaned = re.sub(r"magnet:\?[^\s\"']+", "magnet:?[REDACTED]", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(https?://[^\s\"'?]+)\?[^\s\"']+", r"\1?[REDACTED_QUERY]", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+    if len(cleaned) > max_chars:
+        return cleaned[-max_chars:]
+    return cleaned
+
+
+def sanitize_untrusted_filename(
+    raw_filename: Optional[str],
+    *,
+    allowed_extensions: set[str],
+    kind_label: str,
+) -> tuple[bool, str, str]:
+    """
+    Treat attachment filenames as untrusted input:
+    - Strip directory traversal components (`../`, `/`, `\\`).
+    - Enforce allowed file extension.
+    - Replace unsafe characters with `_` and bound length.
+    Returns `(is_valid, sanitized_filename_or_error, lowercase_extension)`.
+    """
+    raw = (raw_filename or "").strip()
+    if not raw or "\x00" in raw:
+        return False, f"{kind_label} dosya adı geçersiz veya boş.", ""
+
+    normalized_slashes = raw.replace("\\", "/")
+    if ".." in Path(normalized_slashes).parts:
+        return False, f"{kind_label} dosya adında güvenli olmayan yol karakterleri (`..`) tespit edildi.", ""
+
+
+    base_name = Path(normalized_slashes).name.strip()
+    if not base_name or base_name.startswith("."):
+        return False, f"{kind_label} dosya adı geçersiz.", ""
+
+    ext = Path(base_name).suffix.lower()
+    if not ext or ext not in allowed_extensions:
+        allowed_str = ", ".join(sorted(allowed_extensions))
+        return (
+            False,
+            f"Geçersiz {kind_label} dosya uzantısı (`{ext or 'yok'}`). Yalnızca şu uzantılar desteklenir: {allowed_str}",
+            ext,
+        )
+
+    stem = Path(base_name).stem
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")[:60] or "file"
+    return True, f"{safe_stem}{ext}", ext
+
+
+def validate_discord_attachment(attachment: Any, *, kind: str) -> tuple[bool, str, str]:
+    """
+    Validate a Discord attachment object (`altyazi` or `intro`) for `/encodeal`:
+    checks untrusted filename, extension, byte size limit, and MIME type (`content_type`).
+    Returns `(is_valid, sanitized_filename_or_error_msg, normalized_content_type)`.
+    """
+    if attachment is None:
+        return False, "Ek dosya bulunamadı.", ""
+
+    if kind == "subtitle":
+        allowed_exts = ALLOWED_SUBTITLE_EXTENSIONS
+        max_bytes = MAX_SUBTITLE_ATTACHMENT_BYTES
+        label = "Altyazı"
+    elif kind == "intro":
+        allowed_exts = ALLOWED_INTRO_EXTENSIONS
+        max_bytes = MAX_INTRO_ATTACHMENT_BYTES
+        label = "İntro"
+    else:
+        return False, f"Bilinmeyen ek dosya türü: {kind}", ""
+
+    raw_filename = getattr(attachment, "filename", None)
+    ok_name, safe_name_or_err, ext = sanitize_untrusted_filename(
+        raw_filename,
+        allowed_extensions=allowed_exts,
+        kind_label=label,
+    )
+    if not ok_name:
+        return False, safe_name_or_err, ""
+
+    size_val = getattr(attachment, "size", None)
+    if size_val is not None:
+        try:
+            size_int = int(size_val)
+        except (TypeError, ValueError):
+            return False, f"{label} dosya boyutu doğrulanamadı.", ""
+        if size_int <= 0:
+            return False, f"{label} dosyası boş (0 byte) olamaz.", ""
+        if size_int > max_bytes:
+            max_mb = max_bytes // (1024 * 1024)
+            return False, f"{label} dosyası çok büyük ({format_storage_bytes(size_int)}). Maksimum sınır: {max_mb} MB.", ""
+
+    raw_ct = str(getattr(attachment, "content_type", "") or "").strip().lower()
+    mime_base = raw_ct.split(";", 1)[0].strip() if raw_ct else ""
+
+    if kind == "subtitle" and mime_base:
+        if any(mime_base.startswith(prefix) for prefix in DISALLOWED_SUBTITLE_MIME_PREFIXES):
+            return (
+                False,
+                f"Altyazı eki için geçersiz MIME türü (`{mime_base}`). Yalnızca metin tabanlı `.ass` veya `.srt` yükleyin.",
+                "",
+            )
+    elif kind == "intro" and mime_base:
+        if not any(mime_base.startswith(prefix) for prefix in ALLOWED_INTRO_MIME_PREFIXES):
+            return (
+                False,
+                f"İntro eki için geçersiz MIME türü (`{mime_base}`). Yalnızca geçerli bir video dosyası yükleyin.",
+                "",
+            )
+
+    effective_ct = mime_base or ("text/plain; charset=utf-8" if kind == "subtitle" else "video/mp4")
+    return True, safe_name_or_err, effective_ct
+
+
+async def stage_discord_attachment_to_gcs(
+    attachment: Any,
+    *,
+    user_id: str,
+    job_id: str,
+    kind: str,
+    gcs_storage: GCSOutputStorage,
+) -> dict[str, Any]:
+    """
+    Validate, download, and upload a Discord attachment into a unique, user/job-scoped
+    GCS staging object (`gs://<bucket>/staging/<user_id>/<job_id>/...`).
+    Never leaves ephemeral Discord CDN URLs in the job queue.
+    """
+    ok_att, safe_name_or_err, content_type = validate_discord_attachment(attachment, kind=kind)
+    if not ok_att:
+        raise ValueError(safe_name_or_err)
+
+    max_bytes = MAX_SUBTITLE_ATTACHMENT_BYTES if kind == "subtitle" else MAX_INTRO_ATTACHMENT_BYTES
+    label = "Altyazı" if kind == "subtitle" else "İntro"
+
+    data: Optional[bytes] = None
+    read_fn = getattr(attachment, "read", None)
+    if callable(read_fn):
+        maybe_coro = read_fn()
+        if asyncio.iscoroutine(maybe_coro):
+            data = await maybe_coro
+        elif isinstance(maybe_coro, (bytes, bytearray)):
+            data = bytes(maybe_coro)
+
+    if data is None:
+        att_url = str(getattr(attachment, "url", "") or "").strip()
+        if not att_url.startswith(("https://", "http://")):
+            raise RuntimeError(f"{label} eki okunamadı (geçerli veri veya kaynak bulunamadı).")
+
+        def _download_bounded() -> bytes:
+            req = urllib.request.Request(att_url, headers={"User-Agent": "UBAgen-AttachmentStager/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                buf = resp.read(max_bytes + 1)
+                if len(buf) > max_bytes:
+                    raise ValueError(f"{label} dosyası izin verilen maksimum boyutu aşıyor.")
+                return buf
+
+        data = await asyncio.to_thread(_download_bounded)
+
+    if not data or len(data) <= 0:
+        raise ValueError(f"{label} dosyası boş (0 byte).")
+    if len(data) > max_bytes:
+        raise ValueError(f"{label} dosyası izin verilen maksimum boyutu aşıyor.")
+
+    if kind == "subtitle":
+        if b"\x00" in data[:512]:
+            raise ValueError("Altyazı dosyası ikili (binary) veri içeriyor; geçerli bir `.ass` veya `.srt` metin dosyası yükleyin.")
+
+    upload_res = await asyncio.to_thread(
+        gcs_storage.upload_staging_bytes,
+        data,
+        user_id=user_id,
+        job_id=job_id,
+        kind=kind,
+        original_filename=safe_name_or_err,
+        content_type=content_type,
+    )
+    return {
+        **upload_res,
+        "sanitized_filename": safe_name_or_err,
+        "content_type": content_type,
+    }
+
 
 STAGE_LABELS_TR: dict[str, str] = {
     "queued": "Sırada Bekliyor",
@@ -496,11 +711,45 @@ def notify_discord_webhook_sync(job: EncodeJob) -> bool:
         return False
 
 
-def _materialize_input_file(source: str, dest_dir: Path, prefix: str, default_suffix: str) -> Path:
+def _materialize_input_file(
+    source: str,
+    dest_dir: Path,
+    prefix: str,
+    default_suffix: str,
+    *,
+    gcs_storage: Optional[GCSOutputStorage] = None,
+    expected_user_id: Optional[str] = None,
+    expected_job_id: Optional[str] = None,
+) -> Path:
     """
-    Resolve a local path or HTTP/HTTPS URL into `dest_dir` for subtitle or intro inputs.
+    Resolve a GCS staging URI (`gs://bucket/staging/<user_id>/<job_id>/...`),
+    local path, or HTTP/HTTPS URL into `dest_dir` for subtitle or intro inputs.
+    Enforces ownership verification on GCS staging paths.
     """
     clean = source.strip()
+    if clean.startswith("gs://"):
+        without_scheme = clean[5:]
+        if "/" not in without_scheme:
+            raise ValueError(f"Geçersiz GCS URI formatı: {clean}")
+        bucket_name, object_name = without_scheme.split("/", 1)
+        clean_obj = object_name.lstrip("/")
+        if ".." in Path(clean_obj).parts:
+            raise ValueError("GCS nesne yolunda güvenli olmayan karakterler tespit edildi.")
+
+        if clean_obj.startswith("staging/") and expected_user_id and expected_job_id:
+            safe_user = re.sub(r"[^A-Za-z0-9._-]+", "_", expected_user_id.strip())[:64]
+            safe_job = re.sub(r"[^A-Za-z0-9._-]+", "_", expected_job_id.strip())[:64]
+            expected_prefix = f"staging/{safe_user}/{safe_job}/"
+            if not clean_obj.startswith(expected_prefix):
+                raise PermissionError(
+                    "Yetkisiz GCS staging nesnesi erişimi reddedildi (kullanıcı veya iş kimliği uyuşmuyor)."
+                )
+
+        ext = Path(clean_obj).suffix.lower() or default_suffix
+        target = dest_dir / f"{prefix}_{uuid.uuid4().hex[:6]}{ext}"
+        active_gcs = gcs_storage or get_job_store().gcs
+        return active_gcs.download_to_path(bucket_name, clean_obj, target)
+
     if clean.startswith(("http://", "https://")):
         parsed = urllib.parse.urlparse(clean)
         ext = Path(parsed.path).suffix.lower() or default_suffix
@@ -514,11 +763,12 @@ def _materialize_input_file(source: str, dest_dir: Path, prefix: str, default_su
 
     local_p = Path(clean).resolve()
     if not local_p.is_file() or local_p.stat().st_size == 0:
-        raise FileNotFoundError(f"Girdi dosyası bulunamadı veya boş: {clean}")
+        raise FileNotFoundError(f"Girdi dosyası bulunamadı veya boş: {Path(clean).name}")
     target = dest_dir / f"{prefix}_{local_p.name}"
     if local_p != target:
         shutil.copy2(local_p, target)
     return target
+
 
 
 def execute_encode_job_sync(
@@ -546,7 +796,13 @@ def execute_encode_job_sync(
     store = job_store or get_job_store()
     job = store.get_job(job_id)
     if job is None:
-        raise KeyError(f"Encode işi bulunamadı: {job_id}")
+        logger.error(
+            "Encode job '%s' was not found in the persistent job store (backend=%s).",
+            job_id,
+            store.get_backend_status().get("backend_type"),
+        )
+        raise JobNotFoundError(f"Encode işi kalıcı veritabanında bulunamadı: {job_id}")
+
 
     execution_name = (
         os.getenv("CLOUD_RUN_EXECUTION", "").strip()
@@ -632,13 +888,14 @@ def execute_encode_job_sync(
 
         videos = find_video_files(download_dir)
         if dl_res.returncode != 0 and not videos:
-            err_tail = (dl_res.stderr or dl_res.stdout or "").strip()[-400:]
+            err_tail = sanitize_process_output(dl_res.stderr or dl_res.stdout or "")
             msg = f"Torrent indirilemedi (aria2c kod {dl_res.returncode}). Magnet bağlantısını ve seeder durumunu kontrol edin."
             if err_tail:
                 logger.warning("Job %s aria2c failure: %s", job_id, err_tail)
             failed = store.mark_job_failed(job_id, msg)
             _emit_update(failed)
             return failed or job
+
 
         if not videos:
             failed = store.mark_job_failed(
@@ -669,6 +926,9 @@ def execute_encode_job_sync(
                 encode_dir,
                 "external_sub",
                 ".srt",
+                gcs_storage=store.gcs,
+                expected_user_id=job.user_id,
+                expected_job_id=job.job_id,
             )
             ext_lower = subtitle_file.suffix.lower()
             if ext_lower not in (".ass", ".ssa", ".srt"):
@@ -676,6 +936,7 @@ def execute_encode_job_sync(
             detected_sub_format = "ass" if ext_lower in (".ass", ".ssa") else "srt"
             if detected_sub_format == "srt":
                 clean_srt_file(subtitle_file)
+
         else:
             # Extract embedded subtitle stream matching requested language
             streams = probe_subtitle_streams(source_video)
@@ -737,7 +998,11 @@ def execute_encode_job_sync(
                 encode_dir,
                 "intro_clip",
                 ".mp4",
+                gcs_storage=store.gcs,
+                expected_user_id=job.user_id,
+                expected_job_id=job.job_id,
             )
+
             intro_meta = probe_video_metadata(intro_file)
             intro_dur = float(intro_meta.get("duration_sec") or 0.0)
             total_duration_sec += intro_dur
@@ -832,8 +1097,11 @@ def execute_encode_job_sync(
                 raise
 
         if retcode != 0 or not encoded_output_path.is_file() or encoded_output_path.stat().st_size == 0:
-            err_tail = (stderr_out or "").strip()[-400:]
+            err_tail = sanitize_process_output(stderr_out or "")
+            if err_tail:
+                logger.error("Job %s FFmpeg encode failure (code %s): %s", job_id, retcode, err_tail)
             raise RuntimeError(f"FFmpeg encode işlemi başarısız oldu (kod {retcode}): {err_tail}")
+
 
         # STAGE 5: Uploading final video to Google Cloud Storage & Verifying Object
         job = store.update_job_progress(
@@ -884,19 +1152,23 @@ def execute_encode_job_sync(
         _emit_update(failed)
         return failed or job
     except Exception as exc:
-        logger.exception("Encode job %s failed: %s", job_id, exc)
-        failed = store.mark_job_failed(job_id, str(exc))
+        safe_err = sanitize_process_output(str(exc), max_chars=500) or "Encode işlemi sırasında beklenmeyen hata oluştu."
+        logger.exception("Encode job %s failed: %s", job_id, safe_err)
+        failed = store.mark_job_failed(job_id, safe_err)
         _emit_update(failed)
         return failed or job
     finally:
-        # Guaranteed cleanup of isolated worker scratch directory
+        # Guaranteed cleanup of isolated worker scratch directory and any leftover GCS staging objects
         if job_temp_dir.exists():
             with suppress(Exception):
                 shutil.rmtree(job_temp_dir, ignore_errors=True)
+        with suppress(Exception):
+            latest_job = store.get_job(job_id) or job
+            store.gcs.cleanup_job_staging_objects(latest_job)
 
 
 # ------------------------------------------------------------------------------
-# Cloud Run Job Dispatcher (Triggers Cloud Run Job v2 API or Subprocess Worker)
+# Cloud Run Job Dispatcher & Controlled Service Revision Restart
 # ------------------------------------------------------------------------------
 def trigger_cloud_run_job_execution(job_id: str) -> dict[str, Any]:
     """
@@ -961,7 +1233,7 @@ def trigger_cloud_run_job_execution(job_id: str) -> dict[str, Any]:
                 "execution_name": exec_name,
             }
     except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")[:300]
+        err_body = sanitize_process_output(exc.read().decode("utf-8", errors="replace"), max_chars=300)
         logger.warning("Cloud Run Job API HTTP %s error: %s", exc.code, err_body)
         return {
             "dispatched": False,
@@ -969,46 +1241,101 @@ def trigger_cloud_run_job_execution(job_id: str) -> dict[str, Any]:
             "reason": f"Cloud Run Job API HTTP {exc.code}: {err_body}",
         }
     except Exception as exc:
-        logger.warning("Cloud Run Job API request failed: %s", exc)
+        safe_exc = sanitize_process_output(str(exc), max_chars=300)
+        logger.warning("Cloud Run Job API request failed: %s", safe_exc)
         return {
             "dispatched": False,
             "mode": "cloud_run_job_error",
-            "reason": str(exc),
+            "reason": safe_exc,
         }
+
+
+def _is_local_worker_fallback_allowed() -> bool:
+    """
+    Determine whether spawning a local subprocess worker inside the current container is permitted.
+    In production / Cloud Run Service environments, heavy video encoding must NOT run inside the
+    Discord bot web service container unless explicitly enabled for local development/testing.
+    """
+    if os.getenv("UBAGEN_DISABLE_LOCAL_WORKER", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    explicit_allow = os.getenv("UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK", "").strip().lower()
+    if explicit_allow in ("1", "true", "yes"):
+        return True
+    if explicit_allow in ("0", "false", "no"):
+        return False
+
+    # If running on a managed Cloud Run Service instance (`K_SERVICE` set) or in production mode,
+    # do NOT silently run heavy FFmpeg jobs inside the web service container.
+    k_service = os.getenv("K_SERVICE", "").strip()
+    env_mode = os.getenv("ENVIRONMENT", "production").strip().lower()
+    if k_service or env_mode == "production":
+        return False
+    return env_mode in ("development", "dev", "local", "test")
+
+
+def _stream_worker_subprocess_logs(proc: subprocess.Popen[str], job_id: str) -> None:
+    """
+    Read stdout/stderr from a dev-mode local worker subprocess and log sanitized lines
+    so FFmpeg and aria2c errors are never swallowed by `subprocess.DEVNULL`.
+    """
+    if proc.stdout is None:
+        return
+    try:
+        for raw_line in proc.stdout:
+            line = sanitize_process_output(raw_line, max_chars=500)
+            if line:
+                logger.info("[worker:%s] %s", job_id, line)
+    except Exception:
+        pass
+    finally:
+        with suppress(Exception):
+            proc.stdout.close()
 
 
 def dispatch_encode_job_background(job_id: str) -> dict[str, Any]:
     """
-    Dispatch `job_id` to the configured Google Cloud Run Job worker.
-    If `UBAGEN_CLOUD_RUN_JOB_NAME` is not configured and local worker fallback is allowed
-    (default in dev/single-container mode unless `UBAGEN_DISABLE_LOCAL_WORKER=true`),
-    spawns an isolated `python3 -B encoder_worker.py --job-id <job_id>` worker subprocess.
+    Dispatch `job_id` to the dedicated Google Cloud Run Job worker (`UBAGEN_CLOUD_RUN_JOB_NAME`).
+    - Never falls back to running heavy encodes inside the production Cloud Run Service instance.
+    - When local dev worker mode is explicitly enabled (`UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK=true`
+      or `ENVIRONMENT=development`), spawns an isolated subprocess with sanitized log capture
+      (never `subprocess.DEVNULL`).
     """
+    store = get_job_store()
     env_details = detect_cloud_run_environment_details()
     if env_details.get("cloud_run_job_configured"):
         res = trigger_cloud_run_job_execution(job_id)
         if res.get("dispatched"):
             return res
-        if os.getenv("UBAGEN_DISABLE_LOCAL_WORKER", "").strip().lower() in ("1", "true", "yes"):
-            get_job_store().mark_job_failed(job_id, f"Cloud Run Job başlatılamadı: {res.get('reason')}")
-            return res
+        fail_reason = f"Cloud Run Job başlatılamadı: {res.get('reason')}"
+        store.mark_job_failed(job_id, fail_reason)
+        return res
 
-    if os.getenv("UBAGEN_DISABLE_LOCAL_WORKER", "").strip().lower() in ("1", "true", "yes"):
+    if not _is_local_worker_fallback_allowed():
         reason = (
-            "Cloud Run Job (`UBAGEN_CLOUD_RUN_JOB_NAME`) yapılandırılmamış ve yerel worker devre dışı."
+            "Cloud Run Job (`UBAGEN_CLOUD_RUN_JOB_NAME`) yapılandırılmamış. "
+            "Üretim ortamında bot/web servisinin kararlılığını korumak için yerel worker fallback devre dışıdır."
         )
-        get_job_store().mark_job_failed(job_id, reason)
+        store.mark_job_failed(job_id, reason)
         return {"dispatched": False, "mode": "disabled", "reason": reason}
 
     worker_script = Path(__file__).resolve()
     proc = subprocess.Popen(
         [sys.executable, "-B", str(worker_script), "--job-id", job_id],
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
         start_new_session=True,
     )
-    get_job_store().update_job_progress(job_id, worker_execution_name=f"local-worker-pid-{proc.pid}")
+    log_thread = threading.Thread(
+        target=_stream_worker_subprocess_logs,
+        args=(proc, job_id),
+        name=f"ubagen-worker-log-{job_id}",
+        daemon=True,
+    )
+    log_thread.start()
+    store.update_job_progress(job_id, worker_execution_name=f"local-worker-pid-{proc.pid}")
     return {
         "dispatched": True,
         "mode": "isolated_subprocess_worker",
@@ -1017,20 +1344,30 @@ def dispatch_encode_job_background(job_id: str) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Discord Slash Commands (/encode & /is_durumu)
+# Discord Slash Commands (/encode, /encodeal, /is_durumu, /discord)
 # ------------------------------------------------------------------------------
-async def handle_encode_slash_command(
+async def submit_encode_job_from_interaction(
     interaction: Any,
+    *,
     magnet: str,
     codec: str = "h264",
     dil: str = "tur",
     altyazi_url: Optional[str] = None,
     intro_url: Optional[str] = None,
-) -> None:
+    altyazi_attachment: Optional[Any] = None,
+    intro_attachment: Optional[Any] = None,
+    command_source: str = "encode",
+) -> Optional[EncodeJob]:
     """
-    Asynchronous handler for the `/encode` Discord slash command.
-    Creates a persistent job in `PersistentJobStore`, dispatches the Cloud Run Job worker,
-    and updates the Discord message with live progress telemetry.
+    Shared backend pipeline used by BOTH `/encode` and `/encodeal`:
+    1. Immediately defers the Discord interaction (`thinking=True`) so it never times out.
+    2. Validates user identity, magnet link, codec (`h264`/`h265`), language, and any attachments.
+    3. Creates the persistent job record in `PersistentJobStore` (Firestore / SQLite WAL).
+    4. If Discord file attachments (`altyazi_attachment`, `intro_attachment`) are provided,
+       validates and uploads them to unique, user/job-scoped GCS staging objects
+       (`gs://<bucket>/staging/<user_id>/<job_id>/...`) — never queuing ephemeral Discord CDN URLs.
+    5. Displays the real `job_id` and initial status in the Discord interaction message.
+    6. Dispatches the Cloud Run Job worker (`UBAGEN_JOB_ID=<job_id>`).
     """
     if hasattr(interaction, "response") and hasattr(interaction.response, "defer"):
         if not interaction.response.is_done():
@@ -1042,41 +1379,111 @@ async def handle_encode_slash_command(
     if not user_id:
         if hasattr(interaction, "edit_original_response"):
             await interaction.edit_original_response(content="❌ Kullanıcı kimliği doğrulanamadı.")
-        return
+        return None
 
     valid_mag, mag_or_err = validate_magnet_uri(magnet)
     if not valid_mag:
         if hasattr(interaction, "edit_original_response"):
             await interaction.edit_original_response(content=f"❌ {mag_or_err}")
-        return
+        return None
 
     ok_codec, canonical_codec, video_encoder = normalize_video_codec(codec)
     if not ok_codec:
         if hasattr(interaction, "edit_original_response"):
             await interaction.edit_original_response(content=f"❌ {video_encoder}")
-        return
+        return None
 
     ok_lang, lang_or_err = normalize_language_code(dil)
     if not ok_lang:
         if hasattr(interaction, "edit_original_response"):
             await interaction.edit_original_response(content=f"❌ {lang_or_err}")
-        return
+        return None
+
+    # Pre-validate attachments before creating job in database
+    if altyazi_attachment is not None:
+        ok_sub, sub_err, _ = validate_discord_attachment(altyazi_attachment, kind="subtitle")
+        if not ok_sub:
+            if hasattr(interaction, "edit_original_response"):
+                await interaction.edit_original_response(content=f"❌ {sub_err}")
+            return None
+
+    if intro_attachment is not None:
+        ok_intro, intro_err, _ = validate_discord_attachment(intro_attachment, kind="intro")
+        if not ok_intro:
+            if hasattr(interaction, "edit_original_response"):
+                await interaction.edit_original_response(content=f"❌ {intro_err}")
+            return None
 
     store = get_job_store()
-    job = await asyncio.to_thread(
-        store.create_job,
-        user_id=user_id,
-        user_name=user_name,
-        magnet=mag_or_err,
-        codec=canonical_codec,
-        subtitle_lang=lang_or_err,
-        subtitle_source=(altyazi_url or "").strip() or None,
-        intro_source=(intro_url or "").strip() or None,
-        guild_id=str(getattr(interaction, "guild_id", "") or "") or None,
-        channel_id=str(getattr(interaction, "channel_id", "") or "") or None,
-        application_id=str(getattr(interaction, "application_id", "") or "") or None,
-        interaction_token=str(getattr(interaction, "token", "") or "") or None,
-    )
+    try:
+        job = await asyncio.to_thread(
+            store.create_job,
+            user_id=user_id,
+            user_name=user_name,
+            magnet=mag_or_err,
+            codec=canonical_codec,
+            subtitle_lang=lang_or_err,
+            subtitle_source=(altyazi_url or "").strip() or None,
+            intro_source=(intro_url or "").strip() or None,
+            guild_id=str(getattr(interaction, "guild_id", "") or "") or None,
+            channel_id=str(getattr(interaction, "channel_id", "") or "") or None,
+            application_id=str(getattr(interaction, "application_id", "") or "") or None,
+            interaction_token=str(getattr(interaction, "token", "") or "") or None,
+            command_source=command_source,
+        )
+    except FirestoreUnavailableError as exc:
+        logger.error("Failed to create job in Firestore: %s", exc)
+        if hasattr(interaction, "edit_original_response"):
+            await interaction.edit_original_response(
+                content=f"❌ Kalıcı iş veritabanı (Firestore) hatası nedeniyle iş oluşturulamadı: {exc}"
+            )
+        return None
+    except Exception as exc:
+        logger.error("Failed to create job: %s", exc)
+        if hasattr(interaction, "edit_original_response"):
+            await interaction.edit_original_response(content=f"❌ İş kaydı oluşturulamadı: {exc}")
+        return None
+
+    # Stage Discord attachments into GCS under `staging/{user_id}/{job.job_id}/...`
+    staged_objects: list[str] = []
+    if altyazi_attachment is not None or intro_attachment is not None:
+        try:
+            if altyazi_attachment is not None:
+                sub_stage = await stage_discord_attachment_to_gcs(
+                    altyazi_attachment,
+                    user_id=user_id,
+                    job_id=job.job_id,
+                    kind="subtitle",
+                    gcs_storage=store.gcs,
+                )
+                job.subtitle_source = str(sub_stage["gcs_uri"])
+                staged_objects.append(str(sub_stage["object_name"]))
+                ext_s = Path(str(sub_stage["sanitized_filename"])).suffix.lower()
+                job.subtitle_format = "ass" if ext_s in (".ass", ".ssa") else "srt"
+
+            if intro_attachment is not None:
+                intro_stage = await stage_discord_attachment_to_gcs(
+                    intro_attachment,
+                    user_id=user_id,
+                    job_id=job.job_id,
+                    kind="intro",
+                    gcs_storage=store.gcs,
+                )
+                job.intro_source = str(intro_stage["gcs_uri"])
+                job.has_intro = True
+                staged_objects.append(str(intro_stage["object_name"]))
+
+            job.staged_gcs_objects = staged_objects
+            job = await asyncio.to_thread(store.save_job, job)
+        except Exception as exc:
+            job.staged_gcs_objects = staged_objects
+            fail_msg = f"Ek dosya GCS staging alanına yüklenemedi: {sanitize_process_output(str(exc), max_chars=250)}"
+            failed_job = await asyncio.to_thread(store.mark_job_failed, job.job_id, fail_msg)
+            if hasattr(interaction, "edit_original_response"):
+                await interaction.edit_original_response(
+                    content=format_discord_job_message(failed_job or job)
+                )
+            return failed_job or job
 
     if hasattr(interaction, "edit_original_response"):
         with suppress(Exception):
@@ -1088,6 +1495,57 @@ async def handle_encode_slash_command(
         if updated and hasattr(interaction, "edit_original_response"):
             with suppress(Exception):
                 await interaction.edit_original_response(content=format_discord_job_message(updated))
+        return updated or job
+
+    return job
+
+
+async def handle_encode_slash_command(
+    interaction: Any,
+    magnet: str,
+    codec: str = "h264",
+    dil: str = "tur",
+    altyazi_url: Optional[str] = None,
+    intro_url: Optional[str] = None,
+) -> Optional[EncodeJob]:
+    """
+    Asynchronous handler for `/encode` slash command.
+    Delegates directly to the shared `submit_encode_job_from_interaction` pipeline.
+    """
+    return await submit_encode_job_from_interaction(
+        interaction,
+        magnet=magnet,
+        codec=codec,
+        dil=dil,
+        altyazi_url=altyazi_url,
+        intro_url=intro_url,
+        command_source=ENCODE_COMMAND_NAME,
+    )
+
+
+async def handle_encodeal_slash_command(
+    interaction: Any,
+    magnet: str,
+    altyazi: Optional[Any] = None,
+    intro: Optional[Any] = None,
+    codec: str = "h264",
+    dil: str = "tur",
+) -> Optional[EncodeJob]:
+    """
+    Asynchronous handler for `/encodeal` slash command.
+    Accepts optional `.ass`/`.srt` subtitle and intro video attachments, stages them safely to GCS,
+    and reuses the exact same `submit_encode_job_from_interaction` pipeline as `/encode`.
+    """
+    return await submit_encode_job_from_interaction(
+        interaction,
+        magnet=magnet,
+        codec=codec,
+        dil=dil,
+        altyazi_attachment=altyazi,
+        intro_attachment=intro,
+        command_source=ENCODEAL_COMMAND_NAME,
+    )
+
 
 
 async def handle_job_status_slash_command(interaction: Any, is_id: str) -> None:
@@ -1121,8 +1579,306 @@ async def handle_job_status_slash_command(interaction: Any, is_id: str) -> None:
         await interaction.edit_original_response(content=msg)
 
 
-def register_encoder_commands(tree: Any) -> list[Any]:
-    """Register `/encode` and `/is_durumu` slash commands on the Discord CommandTree."""
+# ------------------------------------------------------------------------------
+# /discord Controlled Bot & Cloud Run Service Restart Command
+# ------------------------------------------------------------------------------
+async def is_user_authorized_for_discord_restart(interaction: Any, bot: Optional[Any] = None) -> bool:
+    """
+    Verify whether `interaction.user` is authorized to execute `/discord` service restart:
+    1. Explicit Discord User ID allowlist (`UBAGEN_DISCORD_ADMIN_IDS` or `DISCORD_OWNER_ID`).
+    2. Discord Application Owner (`await bot.is_owner(user)` or `bot.owner_id`).
+    3. Server Administrator (`user.guild_permissions.administrator == True`) inside a guild.
+    Never allows arbitrary unprivileged users to restart the bot.
+    """
+    user_obj = getattr(interaction, "user", None)
+    user_id = str(getattr(user_obj, "id", "") or "").strip()
+    if not user_id:
+        return False
+
+    # 1. Check explicit admin/owner IDs from environment
+    allowed_ids: set[str] = set()
+    for env_key in ("UBAGEN_DISCORD_ADMIN_IDS", "DISCORD_OWNER_ID"):
+        raw_ids = os.getenv(env_key, "").strip()
+        if raw_ids:
+            for part in raw_ids.replace(";", ",").split(","):
+                clean_part = part.strip()
+                if clean_part.isdigit():
+                    allowed_ids.add(clean_part)
+    if user_id in allowed_ids:
+        return True
+
+    # 2. Check bot owner
+    active_bot = bot or getattr(interaction, "client", None)
+    if active_bot is not None:
+        owner_id = getattr(active_bot, "owner_id", None)
+        if owner_id and str(owner_id) == user_id:
+            return True
+        owner_ids = getattr(active_bot, "owner_ids", None)
+        if owner_ids and any(str(oid) == user_id for oid in owner_ids):
+            return True
+        is_owner_fn = getattr(active_bot, "is_owner", None)
+        if callable(is_owner_fn):
+            with suppress(Exception):
+                maybe_coro = is_owner_fn(user_obj)
+                if asyncio.iscoroutine(maybe_coro):
+                    if await maybe_coro:
+                        return True
+                elif bool(maybe_coro):
+                    return True
+
+    # 3. Check Guild Administrator permission when invoked in a server
+    guild_perms = getattr(user_obj, "guild_permissions", None)
+    if guild_perms is not None and bool(getattr(guild_perms, "administrator", False)):
+        return True
+
+    return False
+
+
+def trigger_cloud_run_service_revision_restart(
+    service_name: Optional[str] = None,
+    project_id: Optional[str] = None,
+    region: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Trigger a controlled new revision rollout on the Cloud Run Service via Cloud Run Admin v2 API
+    (`GET` + `PATCH https://{region}-run.googleapis.com/v2/projects/{project}/locations/{region}/services/{service}`)
+    by updating `template.annotations['ubagen.dev/restart-requested-at']`.
+    Does NOT touch or stop any running Cloud Run Jobs (`ubagen-encoder-worker`).
+    """
+    env_details = detect_cloud_run_environment_details()
+    svc = (
+        service_name
+        or os.getenv("UBAGEN_CLOUD_RUN_SERVICE_NAME", "").strip()
+        or env_details.get("k_service")
+        or ""
+    ).strip()
+    proj = (project_id or env_details.get("project_id") or "").strip()
+    reg = (region or env_details.get("region") or "europe-west2").strip()
+
+    if not svc or not proj:
+        return {
+            "triggered": False,
+            "verified_complete": False,
+            "mode": "cloud_run_revision_unconfigured",
+            "reason": "K_SERVICE / UBAGEN_CLOUD_RUN_SERVICE_NAME veya UBAGEN_GCP_PROJECT_ID tanımlı değil.",
+        }
+
+    token = get_gcp_access_token()
+    if not token:
+        return {
+            "triggered": False,
+            "verified_complete": False,
+            "mode": "cloud_run_auth_unavailable",
+            "reason": "Cloud Run Admin API için GCP OAuth2 erişim anahtarı alınamadı.",
+        }
+
+    svc_url = (
+        f"https://{reg}-run.googleapis.com/v2/projects/"
+        f"{urllib.parse.quote(proj)}/locations/{urllib.parse.quote(reg)}/"
+        f"services/{urllib.parse.quote(svc)}"
+    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        get_req = urllib.request.Request(svc_url, headers=headers, method="GET")
+        with urllib.request.urlopen(get_req, timeout=10) as get_resp:
+            svc_data = json.loads(get_resp.read().decode("utf-8", errors="replace"))
+
+        template = svc_data.get("template") or {}
+        annotations = dict(template.get("annotations") or {})
+        annotations["ubagen.dev/restart-requested-at"] = datetime.now(timezone.utc).isoformat()
+        template["annotations"] = annotations
+        svc_data["template"] = template
+
+        patch_url = f"{svc_url}?updateMask=template.annotations"
+        patch_req = urllib.request.Request(
+            patch_url,
+            data=json.dumps(svc_data).encode("utf-8"),
+            headers=headers,
+            method="PATCH",
+        )
+        with urllib.request.urlopen(patch_req, timeout=15) as patch_resp:
+            op_data = json.loads(patch_resp.read().decode("utf-8", errors="replace"))
+            op_name = op_data.get("name") or f"projects/{proj}/locations/{reg}/operations/restart"
+            op_done = bool(op_data.get("done", False))
+            return {
+                "triggered": True,
+                "verified_complete": op_done,
+                "mode": "cloud_run_revision",
+                "operation_name": op_name,
+                "service_name": svc,
+            }
+    except urllib.error.HTTPError as exc:
+        err_body = sanitize_process_output(exc.read().decode("utf-8", errors="replace"), max_chars=240)
+        logger.warning("Cloud Run Service revision PATCH HTTP %s: %s", exc.code, err_body)
+        return {
+            "triggered": False,
+            "verified_complete": False,
+            "mode": "cloud_run_revision_error",
+            "http_status": exc.code,
+            "reason": f"Cloud Run API HTTP {exc.code}: {err_body}",
+        }
+    except Exception as exc:
+        safe_exc = sanitize_process_output(str(exc), max_chars=240)
+        logger.warning("Cloud Run Service revision PATCH error: %s", safe_exc)
+        return {
+            "triggered": False,
+            "verified_complete": False,
+            "mode": "cloud_run_revision_error",
+            "reason": safe_exc,
+        }
+
+
+async def handle_discord_restart_command(
+    interaction: Any,
+    bot: Optional[Any] = None,
+    bot_manager: Optional[Any] = None,
+) -> tuple[int, dict[str, Any]]:
+    """
+    Asynchronous handler for `/discord` slash command:
+    1. Immediately defers the interaction (`ephemeral=True, thinking=True`) so it never times out.
+    2. Verifies caller authorization (Bot Owner, `UBAGEN_DISCORD_ADMIN_IDS`, or Guild Administrator).
+       Rejects unauthorized users with HTTP 403 and a clear message.
+    3. Sends an immediate acknowledgement that the restart request was received.
+    4. Never calls `sys.exit()` or `os.kill()` and never interrupts running Cloud Run Job encode tasks.
+    5. Executes a controlled restart via `BotLifecycleManager.restart_bot()` (and optional Cloud Run
+       revision rollout when `UBAGEN_DISCORD_RESTART_MODE=cloud_run_revision`), reporting accurately
+       whether the restart request was accepted (`202`), verified complete (`200`), throttled (`429`),
+       or failed (`500`/`503`).
+    """
+    if hasattr(interaction, "response") and hasattr(interaction.response, "defer"):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
+    active_bot = bot or getattr(interaction, "client", None)
+    authorized = await is_user_authorized_for_discord_restart(interaction, bot=active_bot)
+    if not authorized:
+        user_id = str(getattr(getattr(interaction, "user", None), "id", "unknown"))
+        logger.warning("Unauthorized /discord restart attempt rejected for user_id=%s", user_id)
+        msg = (
+            "🚫 **Yetkisiz İşlem (403):** `/discord` bot yeniden başlatma komutunu yalnızca "
+            "bot sahibi veya sunucu yöneticileri (`Administrator`) çalıştırabilir."
+        )
+        if hasattr(interaction, "edit_original_response"):
+            await interaction.edit_original_response(content=msg)
+        return 403, {"status": "forbidden", "error": msg}
+
+    # Acknowledge immediately before starting the restart sequence
+    if hasattr(interaction, "edit_original_response"):
+        with suppress(Exception):
+            await interaction.edit_original_response(
+                content=(
+                    "⏳ **Yeniden başlatma isteği kabul edildi.** "
+                    "Yetki doğrulandı; Discord bot servisi güvenli şekilde yeniden başlatılıyor..."
+                )
+            )
+
+    # Resolve BotLifecycleManager from bot or FastAPI state
+    mgr = bot_manager or getattr(active_bot, "lifecycle_manager", None)
+    restart_mode = os.getenv("UBAGEN_DISCORD_RESTART_MODE", "gateway").strip().lower()
+    revision_info: Optional[dict[str, Any]] = None
+
+    if restart_mode == "cloud_run_revision":
+        revision_info = await asyncio.to_thread(trigger_cloud_run_service_revision_restart)
+        if revision_info.get("triggered"):
+            if revision_info.get("verified_complete"):
+                msg = (
+                    f"✅ **Cloud Run Servis Yeniden Dağıtımı Tamamlandı (`{revision_info.get('service_name')}`)**\n"
+                    f"• **İşlem:** `{revision_info.get('operation_name')}`\n"
+                    "• Bağımsız çalışan Cloud Run Job encode görevleri kesintiye uğramadan devam etmektedir."
+                )
+                if hasattr(interaction, "edit_original_response"):
+                    await interaction.edit_original_response(content=msg)
+                return 200, {"status": "completed", "revision": revision_info}
+
+            msg = (
+                f"🔄 **Cloud Run Yeni Revision İsteği Kabul Edildi (`{revision_info.get('service_name')}`)**\n"
+                f"• **Operation:** `{revision_info.get('operation_name')}` (Dağıtım arka planda devam ediyor, henüz tamamlandığı doğrulanmadı)\n"
+                "• Bağımsız Cloud Run Job encode işlemleri etkilenmeden çalışmaya devam eder."
+            )
+            if hasattr(interaction, "edit_original_response"):
+                await interaction.edit_original_response(content=msg)
+            return 202, {"status": "accepted", "revision": revision_info}
+
+    if mgr is not None and hasattr(mgr, "restart_bot") and callable(mgr.restart_bot):
+        status_code, payload = await mgr.restart_bot()
+    else:
+        return_err = (
+            "Bot yaşam döngüsü yöneticisi (`BotLifecycleManager`) bağlı değil"
+            + (f" ve Cloud Run revision API hatası: {revision_info.get('reason')}" if revision_info else ".")
+        )
+        if hasattr(interaction, "edit_original_response"):
+            await interaction.edit_original_response(
+                content=f"❌ **Yeniden Başlatma Başarısız (503):** {return_err}"
+            )
+        return 503, {"status": "unavailable", "error": return_err}
+
+    if status_code in (200, 202):
+        rev_note = ""
+        if revision_info and not revision_info.get("triggered"):
+            rev_note = (
+                f"\n• *Not: Cloud Run Revision API kullanılamadı (`{revision_info.get('reason')}`), "
+                "güvenli süreç içi Gateway yeniden başlatma uygulandı.*"
+            )
+        msg = (
+            "🔄 **Bot Yeniden Başlatma İsteği Kabul Edildi (202 Accepted)**\n"
+            "• Mevcut Discord Gateway oturumu güvenli şekilde kapatıldı ve yeni bot örneğiyle yeniden bağlantı başlatıldı.\n"
+            "• Web izleme paneli ve devam eden **Cloud Run Job** video encode işlemleri kesintiye uğramadan çalışmaya devam etmektedir."
+            f"{rev_note}"
+        )
+        if hasattr(interaction, "edit_original_response"):
+            with suppress(Exception):
+                await interaction.edit_original_response(content=msg)
+        return status_code, payload
+
+    if status_code == 429:
+        retry_after = payload.get("retry_after", 15)
+        msg = (
+            f"⏳ **Çok Sık İstek (429):** Yakın zamanda bir yeniden başlatma isteği gönderildi "
+            f"veya işlem halen devam ediyor. Lütfen `{retry_after}` saniye sonra tekrar deneyin."
+        )
+        if hasattr(interaction, "edit_original_response"):
+            with suppress(Exception):
+                await interaction.edit_original_response(content=msg)
+        return 429, payload
+
+    err_detail = payload.get("error") or "Bilinmeyen yeniden başlatma hatası."
+    msg = f"❌ **Yeniden Başlatma Başarısız ({status_code}):** {err_detail}"
+    if hasattr(interaction, "edit_original_response"):
+        with suppress(Exception):
+            await interaction.edit_original_response(content=msg)
+    return status_code, payload
+
+
+def register_discord_restart_command(tree: Any, bot: Optional[Any] = None) -> Optional[Any]:
+    """
+    Register the `/discord` controlled bot restart slash command on `tree` if not already registered.
+    """
+    if discord is None or app_commands is None or tree is None:
+        return None
+    if tree.get_command(DISCORD_RESTART_COMMAND_NAME) is not None:
+        return None
+
+    @tree.command(
+        name=DISCORD_RESTART_COMMAND_NAME,
+        description="Bot servisini güvenli şekilde kapatıp yeniden başlatır (Yalnızca yetkili yönetici).",
+    )
+    async def discord_restart_command(interaction: discord.Interaction) -> None:
+        active_bot = bot or getattr(interaction, "client", None)
+        mgr = getattr(active_bot, "lifecycle_manager", None) if active_bot is not None else None
+        await handle_discord_restart_command(interaction, bot=active_bot, bot_manager=mgr)
+
+    return discord_restart_command
+
+
+def register_encoder_commands(tree: Any, bot: Optional[Any] = None) -> list[Any]:
+    """
+    Register `/encode`, `/encodeal`, `/is_durumu`, and `/discord` slash commands on the Discord CommandTree.
+    All command and parameter descriptions strictly adhere to Discord's <= 100 character limit.
+    Idempotent: never registers a command twice if it already exists on `tree`.
+    """
     if discord is None or app_commands is None or tree is None:
         return []
 
@@ -1131,7 +1887,7 @@ def register_encoder_commands(tree: Any) -> list[Any]:
     if tree.get_command(ENCODE_COMMAND_NAME) is None:
         @tree.command(
             name=ENCODE_COMMAND_NAME,
-            description="Magnet bağlantısından videoyu indirir, ASS/SRT altyazı ve isteğe bağlı intro ile H.264/H.265 encode eder.",
+            description="Magnetten videoyu indirir, ASS/SRT altyazı ve intro ile H.264/H.265 encode eder.",
         )
         @app_commands.describe(
             magnet="Zorunlu torrent magnet bağlantısı (magnet:?xt=urn:btih:...)",
@@ -1165,6 +1921,43 @@ def register_encoder_commands(tree: Any) -> list[Any]:
 
         registered.append(encode_command)
 
+    if tree.get_command(ENCODEAL_COMMAND_NAME) is None:
+        @tree.command(
+            name=ENCODEAL_COMMAND_NAME,
+            description="Magnet, isteğe bağlı ASS/SRT altyazı ve intro dosya ekiyle H.264/H.265 encode eder.",
+        )
+        @app_commands.describe(
+            magnet="Zorunlu torrent magnet bağlantısı (magnet:?xt=urn:btih:...)",
+            altyazi="İsteğe bağlı .ass veya .srt altyazı dosyası eki (GCS staging'e yüklenir)",
+            intro="İsteğe bağlı intro video dosyası eki (.mp4/.mkv, GCS staging'e yüklenir)",
+            codec="Video codec seçimi: h264 (libx264) veya h265 (libx265)",
+            dil="Altyazı dil kodu (varsayılan: tur)",
+        )
+        @app_commands.choices(
+            codec=[
+                app_commands.Choice(name="H.264 (libx264 — Yüksek Uyumluluk)", value="h264"),
+                app_commands.Choice(name="H.265 / HEVC (libx265 — Yüksek Sıkıştırma)", value="h265"),
+            ]
+        )
+        async def encodeal_command(
+            interaction: discord.Interaction,
+            magnet: str,
+            altyazi: Optional[discord.Attachment] = None,
+            intro: Optional[discord.Attachment] = None,
+            codec: str = "h264",
+            dil: str = "tur",
+        ) -> None:
+            await handle_encodeal_slash_command(
+                interaction,
+                magnet=magnet,
+                altyazi=altyazi,
+                intro=intro,
+                codec=codec,
+                dil=dil,
+            )
+
+        registered.append(encodeal_command)
+
     if tree.get_command(JOB_STATUS_COMMAND_NAME) is None:
         @tree.command(
             name=JOB_STATUS_COMMAND_NAME,
@@ -1176,7 +1969,12 @@ def register_encoder_commands(tree: Any) -> list[Any]:
 
         registered.append(job_status_command)
 
+    discord_cmd = register_discord_restart_command(tree, bot=bot)
+    if discord_cmd is not None:
+        registered.append(discord_cmd)
+
     return registered
+
 
 
 # ------------------------------------------------------------------------------

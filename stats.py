@@ -668,19 +668,48 @@ def check_environment_variables() -> list[dict[str, str]]:
     })
 
     job_name = os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip()
+    local_fb = os.getenv("UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK", "").strip().lower() in ("1", "true", "yes")
     results.append({
         "name": "UBAGEN_CLOUD_RUN_JOB_NAME",
-        "status": f"Configured ({job_name})" if job_name else "Not configured (Using local subprocess worker fallback)",
-        "indicator": "✅" if job_name else "⚪",
+        "status": (
+            f"Configured ({job_name})"
+            if job_name
+            else (
+                "Not configured (Dev local worker fallback enabled)"
+                if local_fb
+                else "Not configured (Required for production Cloud Run Job dispatch)"
+            )
+        ),
+        "indicator": "✅" if job_name else ("⚠️" if local_fb else "⚪"),
         "type": "Cloud Run Job",
+    })
+
+    gcp_proj = (
+        os.getenv("UBAGEN_GCP_PROJECT_ID", "").strip()
+        or os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    )
+    gcp_reg = os.getenv("UBAGEN_GCP_REGION", "europe-west2").strip() or "europe-west2"
+    results.append({
+        "name": "UBAGEN_GCP_PROJECT_ID",
+        "status": f"Configured ({gcp_proj} • {gcp_reg})" if gcp_proj else "Not configured (Set UBAGEN_GCP_PROJECT_ID)",
+        "indicator": "✅" if gcp_proj else "⚪",
+        "type": "Google Cloud",
     })
 
     use_fs = os.getenv("UBAGEN_USE_FIRESTORE", "").strip().lower() in ("1", "true", "yes")
     results.append({
         "name": "UBAGEN_USE_FIRESTORE",
-        "status": "Enabled (Firestore Job State)" if use_fs else "Disabled (SQLite WAL Persistent Fallback)",
+        "status": "Enabled (Firestore Authoritative Store)" if use_fs else "Disabled (SQLite WAL Persistent Store)",
         "indicator": "✅" if use_fs else "⚪",
         "type": "Database",
+    })
+
+    discord_admins = os.getenv("UBAGEN_DISCORD_ADMIN_IDS", "").strip() or os.getenv("DISCORD_OWNER_ID", "").strip()
+    results.append({
+        "name": "UBAGEN_DISCORD_ADMIN_IDS",
+        "status": "Configured (Explicit Admin IDs + Bot Owner/Server Admin)" if discord_admins else "Default (Bot Owner & Server Administrators)",
+        "indicator": "✅",
+        "type": "Discord Security",
     })
 
     return results

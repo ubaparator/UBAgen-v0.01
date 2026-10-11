@@ -29,19 +29,38 @@ import unittest
 import urllib.parse
 
 from encoder_worker import (
+    DISCORD_RESTART_COMMAND_NAME,
+    ENCODE_COMMAND_NAME,
+    ENCODEAL_COMMAND_NAME,
+    JOB_STATUS_COMMAND_NAME,
+    _materialize_input_file,
     execute_encode_job_sync,
     format_discord_job_message,
+    handle_discord_restart_command,
+    handle_encode_slash_command,
+    handle_encodeal_slash_command,
+    handle_job_status_slash_command,
+    main_cli,
     parse_ffmpeg_progress_block,
     probe_video_metadata,
+    register_encoder_commands,
+    sanitize_untrusted_filename,
+    validate_discord_attachment,
 )
 from health_api import create_health_app
 from job_store import (
     DEFAULT_RETENTION_SECONDS,
+    FirestoreUnavailableError,
     GCSOutputStorage,
+    JobNotFoundError,
     PersistentJobStore,
+    discover_and_apply_runtime_config,
     normalize_video_codec,
     reset_job_store_for_tests,
 )
+from main import BotLifecycleManager, UBAgenBot
+from stats import register_stats_command
+from subtitle_extract import register_subtitle_extract_command
 
 
 class _AsgiResponse:
@@ -670,6 +689,415 @@ class TestEncoderSystem(unittest.TestCase):
         self.assertEqual(separation["persistent_output_storage"]["retention_seconds"], 7200)
         self.assertTrue(separation["ephemeral_worker_scratch_disk"]["is_ephemeral"])
         self.assertFalse(separation["job_state_database"]["in_memory_only"])
+
+    # ------------------------------------------------------------------
+    # 9. /encode & /encodeal Shared Backend + GCS Attachment Staging
+    # ------------------------------------------------------------------
+    def test_encode_and_encodeal_shared_backend_and_gcs_attachment_staging(self) -> None:
+        fixture_dir = self.temp_root / "fixtures_encodeal"
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+        source_mkv = fixture_dir / "source_ep.mkv"
+        sub_ass = fixture_dir / "source_ep.ass"
+        intro_mp4 = fixture_dir / "intro_attach.mp4"
+        _create_synthetic_video_with_subtitles(source_mkv, sub_ass, duration_sec=0.8)
+        _create_synthetic_intro_clip(intro_mp4, duration_sec=0.4)
+
+        class FakeUser:
+            def __init__(self, uid: str, name: str = "tester", is_admin: bool = False):
+                self.id = uid
+                self.name = name
+                self.guild_permissions = type("Perms", (), {"administrator": is_admin})()
+
+        class FakeResponse:
+            def __init__(self):
+                self.deferred = False
+                self.ephemeral = False
+
+            def is_done(self) -> bool:
+                return self.deferred
+
+            async def defer(self, *, ephemeral: bool = False, thinking: bool = False) -> None:
+                self.deferred = True
+                self.ephemeral = ephemeral
+
+        class FakeInteraction:
+            def __init__(self, uid: str, is_admin: bool = False):
+                self.user = FakeUser(uid, is_admin=is_admin)
+                self.response = FakeResponse()
+                self.guild_id = "1558547351717543968"
+                self.channel_id = "1558547351717543999"
+                self.application_id = "1558545306046701599"
+                self.token = "fake_interaction_token_abc"
+                self.messages: list[str] = []
+
+            async def edit_original_response(self, *, content: str) -> None:
+                self.messages.append(content)
+
+        class FakeAttachment:
+            def __init__(self, filename: str, data: bytes, content_type: str):
+                self.filename = filename
+                self._data = data
+                self.size = len(data)
+                self.content_type = content_type
+                self.url = f"https://cdn.discordapp.com/ephemeral-attachments/999/{filename}"
+
+            async def read(self) -> bytes:
+                return self._data
+
+        # Prevent actual background subprocess spawn during command submission test
+        os.environ["UBAGEN_DISABLE_LOCAL_WORKER"] = "true"
+        try:
+            inter_encode = FakeInteraction("user_encode_1")
+            job_from_encode = asyncio.run(
+                handle_encode_slash_command(
+                    inter_encode,
+                    magnet=SAMPLE_MAGNET,
+                    codec="h264",
+                    dil="tur",
+                )
+            )
+            self.assertIsNotNone(job_from_encode)
+            assert job_from_encode is not None
+            self.assertTrue(inter_encode.response.deferred)
+            self.assertEqual(job_from_encode.command_source, ENCODE_COMMAND_NAME)
+
+            ass_bytes = sub_ass.read_bytes()
+            intro_bytes = intro_mp4.read_bytes()
+            sub_attachment = FakeAttachment("custom_styled_sub.ass", ass_bytes, "text/plain; charset=utf-8")
+            intro_attachment = FakeAttachment("channel_intro.mp4", intro_bytes, "video/mp4")
+
+            inter_encodeal = FakeInteraction("user_encodeal_2")
+            job_from_encodeal = asyncio.run(
+                handle_encodeal_slash_command(
+                    inter_encodeal,
+                    magnet=SAMPLE_MAGNET,
+                    altyazi=sub_attachment,
+                    intro=intro_attachment,
+                    codec="h265",
+                    dil="tur",
+                )
+            )
+            self.assertIsNotNone(job_from_encodeal)
+            assert job_from_encodeal is not None
+            self.assertTrue(inter_encodeal.response.deferred)
+            self.assertEqual(job_from_encodeal.command_source, ENCODEAL_COMMAND_NAME)
+            self.assertEqual(job_from_encodeal.codec, "h265")
+            self.assertEqual(job_from_encodeal.video_encoder, "libx265")
+
+            # Verify Discord CDN URLs were NOT stored in job queue; instead GCS staging URIs were used
+            self.assertIsNotNone(job_from_encodeal.subtitle_source)
+            self.assertIsNotNone(job_from_encodeal.intro_source)
+            self.assertTrue(str(job_from_encodeal.subtitle_source).startswith("gs://ubagen-test-bucket/staging/user_encodeal_2/"))
+            self.assertTrue(str(job_from_encodeal.intro_source).startswith("gs://ubagen-test-bucket/staging/user_encodeal_2/"))
+            self.assertNotIn("discordapp.com", str(job_from_encodeal.subtitle_source))
+            self.assertNotIn("discordapp.com", str(job_from_encodeal.intro_source))
+            self.assertEqual(len(job_from_encodeal.staged_gcs_objects), 2)
+        finally:
+            os.environ.pop("UBAGEN_DISABLE_LOCAL_WORKER", None)
+
+        # Re-stage fresh objects for worker execution test (since dispatch failure above cleaned staging)
+        staged_sub = self.gcs.upload_staging_bytes(
+            ass_bytes,
+            user_id="user_encodeal_2",
+            job_id=job_from_encodeal.job_id,
+            kind="subtitle",
+            original_filename="custom_styled_sub.ass",
+            content_type="text/plain",
+        )
+        staged_intro = self.gcs.upload_staging_bytes(
+            intro_bytes,
+            user_id="user_encodeal_2",
+            job_id=job_from_encodeal.job_id,
+            kind="intro",
+            original_filename="channel_intro.mp4",
+            content_type="video/mp4",
+        )
+        job_from_encodeal.subtitle_source = staged_sub["gcs_uri"]
+        job_from_encodeal.intro_source = staged_intro["gcs_uri"]
+        job_from_encodeal.has_intro = True
+        job_from_encodeal.staged_gcs_objects = [staged_sub["object_name"], staged_intro["object_name"]]
+        job_from_encodeal.status = "queued"
+        job_from_encodeal.stage = "queued"
+        job_from_encodeal.error = None
+        self.store.save_job(job_from_encodeal)
+
+        # Verify cross-user staging access is blocked
+        with self.assertRaises(PermissionError):
+            _materialize_input_file(
+                staged_sub["gcs_uri"],
+                self.worker_temp_dir,
+                "unauthorized_test",
+                ".ass",
+                gcs_storage=self.gcs,
+                expected_user_id="different_attacker_user",
+                expected_job_id=job_from_encodeal.job_id,
+            )
+
+        # Run worker and verify it reads staged GCS files, encodes H.265, and cleans up staging objects
+        completed_encodeal = execute_encode_job_sync(
+            job_from_encodeal.job_id,
+            job_store=self.store,
+            download_runner=lambda _m, d: (
+                shutil.copy2(source_mkv, d / source_mkv.name),
+                subprocess.CompletedProcess(args=["aria2c"], returncode=0, stdout="OK", stderr=""),
+            )[1],
+        )
+        self.assertEqual(completed_encodeal.status, "completed")
+        self.assertTrue(completed_encodeal.gcs_upload_verified)
+        self.assertIsNotNone(completed_encodeal.download_url)
+        # Staged input objects must be automatically purged from GCS after job completion
+        self.assertFalse(self.gcs.verify_object("ubagen-test-bucket", staged_sub["object_name"]))
+        self.assertFalse(self.gcs.verify_object("ubagen-test-bucket", staged_intro["object_name"]))
+
+        # Verify /is_durumu cross-user redaction vs owner visibility
+        inter_other_status = FakeInteraction("other_viewer_999")
+        asyncio.run(handle_job_status_slash_command(inter_other_status, completed_encodeal.job_id))
+        self.assertNotIn(completed_encodeal.download_token, inter_other_status.messages[-1])
+        self.assertIn("başka bir kullanıcıya aittir", inter_other_status.messages[-1])
+
+        inter_owner_status = FakeInteraction("user_encodeal_2")
+        asyncio.run(handle_job_status_slash_command(inter_owner_status, completed_encodeal.job_id))
+        self.assertIn(completed_encodeal.download_url or "", inter_owner_status.messages[-1])
+
+    # ------------------------------------------------------------------
+    # 10. Untrusted Filename, Extension, Size & MIME Validation
+    # ------------------------------------------------------------------
+    def test_attachment_and_parameter_validation_rejects_untrusted_inputs(self) -> None:
+        # Path traversal filename must be rejected
+        ok_trav, err_trav, _ = sanitize_untrusted_filename(
+            "../../etc/passwd.srt",
+            allowed_extensions={".ass", ".srt"},
+            kind_label="Altyazı",
+        )
+        self.assertFalse(ok_trav)
+        self.assertIn("..", err_trav)
+
+        # Disallowed extension
+        ok_ext, err_ext, _ = sanitize_untrusted_filename(
+            "malware.exe",
+            allowed_extensions={".ass", ".srt"},
+            kind_label="Altyazı",
+        )
+        self.assertFalse(ok_ext)
+        self.assertIn(".exe", err_ext)
+
+        # Valid filename with special characters is sanitized cleanly
+        ok_clean, safe_name, ext = sanitize_untrusted_filename(
+            "My Anime Episode [01] (1080p);drop.ass",
+            allowed_extensions={".ass", ".srt"},
+            kind_label="Altyazı",
+        )
+        self.assertTrue(ok_clean)
+        self.assertEqual(ext, ".ass")
+        self.assertNotIn(";", safe_name)
+        self.assertNotIn("[", safe_name)
+
+        class DummyAtt:
+            def __init__(self, filename: str, size: int, content_type: str):
+                self.filename = filename
+                self.size = size
+                self.content_type = content_type
+
+        # Oversized subtitle (> 10 MB)
+        ok_big_sub, err_big_sub, _ = validate_discord_attachment(
+            DummyAtt("sub.srt", 15 * 1024 * 1024, "text/plain"),
+            kind="subtitle",
+        )
+        self.assertFalse(ok_big_sub)
+        self.assertIn("çok büyük", err_big_sub)
+
+        # Invalid MIME type on subtitle (e.g. video/mp4 disguised as .srt)
+        ok_mime_sub, err_mime_sub, _ = validate_discord_attachment(
+            DummyAtt("sub.srt", 1024, "video/mp4"),
+            kind="subtitle",
+        )
+        self.assertFalse(ok_mime_sub)
+        self.assertIn("MIME", err_mime_sub)
+
+        # Invalid MIME type on intro (e.g. text/plain disguised as .mp4)
+        ok_mime_intro, err_mime_intro, _ = validate_discord_attachment(
+            DummyAtt("intro.mp4", 2048, "text/plain"),
+            kind="intro",
+        )
+        self.assertFalse(ok_mime_intro)
+        self.assertIn("MIME", err_mime_intro)
+
+    # ------------------------------------------------------------------
+    # 11. /discord Controlled Bot Restart Authorization, Cooldown & Job Isolation
+    # ------------------------------------------------------------------
+    def test_discord_restart_command_authorization_cooldown_and_job_isolation(self) -> None:
+        class FakeUser:
+            def __init__(self, uid: str, is_admin: bool = False):
+                self.id = uid
+                self.name = f"user_{uid}"
+                self.guild_permissions = type("Perms", (), {"administrator": is_admin})()
+
+        class FakeResponse:
+            def __init__(self):
+                self.deferred = False
+
+            def is_done(self) -> bool:
+                return self.deferred
+
+            async def defer(self, *, ephemeral: bool = False, thinking: bool = False) -> None:
+                self.deferred = True
+
+        class FakeInteraction:
+            def __init__(self, uid: str, is_admin: bool = False):
+                self.user = FakeUser(uid, is_admin=is_admin)
+                self.response = FakeResponse()
+                self.messages: list[str] = []
+
+            async def edit_original_response(self, *, content: str) -> None:
+                self.messages.append(content)
+
+        # Create an active encode job before restarting the bot
+        running_job = self.store.create_job(user_id="encoder_user_55", magnet=SAMPLE_MAGNET, codec="h264")
+        self.store.update_job_progress(
+            running_job.job_id,
+            stage="encoding",
+            status="running",
+            percent=55.0,
+            processed_frames=550,
+            total_frames=1000,
+            fps=29.97,
+            eta_seconds=15,
+        )
+
+        os.environ["DISCORD_BOT_TOKEN"] = "MTU1ODU0NTMwNjA0NjcwMTU5OQ.GfakeToken.ForControlledRestartTest123"
+        os.environ["UBAGEN_DISCORD_ADMIN_IDS"] = "777888999000111222"
+        try:
+            shutdown_ev = asyncio.Event()
+            shutdown_ev.set()  # Prevent background gateway network loop from connecting externally
+            mgr = BotLifecycleManager(cooldown_seconds=30.0, shutdown_event=shutdown_ev)
+
+            # 1. Unauthorized regular user -> 403 Forbidden
+            unauth_inter = FakeInteraction("111222333444555666", is_admin=False)
+            code_unauth, payload_unauth = asyncio.run(
+                handle_discord_restart_command(unauth_inter, bot=mgr.bot, bot_manager=mgr)
+            )
+            self.assertEqual(code_unauth, 403)
+            self.assertEqual(payload_unauth["status"], "forbidden")
+            self.assertTrue(unauth_inter.response.deferred)
+            self.assertIn("Yetkisiz İşlem (403)", unauth_inter.messages[-1])
+
+            # 2. Authorized admin user -> 202 Accepted (ack sent first, then controlled restart)
+            admin_inter = FakeInteraction("777888999000111222", is_admin=False)
+            code_ok, payload_ok = asyncio.run(
+                handle_discord_restart_command(admin_inter, bot=mgr.bot, bot_manager=mgr)
+            )
+            self.assertEqual(code_ok, 202)
+            self.assertEqual(payload_ok["status"], "restarting")
+            self.assertGreaterEqual(len(admin_inter.messages), 2)
+            self.assertIn("kabul edildi", admin_inter.messages[0])
+            self.assertIn("202 Accepted", admin_inter.messages[-1])
+
+            # 3. Immediate second restart attempt within cooldown -> 429 Too Many Requests
+            spam_inter = FakeInteraction("777888999000111222", is_admin=True)
+            code_429, _ = asyncio.run(
+                handle_discord_restart_command(spam_inter, bot=mgr.bot, bot_manager=mgr)
+            )
+            self.assertEqual(code_429, 429)
+            self.assertIn("429", spam_inter.messages[-1])
+
+            # 4. Verify running encode job was NOT interrupted or lost during bot restart
+            preserved_job = self.store.get_job(running_job.job_id)
+            self.assertIsNotNone(preserved_job)
+            assert preserved_job is not None
+            self.assertEqual(preserved_job.status, "running")
+            self.assertEqual(preserved_job.processed_frames, 550)
+        finally:
+            os.environ.pop("UBAGEN_DISCORD_ADMIN_IDS", None)
+            os.environ.pop("DISCORD_BOT_TOKEN", None)
+
+    # ------------------------------------------------------------------
+    # 12. Strict Firestore Error Handling & Non-Existent Job ID Protection
+    # ------------------------------------------------------------------
+    def test_firestore_strict_error_handling_and_nonexistent_job_id(self) -> None:
+        # When UBAGEN_USE_FIRESTORE=True but Firestore is unreachable/unconfigured,
+        # PersistentJobStore must raise FirestoreUnavailableError and NEVER silently fall back to SQLite.
+        fs_store = PersistentJobStore(
+            db_path=self.db_path,
+            gcs_storage=self.gcs,
+            use_firestore=True,
+        )
+        fs_store.firestore_project = ""
+        fs_store._firestore_client = None
+        fs_store._firestore_init_error = "Simulated Firestore unavailability"
+
+        with self.assertRaises(FirestoreUnavailableError):
+            fs_store.create_job(user_id="user_fs", magnet=SAMPLE_MAGNET, codec="h264")
+
+        with self.assertRaises(FirestoreUnavailableError):
+            fs_store.get_job("job_any_123")
+
+        with self.assertRaises(FirestoreUnavailableError):
+            fs_store.list_jobs()
+
+        # Verify FastAPI endpoints return HTTP 503 when FirestoreUnavailableError is raised
+        reset_job_store_for_tests(fs_store)
+        try:
+            app = create_health_app()
+            client = TestClient(app)
+            res_503 = client.get("/api/jobs")
+            self.assertEqual(res_503.status_code, 503)
+            self.assertEqual(res_503.json()["status"], "firestore_unavailable")
+        finally:
+            reset_job_store_for_tests(self.store)
+
+        # Non-existent job_id passed to worker raises JobNotFoundError cleanly
+        with self.assertRaises(JobNotFoundError):
+            execute_encode_job_sync("job_does_not_exist_999999", job_store=self.store)
+
+        # CLI entrypoint with missing job_id returns exit code 2
+        self.assertEqual(main_cli(["--job-id", ""]), 2)
+
+    # ------------------------------------------------------------------
+    # 13. Slash Command Registration Idempotency & <=100 Char Descriptions
+    # ------------------------------------------------------------------
+    def test_slash_command_registration_idempotency_and_description_limits(self) -> None:
+        self.assertIsNotNone(UBAgenBot)
+        bot = UBAgenBot(guild_id=1558547351717543968)
+        register_stats_command(bot.tree, bot)
+        register_subtitle_extract_command(bot.tree)
+        register_encoder_commands(bot.tree, bot=bot)
+
+        # Calling registration a second time must be idempotent and not raise CommandAlreadyRegistered
+        register_stats_command(bot.tree, bot)
+        register_subtitle_extract_command(bot.tree)
+        register_encoder_commands(bot.tree, bot=bot)
+
+        cmds = {c.name: c for c in bot.tree.get_commands()}
+        expected_names = {
+            "stats",
+            "altyazı_ayıklama",
+            ENCODE_COMMAND_NAME,
+            ENCODEAL_COMMAND_NAME,
+            JOB_STATUS_COMMAND_NAME,
+            DISCORD_RESTART_COMMAND_NAME,
+        }
+        self.assertTrue(expected_names.issubset(set(cmds.keys())))
+
+        # Verify Discord API constraint: every command description and parameter description <= 100 chars
+        for name, cmd in cmds.items():
+            desc = getattr(cmd, "description", "") or ""
+            self.assertLessEqual(
+                len(desc),
+                100,
+                f"Command /{name} description is {len(desc)} chars (>100 limit): {desc}",
+            )
+            for param in getattr(cmd, "parameters", []):
+                p_desc = getattr(param, "description", "") or ""
+                self.assertLessEqual(
+                    len(p_desc),
+                    100,
+                    f"Command /{name} param '{param.name}' description is {len(p_desc)} chars (>100 limit)",
+                )
+
+        # Verify auto-discovery configuration helper
+        cfg = discover_and_apply_runtime_config()
+        self.assertIn("discovered", cfg)
+        self.assertEqual(cfg["discovered"]["retention_seconds"], 7200)
 
 
 if __name__ == "__main__":

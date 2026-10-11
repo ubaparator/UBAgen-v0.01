@@ -7,8 +7,10 @@ Provides real-time host and container telemetry through:
 2. **Discord Slash Commands**:
    - `/stats` returning a rich diagnostic embed to any Discord server without blocking the event loop.
    - `/altyazı_ayıklama` (`magnet`, `dil`) downloading torrents via `aria2c` into an isolated `download_temp` workspace and extracting/cleaning embedded `.srt`/`.ass` subtitles via `ffprobe`/`ffmpeg`.
-   - `/encode` (`magnet`, `codec` (`h264`/`h265`), `altyazi_ekle`, `altyazi_dili`, `intro_path`, `crf`, `preset`) creating a persistent encode job, dispatching it to the dedicated **Cloud Run Job worker** (`encoder_worker.py`), updating Discord progress messages with real-time `frame/total_frames`, `FPS`, `ETA`, and percentage, uploading the final output to **Google Cloud Storage (GCS)**, and issuing a 7200-second (2-hour) owner-authorized download link.
-   - `/is_durumu` (`job_id`) inspecting persistent encode job state, progress, and expiration countdown across Cloud Run instance restarts.
+   - `/encode` (`magnet`, `codec` (`h264`/`h265`), `dil`, `altyazi_url`, `intro_url`) creating a persistent encode job, dispatching it to the dedicated **Cloud Run Job worker** (`encoder_worker.py`), updating Discord progress messages with real-time `frame/total_frames`, `FPS`, `ETA`, and percentage, uploading the final output to **Google Cloud Storage (GCS)**, and issuing a 7200-second (2-hour) owner-authorized download link.
+   - `/encodeal` (`magnet`, `altyazi` attachment, `intro` attachment, `codec` (`h264`/`h265`), `dil`) reusing the exact same shared backend pipeline as `/encode`, validating and uploading `.ass`/`.srt` and intro attachments into isolated, user/job-scoped GCS staging objects (`gs://<bucket>/staging/<user_id>/<job_id>/...`), and automatically cleaning up staging objects after completion or failure.
+   - `/is_durumu` (`is_id`) inspecting persistent encode job state, progress, and expiration countdown across Cloud Run instance restarts with cross-user download link redaction.
+   - `/discord` executing an authorized, cooldown-protected controlled restart of the Discord bot service (`BotLifecycleManager.restart_bot()` or Cloud Run Service revision rollout) without interrupting running Cloud Run Job encode tasks.
 3. **HTTP Health Probes** (`GET /health`) for container orchestrators (Render, Railway, Fly.io, Cloud Run, Docker).
 
 ---
@@ -86,11 +88,17 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 | `UBAGEN_TEMP_DIR` | Optional | `<UBAGEN_STORAGE_DIR>/download_temp` | Dedicated temporary directory for `aria2c` torrent downloads (`job_*`) and `ffmpeg` intermediate encodes (`encode_temp/encode_*`). Cleaned up in `finally` and on startup. |
 | `UBAGEN_STORAGE_MAX_GB` | Optional | `200` | Maximum storage quota ceiling (GB), bounded automatically by actual available space minus `UBAGEN_MIN_FREE_RESERVE_GB`. |
 | `UBAGEN_OUTPUT_RETENTION_HOURS` | Optional | `24` | Retention TTL (hours) before expired files in local `video_outputs` are automatically purged. |
-| `UBAGEN_GCS_BUCKET` | Recommended (Production) | *Empty* | Google Cloud Storage bucket name for persistent encoded video outputs (authenticated via Workload Identity / ADC; no credentials in source code). |
+| `UBAGEN_GCS_BUCKET` | Recommended (Production) | *Empty* | Google Cloud Storage bucket name for persistent encoded video outputs and `/encodeal` attachment staging (`staging/{user_id}/{job_id}/...`). |
 | `UBAGEN_CLOUD_RUN_JOB_NAME` | Recommended (Production) | *Empty* | Dedicated Google Cloud Run Job name (`ubagen-encoder-worker`) triggered via Cloud Run v2 `jobs.run` API (`UBAGEN_JOB_ID=<job_id>`). |
-| `UBAGEN_USE_FIRESTORE` | Optional | `auto` | Persistent job state backend selector (`auto`, `true`, `false`). Uses Google Cloud Firestore in multi-instance Cloud Run or SQLite WAL on persistent volumes. |
+| `UBAGEN_GCP_PROJECT_ID` | Recommended (Production) | Auto-discovered on GCP | Google Cloud Project ID hosting Cloud Run Job, Firestore, and GCS. Auto-discovered from Metadata Server or `GOOGLE_CLOUD_PROJECT` when available. |
+| `UBAGEN_GCP_REGION` | Optional | `europe-west2` (or Metadata Server) | Google Cloud region for Cloud Run Job and Service operations. |
+| `UBAGEN_USE_FIRESTORE` | Optional | `false` | Set to `true` to use Google Cloud Firestore as the authoritative job store across Cloud Run Service and Job worker instances (never silently falls back to local SQLite when `true`). |
+| `UBAGEN_FIRESTORE_DATABASE` | Optional | `(default)` | Firestore database ID. |
 | `UBAGEN_FIRESTORE_COLLECTION` | Optional | `ubagen_encode_jobs` | Firestore collection storing encode jobs across Cloud Run Service and Cloud Run Job worker instances. |
-| `UBAGEN_OUTPUT_TTL_SECONDS` | Optional | `7200` | Exact output retention TTL in seconds (`7200` = 2 hours). After expiry, download access is revoked (`410 Gone`) and the object is deleted from GCS. |
+| `UBAGEN_ENCODE_RETENTION_SECONDS` | Optional | `7200` | Exact output retention TTL in seconds (`7200` = 2 hours). After expiry, download access is revoked (`410 Gone`) and the object is deleted from GCS. |
+| `UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK` | Optional | `false` | Permits spawning a local worker subprocess only in local dev/test environments when Cloud Run Job is not configured. Disabled in production to protect bot stability. |
+| `UBAGEN_DISCORD_ADMIN_IDS` | Optional | *Empty* (Bot Owner & Server Admins) | Optional comma-separated Discord User IDs authorized to execute the `/discord` bot restart command. |
+| `UBAGEN_DISCORD_RESTART_MODE` | Optional | `gateway` | Controls `/discord` restart strategy: `gateway` (safe in-process gateway session reconnect) or `cloud_run_revision` (Cloud Run Admin v2 API revision rollout). |
 
 > 🔒 **Security Notice**: Never commit secret tokens or `.env` files to Git, and never place `UBAGEN_ADMIN_TOKEN` or `DISCORD_BOT_TOKEN` in client-exposed `VITE_*` environment variables. Set them securely through your hosting platform's server-side secret manager.
 

@@ -68,6 +68,15 @@ VALID_STAGES = {
 }
 
 
+class FirestoreUnavailableError(RuntimeError):
+    """Raised when Firestore is enabled (`UBAGEN_USE_FIRESTORE=true`) but unreachable or unauthorized."""
+
+
+class JobNotFoundError(KeyError):
+    """Raised when a requested `job_id` does not exist in the authoritative job store."""
+
+
+
 def normalize_video_codec(raw_codec: Optional[str]) -> tuple[bool, str, str]:
     """
     Validate and normalize requested video codec.
@@ -150,41 +159,58 @@ def detect_cloud_run_environment_details() -> dict[str, Any]:
     k_service = os.getenv("K_SERVICE", "").strip() or None
     k_revision = os.getenv("K_REVISION", "").strip() or None
     k_config = os.getenv("K_CONFIGURATION", "").strip() or None
+    cloud_run_job = os.getenv("CLOUD_RUN_JOB", "").strip() or None
+    on_gcp_runtime = bool(k_service or cloud_run_job)
 
     project_id = (
         os.getenv("UBAGEN_GCP_PROJECT_ID", "").strip()
+        or os.getenv("UBAGEN_FIRESTORE_PROJECT", "").strip()
         or os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
         or os.getenv("GCLOUD_PROJECT", "").strip()
-        or (_get_gcp_metadata("project/project-id") if k_service else None)
+        or (_get_gcp_metadata("project/project-id") if on_gcp_runtime else None)
     )
-    region_meta = _get_gcp_metadata("instance/region") if k_service else None
+    region_meta = _get_gcp_metadata("instance/region") if on_gcp_runtime else None
     region_from_meta = region_meta.split("/")[-1] if region_meta and "/" in region_meta else region_meta
     region = (
         os.getenv("UBAGEN_GCP_REGION", "").strip()
+        or os.getenv("UBAGEN_CLOUD_RUN_REGION", "").strip()
         or os.getenv("CLOUD_RUN_REGION", "").strip()
         or region_from_meta
         or "europe-west2"
     )
     service_account = (
         os.getenv("UBAGEN_SERVICE_ACCOUNT_EMAIL", "").strip()
-        or (_get_gcp_metadata("instance/service-accounts/default/email") if k_service else None)
+        or (_get_gcp_metadata("instance/service-accounts/default/email") if on_gcp_runtime else None)
         or os.getenv("AUTHORIZED_SERVICE_ACCOUNT_EMAIL", "").strip()
         or None
     )
 
+    public_base_url = (
+        os.getenv("UBAGEN_PUBLIC_BASE_URL", "").strip()
+        or os.getenv("APP_URL", "").strip()
+        or os.getenv("CLOUD_RUN_SERVICE_URL", "").strip()
+        or os.getenv("SHARED_APP_URL", "").strip()
+        or None
+    )
     cloud_run_job_name = os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip() or None
     gcs_bucket = os.getenv("UBAGEN_GCS_BUCKET", "").strip() or os.getenv("GCS_BUCKET_NAME", "").strip() or None
-    firestore_collection = os.getenv("UBAGEN_FIRESTORE_COLLECTION", "ubagen_encode_jobs").strip()
-    firestore_db = os.getenv("UBAGEN_FIRESTORE_DATABASE", "(default)").strip()
+    firestore_collection = os.getenv("UBAGEN_FIRESTORE_COLLECTION", "ubagen_encode_jobs").strip() or "ubagen_encode_jobs"
+    firestore_db = os.getenv("UBAGEN_FIRESTORE_DATABASE", "(default)").strip() or "(default)"
     firestore_enabled = os.getenv("UBAGEN_USE_FIRESTORE", "").strip().lower() in ("1", "true", "yes")
+    worker_temp_dir = (
+        os.getenv("UBAGEN_WORKER_TEMP_DIR", "").strip()
+        or ("/tmp/ubagen_worker_scratch" if on_gcp_runtime else None)
+    )
 
     return {
         "k_service": k_service,
         "k_revision": k_revision,
         "k_configuration": k_config,
+        "cloud_run_job": cloud_run_job,
         "project_id": project_id,
         "region": region,
         "service_account_email": service_account,
+        "public_base_url": public_base_url,
         "cloud_run_job_name": cloud_run_job_name,
         "cloud_run_job_configured": bool(cloud_run_job_name and project_id),
         "gcs_bucket": gcs_bucket,
@@ -192,7 +218,12 @@ def detect_cloud_run_environment_details() -> dict[str, Any]:
         "firestore_enabled": firestore_enabled,
         "firestore_database": firestore_db,
         "firestore_collection": firestore_collection,
+        "worker_temp_dir": worker_temp_dir,
         "retention_seconds": get_configured_retention_seconds(),
+        "secrets_present": {
+            "DISCORD_BOT_TOKEN": bool(os.getenv("DISCORD_BOT_TOKEN", "").strip()),
+            "UBAGEN_ADMIN_TOKEN": bool(os.getenv("UBAGEN_ADMIN_TOKEN", "").strip()),
+        },
         "recommended_job_profile": {
             "cpu": "4",
             "memory": "8Gi",
@@ -205,14 +236,46 @@ def detect_cloud_run_environment_details() -> dict[str, Any]:
     }
 
 
+def discover_and_apply_runtime_config() -> dict[str, Any]:
+    """
+    Auto-discover non-secret configuration values from the Cloud Run / container environment
+    and populate missing `UBAGEN_*` variables without overwriting explicitly configured values
+    and without ever fabricating or logging secret values.
+    """
+    details = detect_cloud_run_environment_details()
+    applied: dict[str, str] = {}
+
+    def _apply_if_missing(env_key: str, candidate: Optional[str]) -> None:
+        if not os.getenv(env_key, "").strip() and candidate and str(candidate).strip():
+            val = str(candidate).strip()
+            os.environ[env_key] = val
+            applied[env_key] = val
+
+    _apply_if_missing("UBAGEN_GCP_PROJECT_ID", details.get("project_id"))
+    _apply_if_missing("UBAGEN_GCP_REGION", details.get("region"))
+    _apply_if_missing("UBAGEN_PUBLIC_BASE_URL", details.get("public_base_url"))
+    _apply_if_missing("UBAGEN_FIRESTORE_COLLECTION", details.get("firestore_collection"))
+    _apply_if_missing("UBAGEN_FIRESTORE_DATABASE", details.get("firestore_database"))
+    _apply_if_missing("UBAGEN_ENCODE_RETENTION_SECONDS", str(details.get("retention_seconds") or DEFAULT_RETENTION_SECONDS))
+    if details.get("worker_temp_dir"):
+        _apply_if_missing("UBAGEN_WORKER_TEMP_DIR", details.get("worker_temp_dir"))
+
+    return {
+        "discovered": detect_cloud_run_environment_details(),
+        "auto_applied_keys": sorted(applied.keys()),
+        "auto_applied_values": applied,
+    }
+
+
 def get_configured_retention_seconds() -> int:
     """Return configured encode output retention in seconds (default: 7200s = 2 hours)."""
-    raw = os.getenv("UBAGEN_ENCODE_RETENTION_SECONDS", "").strip()
-    if raw:
-        with suppress(ValueError):
-            val = int(float(raw))
-            if val > 0:
-                return val
+    for env_key in ("UBAGEN_ENCODE_RETENTION_SECONDS", "UBAGEN_OUTPUT_TTL_SECONDS"):
+        raw = os.getenv(env_key, "").strip()
+        if raw:
+            with suppress(ValueError):
+                val = int(float(raw))
+                if val > 0:
+                    return val
     return DEFAULT_RETENTION_SECONDS
 
 
@@ -261,6 +324,9 @@ class EncodeJob:
     deleted_from_gcs: bool = False
     deleted_at: Optional[float] = None
     worker_execution_name: Optional[str] = None
+    staged_gcs_objects: list[str] = field(default_factory=list)
+    command_source: str = "encode"
+
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         cur = now if now is not None else time.time()
@@ -390,6 +456,7 @@ class EncodeJob:
             "deleted_at": self.deleted_at,
             "deleted_at_iso": _iso_utc(self.deleted_at),
             "worker_execution_name": self.worker_execution_name,
+            "command_source": self.command_source,
         }
 
 
@@ -706,6 +773,112 @@ class GCSOutputStorage:
             logger.warning("GCS REST download error: %s", exc)
         return None, None
 
+    def upload_staging_bytes(
+        self,
+        data: bytes,
+        *,
+        user_id: str,
+        job_id: str,
+        kind: str,
+        original_filename: str,
+        content_type: str = "application/octet-stream",
+    ) -> dict[str, Any]:
+        """
+        Upload user-supplied attachment bytes (e.g. `.ass`/`.srt` subtitle or intro clip from `/encodeal`)
+        to a unique, user- and job-scoped staging object in GCS (`staging/{user_id}/{job_id}/...`)
+        and verify its existence and byte size.
+        """
+        if not data or len(data) <= 0:
+            raise ValueError("Staging dosyası boş (0 byte); yükleme reddedildi.")
+
+        safe_user = re.sub(r"[^A-Za-z0-9._-]+", "_", (user_id or "").strip())[:64]
+        safe_job = re.sub(r"[^A-Za-z0-9._-]+", "_", (job_id or "").strip())[:64]
+        safe_kind = re.sub(r"[^A-Za-z0-9_-]+", "_", (kind or "input").strip())[:24]
+        raw_base = Path(str(original_filename or "file").replace("\\", "/")).name
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_base).strip("._")[:80] or "attachment"
+        if not safe_user or not safe_job:
+            raise ValueError("Staging yüklemesi için geçerli user_id ve job_id gereklidir.")
+
+        object_name = f"staging/{safe_user}/{safe_job}/{safe_kind}_{uuid.uuid4().hex[:8]}_{safe_name}"
+
+        with tempfile.NamedTemporaryFile(prefix=f"ubagen_stage_{safe_kind}_", delete=False) as tmp_f:
+            tmp_f.write(data)
+            tmp_path = Path(tmp_f.name)
+
+        try:
+            res = self.upload_file(
+                tmp_path,
+                object_name,
+                content_type=content_type,
+                metadata={
+                    "user_id": safe_user,
+                    "job_id": safe_job,
+                    "staging_kind": safe_kind,
+                    "original_filename": safe_name,
+                },
+            )
+            if not res.get("verified") or int(res.get("size_bytes") or 0) != len(data):
+                raise RuntimeError("GCS staging nesnesi doğrulanamadı.")
+            return res
+        finally:
+            with suppress(Exception):
+                tmp_path.unlink(missing_ok=True)
+
+    def download_to_path(self, bucket: str, object_name: str, dest_path: Path) -> Path:
+        """
+        Download a GCS object (`gs://{bucket}/{object_name}`) into `dest_path` for worker processing
+        and verify that the downloaded file is non-empty.
+        """
+        clean_bucket = (bucket or self.bucket_name or "").strip()
+        clean_object = (object_name or "").lstrip("/")
+        if not clean_bucket or not clean_object:
+            raise ValueError("GCS indirme işlemi için bucket ve object_name zorunludur.")
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        local_mirror, raw_bytes = self.open_download_stream_or_path(clean_bucket, clean_object)
+        if local_mirror is not None and local_mirror.is_file():
+            shutil.copy2(local_mirror, dest_path)
+        elif raw_bytes is not None:
+            dest_path.write_bytes(raw_bytes)
+        else:
+            raise FileNotFoundError(
+                f"GCS staging/kaynak nesnesi okunamadı veya bulunamadı: gs://{clean_bucket}/{clean_object}"
+            )
+
+        if not dest_path.is_file() or dest_path.stat().st_size <= 0:
+            raise RuntimeError(f"GCS nesnesi indirildi ancak boş: gs://{clean_bucket}/{clean_object}")
+        return dest_path
+
+    def cleanup_job_staging_objects(self, job: EncodeJob) -> int:
+        """
+        Delete all per-job staging objects (`staging/{user_id}/{job_id}/...`) from GCS.
+        Called automatically when a job completes, fails, or expires.
+        """
+        bucket = (job.gcs_bucket or self.bucket_name or "").strip()
+        if not bucket:
+            return 0
+
+        candidates: set[str] = set()
+        for obj in job.staged_gcs_objects or []:
+            if obj and str(obj).strip():
+                candidates.add(str(obj).strip().lstrip("/"))
+
+        for src in (job.subtitle_source, job.intro_source):
+            if src and str(src).strip().startswith("gs://"):
+                without_scheme = str(src).strip()[5:]
+                if "/" in without_scheme:
+                    src_bucket, src_obj = without_scheme.split("/", 1)
+                    if src_bucket == bucket and src_obj.startswith("staging/"):
+                        candidates.add(src_obj.lstrip("/"))
+
+        deleted = 0
+        for obj_name in sorted(candidates):
+            with suppress(Exception):
+                if self.delete_object(bucket, obj_name):
+                    deleted += 1
+        return deleted
+
+
 
 # ------------------------------------------------------------------------------
 # Persistent Job Store (Firestore Primary + SQLite WAL Persistent Fallback)
@@ -737,12 +910,13 @@ class PersistentJobStore:
         self._ensure_sqlite_db()
 
         self.gcs = gcs_storage or GCSOutputStorage()
-        self.firestore_collection = os.getenv("UBAGEN_FIRESTORE_COLLECTION", "ubagen_encode_jobs").strip()
-        self.firestore_database = os.getenv("UBAGEN_FIRESTORE_DATABASE", "(default)").strip()
+        self.firestore_collection = os.getenv("UBAGEN_FIRESTORE_COLLECTION", "ubagen_encode_jobs").strip() or "ubagen_encode_jobs"
+        self.firestore_database = os.getenv("UBAGEN_FIRESTORE_DATABASE", "(default)").strip() or "(default)"
         self.firestore_project = (
             os.getenv("UBAGEN_FIRESTORE_PROJECT", "").strip()
             or os.getenv("UBAGEN_GCP_PROJECT_ID", "").strip()
             or os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+            or os.getenv("GCLOUD_PROJECT", "").strip()
         )
         self._use_firestore = (
             use_firestore
@@ -750,22 +924,47 @@ class PersistentJobStore:
             else (os.getenv("UBAGEN_USE_FIRESTORE", "").strip().lower() in ("1", "true", "yes"))
         )
         self._firestore_client: Any = None
+        self._firestore_init_error: Optional[str] = None
         if self._use_firestore:
             self._init_firestore_client()
 
     def _init_firestore_client(self) -> None:
+        if not self.firestore_project:
+            self._firestore_init_error = (
+                "Firestore etkin (`UBAGEN_USE_FIRESTORE=true`) ancak `UBAGEN_GCP_PROJECT_ID` tanımlı değil."
+            )
+            logger.error(self._firestore_init_error)
+            self._firestore_client = None
+            return
         try:
             from google.cloud import firestore  # type: ignore
 
-            kwargs: dict[str, Any] = {}
-            if self.firestore_project:
-                kwargs["project"] = self.firestore_project
+            kwargs: dict[str, Any] = {"project": self.firestore_project}
             if self.firestore_database and self.firestore_database != "(default)":
                 kwargs["database"] = self.firestore_database
             self._firestore_client = firestore.Client(**kwargs)
+            self._firestore_init_error = None
         except Exception as exc:
-            logger.debug("Firestore SDK client not initialized (%s); using REST/SQLite store.", exc)
+            self._firestore_init_error = f"Firestore istemcisi başlatılamadı: {type(exc).__name__}: {exc}"
+            logger.error(self._firestore_init_error)
             self._firestore_client = None
+
+    def _require_firestore_client(self) -> Any:
+        """
+        Ensure Firestore client is available when `use_firestore=True`.
+        Never silently falls back to local SQLite when Firestore is configured,
+        preventing split-brain state where the Cloud Run Job worker cannot find jobs.
+        """
+        if self._firestore_client is None:
+            self._init_firestore_client()
+        if self._firestore_client is None:
+            msg = (
+                self._firestore_init_error
+                or "Firestore bağlantısı kurulamadı. Yerel SQLite'a sessizce geçilmedi."
+            )
+            raise FirestoreUnavailableError(msg)
+        return self._firestore_client
+
 
     def _ensure_sqlite_db(self) -> None:
         try:
@@ -847,10 +1046,27 @@ class PersistentJobStore:
         }
 
     def save_job(self, job: EncodeJob) -> EncodeJob:
-        """Persist `job` to Firestore (if enabled) and transactional SQLite WAL store."""
+        """
+        Persist `job` to the authoritative store:
+        - When `use_firestore=True`: writes to Google Cloud Firestore and raises `FirestoreUnavailableError`
+          on failure (never silently falling back to local SQLite).
+        - When `use_firestore=False`: writes to local transactional SQLite WAL database.
+        """
         job.updated_at = time.time()
         payload_dict = job.to_dict()
         payload_json = json.dumps(payload_dict, ensure_ascii=False)
+
+        if self._use_firestore:
+            client = self._require_firestore_client()
+            try:
+                client.collection(self.firestore_collection).document(job.job_id).set(payload_dict)
+            except Exception as exc:
+                err_msg = (
+                    f"Firestore iş kaydı yazılamadı (`{self.firestore_collection}/{job.job_id}`): "
+                    f"{type(exc).__name__}"
+                )
+                logger.error("%s: %s", err_msg, exc)
+                raise FirestoreUnavailableError(err_msg) from exc
 
         with self._lock:
             with self._connect_sqlite() as conn:
@@ -882,10 +1098,6 @@ class PersistentJobStore:
                     ),
                 )
 
-        if self._use_firestore and self._firestore_client is not None:
-            with suppress(Exception):
-                self._firestore_client.collection(self.firestore_collection).document(job.job_id).set(payload_dict)
-
         return job
 
     def create_job(
@@ -903,6 +1115,8 @@ class PersistentJobStore:
         application_id: Optional[str] = None,
         interaction_token: Optional[str] = None,
         retention_seconds: Optional[int] = None,
+        staged_gcs_objects: Optional[list[str]] = None,
+        command_source: str = "encode",
     ) -> EncodeJob:
         """Validate inputs and create a new persistent `EncodeJob` in `queued` state."""
         clean_user = (user_id or "").strip()
@@ -944,22 +1158,47 @@ class PersistentJobStore:
             created_at=now,
             updated_at=now,
             retention_seconds=ret_sec,
+            staged_gcs_objects=list(staged_gcs_objects or []),
+            command_source=command_source,
         )
         return self.save_job(job)
 
     def get_job(self, job_id: str) -> Optional[EncodeJob]:
-        """Load a job by `job_id` from persistent storage."""
+        """
+        Load a job by `job_id` from persistent storage.
+        When `use_firestore=True`, reads exclusively from Firestore (raising `FirestoreUnavailableError`
+        on connection/auth failure and returning `None` if the document does not exist in Firestore).
+        """
         clean_id = (job_id or "").strip()
         if not clean_id:
             return None
 
-        if self._use_firestore and self._firestore_client is not None:
-            with suppress(Exception):
-                doc = self._firestore_client.collection(self.firestore_collection).document(clean_id).get()
-                if doc.exists:
-                    data = doc.to_dict()
-                    if isinstance(data, dict):
-                        return EncodeJob.from_dict(data)
+        if self._use_firestore:
+            client = self._require_firestore_client()
+            try:
+                doc = client.collection(self.firestore_collection).document(clean_id).get()
+                if not doc.exists:
+                    logger.warning(
+                        "Job document '%s' not found in Firestore collection '%s' (project=%s, db=%s).",
+                        clean_id,
+                        self.firestore_collection,
+                        self.firestore_project,
+                        self.firestore_database,
+                    )
+                    return None
+                data = doc.to_dict()
+                if isinstance(data, dict):
+                    return EncodeJob.from_dict(data)
+                return None
+            except FirestoreUnavailableError:
+                raise
+            except Exception as exc:
+                err_msg = (
+                    f"Firestore iş kaydı okunamadı (`{self.firestore_collection}/{clean_id}`): "
+                    f"{type(exc).__name__}"
+                )
+                logger.error("%s: %s", err_msg, exc)
+                raise FirestoreUnavailableError(err_msg) from exc
 
         with self._connect_sqlite() as conn:
             row = conn.execute(
@@ -969,6 +1208,7 @@ class PersistentJobStore:
             if not row:
                 return None
             return EncodeJob.from_dict(json.loads(row["payload_json"]))
+
 
     def update_job_progress(
         self,
@@ -1089,10 +1329,12 @@ class PersistentJobStore:
         job.output_size_bytes = int(output_size_bytes)
         job.deleted_from_gcs = False
         job.download_url = self.build_download_url(job, public_base_url=public_base_url)
+        with suppress(Exception):
+            self.gcs.cleanup_job_staging_objects(job)
         return self.save_job(job)
 
     def mark_job_failed(self, job_id: str, error_message: str) -> Optional[EncodeJob]:
-        """Transition a job to `failed` state and clear any download link."""
+        """Transition a job to `failed` state, clean up any GCS staging files, and clear download link."""
         job = self.get_job(job_id)
         if job is None:
             return None
@@ -1102,7 +1344,28 @@ class PersistentJobStore:
         job.gcs_upload_verified = False
         job.download_url = None
         job.error = error_message
+        with suppress(Exception):
+            self.gcs.cleanup_job_staging_objects(job)
         return self.save_job(job)
+
+
+    def _list_all_firestore_jobs(self, max_docs: int = 500) -> list[EncodeJob]:
+        client = self._require_firestore_client()
+        try:
+            docs = client.collection(self.firestore_collection).limit(max_docs).stream()
+            items: list[EncodeJob] = []
+            for doc in docs:
+                data = doc.to_dict()
+                if isinstance(data, dict) and data.get("job_id"):
+                    items.append(EncodeJob.from_dict(data))
+            items.sort(key=lambda j: float(j.created_at or 0.0), reverse=True)
+            return items
+        except FirestoreUnavailableError:
+            raise
+        except Exception as exc:
+            err_msg = f"Firestore iş listesi okunamadı (`{self.firestore_collection}`): {type(exc).__name__}"
+            logger.error("%s: %s", err_msg, exc)
+            raise FirestoreUnavailableError(err_msg) from exc
 
     def list_jobs(
         self,
@@ -1112,6 +1375,19 @@ class PersistentJobStore:
     ) -> list[EncodeJob]:
         """List jobs ordered newest-first."""
         safe_limit = max(1, min(int(limit or 50), 200))
+        if self._use_firestore:
+            all_jobs = self._list_all_firestore_jobs(max_docs=max(200, safe_limit * 4))
+            filtered: list[EncodeJob] = []
+            for j in all_jobs:
+                if user_id and j.user_id != user_id.strip():
+                    continue
+                if status and j.status != status.strip():
+                    continue
+                filtered.append(j)
+                if len(filtered) >= safe_limit:
+                    break
+            return filtered
+
         clauses: list[str] = []
         params: list[Any] = []
         if user_id:
@@ -1136,26 +1412,34 @@ class PersistentJobStore:
         revokes download access (`download_url = None`), and updates their status to `expired`.
         """
         cur = now if now is not None else time.time()
-        with self._connect_sqlite() as conn:
-            rows = conn.execute(
-                """
-                SELECT payload_json FROM encode_jobs
-                WHERE expires_at IS NOT NULL AND expires_at <= ? AND deleted_from_gcs = 0
-                """,
-                (cur,),
-            ).fetchall()
+        candidates: list[EncodeJob] = []
+        if self._use_firestore:
+            for j in self._list_all_firestore_jobs(max_docs=500):
+                if j.expires_at is not None and j.expires_at <= cur and not j.deleted_from_gcs:
+                    candidates.append(j)
+        else:
+            with self._connect_sqlite() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT payload_json FROM encode_jobs
+                    WHERE expires_at IS NOT NULL AND expires_at <= ? AND deleted_from_gcs = 0
+                    """,
+                    (cur,),
+                ).fetchall()
+            candidates = [EncodeJob.from_dict(json.loads(r["payload_json"])) for r in rows]
 
         expired_count = 0
         gcs_deleted_count = 0
         purged_job_ids: list[str] = []
 
-        for row in rows:
-            job = EncodeJob.from_dict(json.loads(row["payload_json"]))
+        for job in candidates:
             deleted_ok = True
             if job.gcs_bucket and job.gcs_object_name:
                 deleted_ok = self.gcs.delete_object(job.gcs_bucket, job.gcs_object_name)
                 if deleted_ok:
                     gcs_deleted_count += 1
+            with suppress(Exception):
+                self.gcs.cleanup_job_staging_objects(job)
 
             job.stage = "expired"
             job.status = "expired"
@@ -1184,18 +1468,24 @@ class PersistentJobStore:
         """
         cur = now if now is not None else time.time()
         cutoff = cur - float(stale_timeout_seconds)
-        with self._connect_sqlite() as conn:
-            rows = conn.execute(
-                """
-                SELECT payload_json FROM encode_jobs
-                WHERE status = 'running' AND updated_at <= ?
-                """,
-                (cutoff,),
-            ).fetchall()
+        candidates: list[EncodeJob] = []
+        if self._use_firestore:
+            for j in self._list_all_firestore_jobs(max_docs=500):
+                if j.status == "running" and float(j.updated_at or 0.0) <= cutoff:
+                    candidates.append(j)
+        else:
+            with self._connect_sqlite() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT payload_json FROM encode_jobs
+                    WHERE status = 'running' AND updated_at <= ?
+                    """,
+                    (cutoff,),
+                ).fetchall()
+            candidates = [EncodeJob.from_dict(json.loads(r["payload_json"])) for r in rows]
 
         recovered: list[EncodeJob] = []
-        for row in rows:
-            job = EncodeJob.from_dict(json.loads(row["payload_json"]))
+        for job in candidates:
             job.stage = "failed"
             job.status = "failed"
             job.eta_seconds = 0
@@ -1205,6 +1495,8 @@ class PersistentJobStore:
                 f"Worker beklenmedik şekilde sonlandı veya zaman aşımına uğradı "
                 f"({int(stale_timeout_seconds)}sn boyunca ilerleme sinyali alınamadı)."
             )
+            with suppress(Exception):
+                self.gcs.cleanup_job_staging_objects(job)
             self.save_job(job)
             recovered.append(job)
         return recovered

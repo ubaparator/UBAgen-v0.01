@@ -57,8 +57,9 @@ import uvicorn
 
 from encoder_worker import notify_discord_webhook_sync, register_encoder_commands
 from health_api import create_health_app
-from job_store import get_job_store
+from job_store import discover_and_apply_runtime_config, get_job_store
 from stats import BotTracker, install_log_buffer_handler, register_stats_command
+
 from storage_manager import get_storage_manager
 from subtitle_extract import (
     cleanup_stale_workdirs,
@@ -99,6 +100,9 @@ if commands is not None:
             self.dev_guild_id = guild_id
             self.tracker = BotTracker()
             self._guild_commands_synced = False
+            self._global_commands_synced = False
+            self._synced_guild_ids: set[int] = set()
+            self.lifecycle_manager: Any = None
 
         def write_state_file(self) -> None:
             """Write current bot state to local tmp file for process sharing."""
@@ -119,14 +123,15 @@ if commands is not None:
             logger.info("Registering slash commands...")
             register_stats_command(self.tree, self)
             register_subtitle_extract_command(self.tree)
-            register_encoder_commands(self.tree)
+            register_encoder_commands(self.tree, bot=self)
 
-            # Sync slash commands with robust fallback
+            # Sync slash commands with robust fallback (avoiding duplicate syncs)
             if self.dev_guild_id:
                 try:
                     dev_guild = discord.Object(id=self.dev_guild_id)
                     self.tree.copy_global_to(guild=dev_guild)
                     synced = await self.tree.sync(guild=dev_guild)
+                    self._synced_guild_ids.add(int(self.dev_guild_id))
                     logger.info(
                         "⚡ Instantly synced %d slash command(s) to development guild ID: %d",
                         len(synced),
@@ -144,6 +149,7 @@ if commands is not None:
                     self.tracker.sync_status = "Dev guild sync: 403 Forbidden (Missing Access). Bot needs applications.commands scope."
                     try:
                         synced = await self.tree.sync()
+                        self._global_commands_synced = True
                         logger.info("🌐 Synced %d global slash command(s) as fallback.", len(synced))
                     except Exception as g_exc:
                         logger.warning("Global fallback sync error: %s", g_exc)
@@ -156,6 +162,7 @@ if commands is not None:
                     self.tracker.sync_status = "Dev guild not found (404). Falling back to global sync."
                     try:
                         synced = await self.tree.sync()
+                        self._global_commands_synced = True
                         logger.info("🌐 Synced %d global slash command(s) as fallback.", len(synced))
                     except Exception as g_exc:
                         logger.warning("Global fallback sync error: %s", g_exc)
@@ -164,12 +171,14 @@ if commands is not None:
                     self.tracker.sync_status = f"Dev sync warning: {type(exc).__name__}"
                     try:
                         synced = await self.tree.sync()
+                        self._global_commands_synced = True
                         logger.info("🌐 Synced %d global slash command(s) as fallback.", len(synced))
                     except Exception as g_exc:
                         logger.warning("Global fallback sync error: %s", g_exc)
             else:
                 try:
                     synced = await self.tree.sync()
+                    self._global_commands_synced = True
                     logger.info(
                         "🌐 Synced %d global slash command(s). (Note: Global sync may take up to 1 hour to propagate)",
                         len(synced),
@@ -178,6 +187,7 @@ if commands is not None:
                 except Exception as exc:
                     logger.warning("Global slash command sync warning (%s): %s", type(exc).__name__, exc)
                     self.tracker.sync_status = f"Global sync warning: {type(exc).__name__}"
+
 
             self.write_state_file()
 
@@ -225,35 +235,47 @@ if commands is not None:
                     pass
 
             # Guild-scoped copies appear immediately in every server the bot has joined.
-            # Keep global registration too, so commands also propagate to future servers.
+            # Keep global registration too, without re-syncing guilds or global commands already synced in setup_hook.
             if not self._guild_commands_synced:
-                synced_guilds = 0
-                global_sync_succeeded = False
+                synced_guilds = len(self._synced_guild_ids)
+                global_sync_succeeded = bool(self._global_commands_synced)
                 for guild in list(self.guilds):
+                    gid = getattr(guild, "id", None)
+                    if gid is not None and int(gid) in self._synced_guild_ids:
+                        continue
                     try:
                         self.tree.copy_global_to(guild=guild)
                         await self.tree.sync(guild=guild)
+                        if gid is not None:
+                            self._synced_guild_ids.add(int(gid))
                         synced_guilds += 1
                     except Exception as exc:
-                        logger.warning("Could not sync commands to guild %s: %s", guild.id, type(exc).__name__)
-                try:
-                    global_commands = await self.tree.sync()
-                    global_sync_succeeded = True
-                    logger.info(
-                        "Slash commands synced globally (%d) and to %d current guild(s).",
-                        len(global_commands),
-                        synced_guilds,
-                    )
+                        logger.warning("Could not sync commands to guild %s: %s", gid, type(exc).__name__)
+                if not self._global_commands_synced:
+                    try:
+                        global_commands = await self.tree.sync()
+                        global_sync_succeeded = True
+                        self._global_commands_synced = True
+                        logger.info(
+                            "Slash commands synced globally (%d) and to %d current guild(s).",
+                            len(global_commands),
+                            synced_guilds,
+                        )
+                        self.tracker.sync_status = (
+                            f"{len(global_commands)} global command(s); synced to {synced_guilds} current server(s)"
+                        )
+                    except Exception as exc:
+                        logger.warning("Global command sync from on_ready failed: %s", type(exc).__name__)
+                        self.tracker.sync_status = f"Command sync warning: {type(exc).__name__}"
+                else:
+                    cmd_count = len(self.tree.get_commands())
                     self.tracker.sync_status = (
-                        f"{len(global_commands)} global command(s); synced to {synced_guilds} current server(s)"
+                        f"{cmd_count} global command(s); synced to {synced_guilds} current server(s)"
                     )
-                except Exception as exc:
-                    logger.warning("Global command sync from on_ready failed: %s", type(exc).__name__)
-                    self.tracker.sync_status = f"Command sync warning: {type(exc).__name__}"
                 # Only mark sync complete after Discord confirms the global sync.
-                # If it failed, a later gateway READY event can retry registration.
                 self._guild_commands_synced = global_sync_succeeded
                 self.write_state_file()
+
 
         async def on_resumed(self) -> None:
             """Fires when a disconnected gateway session is successfully resumed."""
@@ -571,12 +593,17 @@ class BotLifecycleManager:
             self.attach_health_app(self.health_app)
 
     def _create_bot_instance(self) -> Any:
+        bot_inst = None
         if self._custom_bot_factory is not None:
-            return self._custom_bot_factory()
-        if UBAgenBot is not None:
+            bot_inst = self._custom_bot_factory()
+        elif UBAgenBot is not None:
             guild_id = self.dev_guild_id if self.dev_guild_id is not None else parse_dev_guild_id()
-            return UBAgenBot(guild_id=guild_id)
-        return None
+            bot_inst = UBAgenBot(guild_id=guild_id)
+        if bot_inst is not None:
+            with suppress(Exception):
+                bot_inst.lifecycle_manager = self
+        return bot_inst
+
 
     def _update_active_bot(self, new_bot: Any) -> None:
         self.bot = new_bot
@@ -850,7 +877,16 @@ async def run_job_retention_sweeper_loop(
 
 async def main() -> None:
     """Main application loop coordinating bot and web service."""
+    with suppress(Exception):
+        auto_cfg = discover_and_apply_runtime_config()
+        if auto_cfg.get("auto_applied_keys"):
+            logger.info(
+                "Auto-discovered and applied runtime configuration keys: %s",
+                ", ".join(auto_cfg["auto_applied_keys"]),
+            )
+
     ubagen_port_env = os.getenv("UBAGEN_HTTP_PORT", "").strip()
+
     raw_port_env = os.getenv("PORT", "8080").strip()
     nginx_port_env = os.getenv("NGINX_PORT", "").strip()
 

@@ -28,7 +28,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from encoder_worker import dispatch_encode_job_background
-from job_store import get_job_store, normalize_video_codec
+from job_store import (
+    FirestoreUnavailableError,
+    discover_and_apply_runtime_config,
+    get_job_store,
+    normalize_video_codec,
+)
 from stats import collect_all_stats, get_recent_logs, install_log_buffer_handler
 from storage_manager import get_storage_manager
 from subtitle_extract import normalize_language_code, validate_magnet_uri
@@ -389,10 +394,17 @@ def create_health_app(
     ) -> JSONResponse:
         """Return persistent encode jobs from Firestore/SQLite store."""
         store = get_job_store()
-        with suppress(Exception):
-            await asyncio.to_thread(store.cleanup_expired_jobs)
-        requester = (x_user_id or user_id or "").strip() or None
-        jobs = await asyncio.to_thread(store.list_jobs, user_id, status, limit)
+        try:
+            with suppress(Exception):
+                await asyncio.to_thread(store.cleanup_expired_jobs)
+            requester = (x_user_id or user_id or "").strip() or None
+            jobs = await asyncio.to_thread(store.list_jobs, user_id, status, limit)
+        except FirestoreUnavailableError as exc:
+            return JSONResponse(
+                content={"status": "firestore_unavailable", "error": str(exc)},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
         return JSONResponse(
             content={
                 "status": "online",
@@ -456,20 +468,27 @@ def create_health_app(
             )
 
         store = get_job_store()
-        job = await asyncio.to_thread(
-            store.create_job,
-            user_id=user_id,
-            magnet=mag_or_err,
-            codec=canonical_codec,
-            subtitle_lang=lang_or_err,
-            subtitle_source=subtitle_source,
-            intro_source=intro_source,
-            user_name=body.get("user_name"),
-        )
-        dispatch_result = None
-        if should_dispatch:
-            dispatch_result = await asyncio.to_thread(dispatch_encode_job_background, job.job_id)
-            job = await asyncio.to_thread(store.get_job, job.job_id) or job
+        try:
+            job = await asyncio.to_thread(
+                store.create_job,
+                user_id=user_id,
+                magnet=mag_or_err,
+                codec=canonical_codec,
+                subtitle_lang=lang_or_err,
+                subtitle_source=subtitle_source,
+                intro_source=intro_source,
+                user_name=body.get("user_name"),
+            )
+            dispatch_result = None
+            if should_dispatch:
+                dispatch_result = await asyncio.to_thread(dispatch_encode_job_background, job.job_id)
+                job = await asyncio.to_thread(store.get_job, job.job_id) or job
+        except FirestoreUnavailableError as exc:
+            return JSONResponse(
+                content={"status": "firestore_unavailable", "error": str(exc)},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
 
         return JSONResponse(
             content={
@@ -504,8 +523,15 @@ def create_health_app(
             )
 
         store = get_job_store()
-        cleanup_res = await asyncio.to_thread(store.cleanup_expired_jobs)
-        recovered = await asyncio.to_thread(store.recover_stale_running_jobs)
+        try:
+            cleanup_res = await asyncio.to_thread(store.cleanup_expired_jobs)
+            recovered = await asyncio.to_thread(store.recover_stale_running_jobs)
+        except FirestoreUnavailableError as exc:
+            return JSONResponse(
+                content={"status": "firestore_unavailable", "error": str(exc)},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
         return JSONResponse(
             content={
                 "status": "ok",
@@ -524,16 +550,23 @@ def create_health_app(
     ) -> JSONResponse:
         """Retrieve a single job record from persistent storage."""
         store = get_job_store()
-        job = await asyncio.to_thread(store.get_job, job_id)
-        if job is None:
+        try:
+            job = await asyncio.to_thread(store.get_job, job_id)
+            if job is None:
+                return JSONResponse(
+                    content={"error": f"Encode işi bulunamadı: {job_id}"},
+                    status_code=404,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if job.is_expired() and not job.deleted_from_gcs:
+                await asyncio.to_thread(store.cleanup_expired_jobs)
+                job = await asyncio.to_thread(store.get_job, job_id) or job
+        except FirestoreUnavailableError as exc:
             return JSONResponse(
-                content={"error": f"Encode işi bulunamadı: {job_id}"},
-                status_code=404,
+                content={"status": "firestore_unavailable", "error": str(exc)},
+                status_code=503,
                 headers={"Cache-Control": "no-store"},
             )
-        if job.is_expired() and not job.deleted_from_gcs:
-            await asyncio.to_thread(store.cleanup_expired_jobs)
-            job = await asyncio.to_thread(store.get_job, job_id) or job
 
         requester = (x_user_id or user_id or "").strip() or None
         return JSONResponse(
@@ -560,7 +593,14 @@ def create_health_app(
         - Verifies `gcs_upload_verified` is True before serving -> returns 409 if not verified.
         """
         store = get_job_store()
-        job = await asyncio.to_thread(store.get_job, job_id)
+        try:
+            job = await asyncio.to_thread(store.get_job, job_id)
+        except FirestoreUnavailableError as exc:
+            return JSONResponse(
+                content={"status": "firestore_unavailable", "error": str(exc)},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
         if job is None:
             return JSONResponse(
                 content={"error": "İstenen encode işi bulunamadı."},
