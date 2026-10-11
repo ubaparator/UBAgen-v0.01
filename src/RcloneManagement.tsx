@@ -48,7 +48,7 @@ type RcloneStatus = {
   requires_google_cloud_project?: boolean;
 };
 
-type Props = { onClose: () => void };
+type Props = { onClose?: () => void; inline?: boolean };
 
 const panelClass = 'rounded-xl border border-slate-800 bg-slate-900/80';
 const inputClass = 'w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 placeholder:text-slate-600';
@@ -100,7 +100,7 @@ function statusLabel(status: string): string {
   }
 }
 
-export default function RcloneManagement({ onClose }: Props) {
+export default function RcloneManagement({ onClose, inline = false }: Props) {
   const [status, setStatus] = useState<RcloneStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [busyKey, setBusyKey] = useState('');
@@ -271,8 +271,14 @@ export default function RcloneManagement({ onClose }: Props) {
     mutate('process-deletions', '/api/rclone/pending-deletions/process', {}, 'Vadesi gelen silme işleri işlendi.');
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-start justify-center overflow-y-auto bg-black/75 p-3 backdrop-blur-sm sm:p-6" role="dialog" aria-modal="true" aria-labelledby="rclone-panel-title">
-      <div className="my-auto w-full max-w-6xl overflow-hidden rounded-2xl border border-slate-700 bg-slate-950 shadow-2xl shadow-black/50">
+    <div
+      id={inline ? 'rclone-storage-management' : undefined}
+      className={inline ? 'relative z-10 mx-auto w-full max-w-[1600px] px-4 py-4 sm:px-6' : 'fixed inset-0 z-[80] flex items-start justify-center overflow-y-auto bg-black/75 p-3 backdrop-blur-sm sm:p-6'}
+      role={inline ? undefined : 'dialog'}
+      aria-modal={inline ? undefined : true}
+      aria-labelledby="rclone-panel-title"
+    >
+      <div className={inline ? 'w-full overflow-hidden rounded-2xl border border-slate-700 bg-slate-950 shadow-xl' : 'my-auto w-full max-w-6xl overflow-hidden rounded-2xl border border-slate-700 bg-slate-950 shadow-2xl shadow-black/50'}>
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-slate-900/90 px-4 py-4 sm:px-6">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/15 text-indigo-300"><HardDrive className="h-5 w-5" /></div>
@@ -288,11 +294,11 @@ export default function RcloneManagement({ onClose }: Props) {
             <button type="button" onClick={() => void refresh()} disabled={loading || !adminToken} className={`${buttonClass} border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700`}>
               <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Yenile
             </button>
-            <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white" aria-label="Rclone yönetimini kapat"><X className="h-5 w-5" /></button>
+            {!inline && onClose && <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white" aria-label="Rclone yönetimini kapat"><X className="h-5 w-5" /></button>}
           </div>
         </div>
 
-        <div className="max-h-[calc(100vh-90px)] space-y-5 overflow-y-auto p-4 sm:p-6">
+        <div className={`${inline ? 'max-h-none' : 'max-h-[calc(100vh-90px)]'} space-y-5 overflow-y-auto p-4 sm:p-6`}>
           {showAuthForm && <form onSubmit={async event => {
             event.preventDefault();
             const candidate = adminTokenInput.trim();
