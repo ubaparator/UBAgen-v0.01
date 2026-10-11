@@ -1,86 +1,32 @@
-# GitHub Actions → Cloud Run encoder IAM
+# UBAgen encoder migration: no Cloud Run Job IAM
 
-This workflow lets the repository repair the encoder Job's runtime execution binding without storing a Google service-account key in GitHub. It uses Workload Identity Federation (WIF).
+## Goal
 
-**It does not bypass Google Cloud IAM.** A project administrator must perform the one-time bootstrap below. The GitHub Actions deployer identity is deliberately limited to reading/updating Cloud Run Job IAM policies; it is not a general project owner.
+Remove the runtime dependency on calling the Cloud Run Jobs API (jobs.run / run.jobs.run). The /encode request uses a direct HTTP(S) media URL and executes through the existing UBAgen service's worker mode instead of dispatching to ubagen-encoder-worker.
 
-## One-time setup (run as a Google Cloud administrator)
+## Repository findings
 
-Open Cloud Shell while signed in to an account that can create Workload Identity pools/providers, service accounts, custom roles, and IAM bindings. Set the project ID to the project that contains the encoder Job:
+- encoder_worker.py owns slash-command registration, persistent job dispatch, the synchronous encode pipeline, FFmpeg progress reporting, and GCS upload verification.
+- dispatch_encode_job_background() currently claims a job and calls trigger_cloud_run_job_execution() when a Cloud Run Job is configured. A 403 marks the job failed before the worker starts.
+- health_api.py currently validates magnet as a torrent magnet in POST /api/jobs.
+- job_store.py already stores jobs persistently and supports Firestore/GCS, so that data model can be retained.
 
-```bash
-export PROJECT_ID="ais-europe-west2-4471ce5b85c94"
-export REGION="europe-west2"
-export REPO="ubaparator/UBAgen-v0.01"
-export POOL_ID="ubagen-github-pool"
-export PROVIDER_ID="github-provider"
-export DEPLOYER_SA="ubagen-github-deployer"
+## Planned rollout (PR #12)
 
-gcloud config set project "$PROJECT_ID"
-export PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+1. Add an explicit UBAGEN_ENCODER_MODE=service_worker mode that skips Cloud Run Job API calls and launches an isolated local worker process in the same service container.
+2. Accept direct HTTP/HTTPS video URLs in /encode and POST /api/jobs, while preserving magnet URI compatibility.
+3. Keep job claims, progress updates, FFmpeg behavior, Firestore job state, GCS output verification, and 7200-second output retention.
+4. Add tests for URL validation and service-worker dispatch selection.
+5. Leave the old Cloud Run Job mode available as a backwards-compatible fallback until the service-worker mode is explicitly configured and tested.
 
-gcloud services enable iam.googleapis.com run.googleapis.com --project="$PROJECT_ID"
+## Operational limits
 
-gcloud iam workload-identity-pools create "$POOL_ID" \
-  --project="$PROJECT_ID" \
-  --location="global" \
-  --display-name="UBAgen GitHub Actions"
+This removes the Cloud Run Job execution IAM dependency, not all IAM. The running service account still needs existing Firestore and GCS permissions. The service-worker mode shares the service's CPU, RAM, and ephemeral disk with Discord/API traffic. A service restart can interrupt an active worker; use a bounded worker concurrency limit and persist state so interrupted jobs can be retried. For production reliability, verify that the chosen Cloud Run Service CPU allocation and request/instance lifecycle support background work before enabling this mode.
 
-gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
-  --project="$PROJECT_ID" \
-  --location="global" \
-  --workload-identity-pool="$POOL_ID" \
-  --display-name="UBAgen repository" \
-  --issuer-uri="https://token.actions.githubusercontent.com" \
-  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
-  --attribute-condition="assertion.repository == '$REPO'"
+## Validation workflow
 
-gcloud iam service-accounts create "$DEPLOYER_SA" \
-  --project="$PROJECT_ID" \
-  --display-name="UBAgen GitHub IAM deployer"
+The accompanying GitHub Actions workflow runs the Python test suite, frontend build, and TypeScript check. It does not modify Google Cloud IAM or deploy to Cloud Run.
 
-# A small custom role for only the IAM policy operations the workflow needs.
-gcloud iam roles create ubagenJobIamEditor \
-  --project="$PROJECT_ID" \
-  --title="UBAgen Cloud Run Job IAM editor" \
-  --description="Read and update Cloud Run Job IAM policies for UBAgen automation" \
-  --permissions="run.jobs.getIamPolicy,run.jobs.setIamPolicy" \
-  --stage="GA"
+## Rollback
 
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$DEPLOYER_SA@$PROJECT_ID.iam.gserviceaccount.com" \
-  --role="projects/$PROJECT_ID/roles/ubagenJobIamEditor"
-
-gcloud iam service-accounts add-iam-policy-binding \
-  "$DEPLOYER_SA@$PROJECT_ID.iam.gserviceaccount.com" \
-  --project="$PROJECT_ID" \
-  --role="roles/iam.workloadIdentityUser" \
-  --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/attribute.repository/$REPO"
-
-echo "WIF provider: projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/providers/$PROVIDER_ID"
-echo "Deployer service account: $DEPLOYER_SA@$PROJECT_ID.iam.gserviceaccount.com"
-```
-
-If any command fails, stop and resolve that error with the project administrator before continuing. Do not paste service-account keys or other credentials into GitHub.
-
-## Configure GitHub repository variables
-
-In GitHub, open **Settings → Secrets and variables → Actions → Variables** for this repository and add these repository variables (they are identifiers, not secrets):
-
-| Variable | Value |
-|---|---|
-| `GCP_PROJECT_ID` | `ais-europe-west2-4471ce5b85c94` |
-| `GCP_REGION` | `europe-west2` |
-| `GCP_WORKLOAD_IDENTITY_PROVIDER` | The full `WIF provider` resource printed above |
-| `GCP_DEPLOYER_SERVICE_ACCOUNT` | The full `Deployer service account` email printed above |
-| `UBAGEN_RUNTIME_SERVICE_ACCOUNT` | `ais-sandbox@ais-europe-west2-4471ce5b85c94.iam.gserviceaccount.com` |
-| `UBAGEN_CLOUD_RUN_JOB_NAME` | `ubagen-encoder-worker` |
-
-## Run the workflow
-
-1. Merge the pull request that adds `.github/workflows/repair-cloud-run-iam.yml`.
-2. Open **Actions → Repair Cloud Run encoder IAM → Run workflow**.
-3. Type `APPLY` into the confirmation field and start the workflow.
-4. Confirm the run succeeds, then retry an encode request in UBAgen.
-
-The workflow only adds `roles/run.jobsExecutor` to the runtime service account on the named Job. It does not deploy a new image or change the running bot. If the Job does not exist in the configured project/region, deployment must be completed separately first.
+Unset UBAGEN_ENCODER_MODE or set it to the existing cloud_run_job mode to return to the previous dispatcher. Do not delete the Cloud Run Job until the new mode has passed an end-to-end encode test.
