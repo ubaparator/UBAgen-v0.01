@@ -36,7 +36,7 @@ export function resolveRestartBotUrl(endpointUrl: string): string {
   }
 
   // Full HTTP(S) URL
-  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
     let parsed: URL;
     try {
       parsed = new URL(raw);
