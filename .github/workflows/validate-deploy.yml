@@ -63,5 +63,5 @@ jobs:
       - name: Build production Docker image
         run: |
           docker build --tag ubagen-ci-test .
-          docker run --rm ubagen-ci-test sh -c "aria2c --version >/dev/null && ffmpeg -version >/dev/null && ffprobe -version >/dev/null && python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker'"
+          docker run --rm ubagen-ci-test sh -c "aria2c --version >/dev/null && ffmpeg -version >/dev/null && ffprobe -version >/dev/null && python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker; cfg = job_store.discover_and_apply_runtime_config(); assert cfg[\"discovered\"][\"cloud_run_job_name\"] == \"ubagen-encoder-worker\"'"
 

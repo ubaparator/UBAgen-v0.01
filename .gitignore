@@ -20,3 +20,4 @@ video_outputs/
 *.ass
 *.sqlite3*
 
+bun.lock

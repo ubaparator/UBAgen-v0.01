@@ -58,6 +58,7 @@ from job_store import (
     JobNotFoundError,
     PersistentJobStore,
     detect_cloud_run_environment_details,
+    discover_and_apply_runtime_config,
     get_gcp_access_token,
     get_job_store,
     normalize_video_codec,
@@ -302,6 +303,7 @@ STAGE_LABELS_TR: dict[str, str] = {
     "uploading": "Google Cloud Storage'a Yükleniyor",
     "completed": "Tamamlandı (GCS Doğrulandı)",
     "failed": "Başarısız Oldu",
+    "cancelled": "İptal Edildi",
     "expired": "Süresi Doldu (GCS'den Silindi)",
 }
 
@@ -645,6 +647,8 @@ def format_discord_job_message(job: EncodeJob) -> str:
     header_icon = (
         "✅"
         if job.status == "completed"
+        else "🛑"
+        if job.status == "cancelled"
         else "❌"
         if job.status == "failed"
         else "⌛"
@@ -671,6 +675,8 @@ def format_discord_job_message(job: EncodeJob) -> str:
             f"🔗 **İndirme Bağlantısı (Yalnızca <@{job.user_id}> için yetkili):**\n{job.download_url}",
             "⚠️ *Not: Bu bağlantı 7200 saniye (2 saat) sonra otomatik olarak iptal edilir ve video Google Cloud Storage'dan kalıcı olarak silinir.*",
         ])
+    elif job.status == "cancelled":
+        lines.append(f"🛑 **Durum:** {job.error or 'İşlem iptal edildi.'}")
     elif job.status == "failed" or job.error:
         lines.append(f"❌ **Hata:** {job.error or 'Bilinmeyen işlem hatası.'}")
     elif job.status == "expired" or job.deleted_from_gcs:
@@ -794,15 +800,17 @@ def execute_encode_job_sync(
     9. Clean up temporary worker directory in `finally:`.
     """
     store = job_store or get_job_store()
-    job = store.get_job(job_id)
-    if job is None:
-        logger.error(
-            "Encode job '%s' was not found in the persistent job store (backend=%s).",
-            job_id,
-            store.get_backend_status().get("backend_type"),
-        )
-        raise JobNotFoundError(f"Encode işi kalıcı veritabanında bulunamadı: {job_id}")
+    task_attempt = 0
+    with suppress(ValueError):
+        task_attempt = int(os.getenv("CLOUD_RUN_TASK_ATTEMPT", "0") or 0)
 
+    should_run, job, prep_state = store.prepare_job_for_worker_execution(
+        job_id,
+        is_task_retry=(task_attempt > 0),
+    )
+    if not should_run:
+        logger.info("Job '%s' skipped worker execution (state=%s).", job_id, prep_state)
+        return job
 
     execution_name = (
         os.getenv("CLOUD_RUN_EXECUTION", "").strip()
@@ -816,6 +824,13 @@ def execute_encode_job_sync(
         if progress_callback is not None:
             with suppress(Exception):
                 progress_callback(updated_job)
+
+    def _abort_if_cancelled() -> Optional[EncodeJob]:
+        if store.is_job_cancelled(job_id):
+            cancelled_job = store.get_job(job_id) or job
+            _emit_update(cancelled_job)
+            return cancelled_job
+        return None
 
     # Validate magnet URI and codec before starting heavy work
     valid_mag, mag_or_err = validate_magnet_uri(job.magnet)
@@ -864,6 +879,9 @@ def execute_encode_job_sync(
     encode_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        if cancelled := _abort_if_cancelled():
+            return cancelled
+
         # STAGE 1: Downloading torrent via aria2c
         job = store.update_job_progress(
             job_id,
@@ -885,6 +903,9 @@ def execute_encode_job_sync(
                 timeout=download_timeout,
                 check=False,
             )
+
+        if cancelled := _abort_if_cancelled():
+            return cancelled
 
         videos = find_video_files(download_dir)
         if dl_res.returncode != 0 and not videos:
@@ -978,6 +999,9 @@ def execute_encode_job_sync(
             if sub_suffix == ".srt":
                 clean_srt_file(subtitle_file)
 
+        if cancelled := _abort_if_cancelled():
+            return cancelled
+
         # STAGE 3: Optional Intro Preparation
         intro_file: Optional[Path] = None
         intro_meta: Optional[dict[str, Any]] = None
@@ -1010,6 +1034,9 @@ def execute_encode_job_sync(
             if total_Duration := total_duration_sec:
                 if main_fps > 0:
                     total_frames = max(1, int(round(total_Duration * main_fps)))
+
+        if cancelled := _abort_if_cancelled():
+            return cancelled
 
         # STAGE 4: Encoding Video (libx264 / libx265) with real-time progress parsing
         safe_stem = re.sub(r"[^\w.\-]+", "_", source_video.stem).strip("._")[:60] or "video"
@@ -1064,6 +1091,10 @@ def execute_encode_job_sync(
                     progress_kv[k.strip()] = v.strip()
 
                     if k.strip() == "progress":
+                        if cancelled := _abort_if_cancelled():
+                            proc.kill()
+                            return cancelled
+
                         parsed = parse_ffmpeg_progress_block(
                             progress_kv,
                             total_frames=total_frames,
@@ -1095,6 +1126,9 @@ def execute_encode_job_sync(
                     with suppress(Exception):
                         proc.kill()
                 raise
+
+        if cancelled := _abort_if_cancelled():
+            return cancelled
 
         if retcode != 0 or not encoded_output_path.is_file() or encoded_output_path.stat().st_size == 0:
             err_tail = sanitize_process_output(stderr_out or "")
@@ -1152,6 +1186,8 @@ def execute_encode_job_sync(
         _emit_update(failed)
         return failed or job
     except Exception as exc:
+        if cancelled := _abort_if_cancelled():
+            return cancelled
         safe_err = sanitize_process_output(str(exc), max_chars=500) or "Encode işlemi sırasında beklenmeyen hata oluştu."
         logger.exception("Encode job %s failed: %s", job_id, safe_err)
         failed = store.mark_job_failed(job_id, safe_err)
@@ -1174,12 +1210,15 @@ def trigger_cloud_run_job_execution(job_id: str) -> dict[str, Any]:
     """
     Trigger a dedicated Google Cloud Run Job execution for `job_id` using the
     Cloud Run v2 REST API (`projects.locations.jobs.run`), passing `UBAGEN_JOB_ID`.
-    Requires `UBAGEN_CLOUD_RUN_JOB_NAME` and `GOOGLE_CLOUD_PROJECT` / `UBAGEN_GCP_PROJECT_ID`.
+    Auto-discovers `UBAGEN_CLOUD_RUN_JOB_NAME`, `UBAGEN_GCP_PROJECT_ID`, and `UBAGEN_GCP_REGION`
+    when not explicitly set.
     """
+    discover_and_apply_runtime_config()
     env_details = detect_cloud_run_environment_details()
     job_name = env_details.get("cloud_run_job_name")
     project_id = env_details.get("project_id")
     region = env_details.get("region") or "europe-west2"
+    sa_email = env_details.get("service_account_email") or "varsayılan servis hesabı"
 
     if not job_name or not project_id:
         return {
@@ -1235,10 +1274,23 @@ def trigger_cloud_run_job_execution(job_id: str) -> dict[str, Any]:
     except urllib.error.HTTPError as exc:
         err_body = sanitize_process_output(exc.read().decode("utf-8", errors="replace"), max_chars=300)
         logger.warning("Cloud Run Job API HTTP %s error: %s", exc.code, err_body)
+        if exc.code == 403:
+            reason = (
+                f"Cloud Run Job (`{job_name}`, proje: `{project_id}`, bölge: `{region}`) tetikleme yetkisi reddedildi (HTTP 403). "
+                f"`{sa_email}` servis hesabına `roles/run.developer` rolü verilmelidir. Detay: {err_body}"
+            )
+        elif exc.code == 404:
+            reason = (
+                f"Cloud Run Job (`{job_name}`) `{project_id}` projesinin `{region}` bölgesinde bulunamadı (HTTP 404). "
+                f"`cloud-run-encoder-job.yaml` ile Job dağıtımını tamamlayın. Detay: {err_body}"
+            )
+        else:
+            reason = f"Cloud Run Job API HTTP {exc.code}: {err_body}"
         return {
             "dispatched": False,
             "mode": "cloud_run_job_error",
-            "reason": f"Cloud Run Job API HTTP {exc.code}: {err_body}",
+            "http_status": exc.code,
+            "reason": reason,
         }
     except Exception as exc:
         safe_exc = sanitize_process_output(str(exc), max_chars=300)
@@ -1292,17 +1344,27 @@ def _stream_worker_subprocess_logs(proc: subprocess.Popen[str], job_id: str) -> 
             proc.stdout.close()
 
 
-def dispatch_encode_job_background(job_id: str) -> dict[str, Any]:
+def dispatch_encode_job_background(job_id: str, *, allow_retry: bool = False) -> dict[str, Any]:
     """
     Dispatch `job_id` to the dedicated Google Cloud Run Job worker (`UBAGEN_CLOUD_RUN_JOB_NAME`).
+    - Prevents launching the same `job_id` multiple times concurrently via `acquire_dispatch_claim`.
+    - Auto-discovers `UBAGEN_CLOUD_RUN_JOB_NAME`, `UBAGEN_GCP_PROJECT_ID`, and `UBAGEN_GCP_REGION`
+      from `cloud-run-encoder-job.yaml` and the GCP Metadata Server.
     - Never falls back to running heavy encodes inside the production Cloud Run Service instance.
-    - When local dev worker mode is explicitly enabled (`UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK=true`
-      or `ENVIRONMENT=development`), spawns an isolated subprocess with sanitized log capture
-      (never `subprocess.DEVNULL`).
     """
     store = get_job_store()
+    can_dispatch, claimed_job, claim_reason = store.acquire_dispatch_claim(job_id, allow_retry=allow_retry)
+    if not can_dispatch:
+        return {
+            "dispatched": False,
+            "mode": "duplicate_or_terminal",
+            "reason": claim_reason,
+            "worker_execution_name": claimed_job.worker_execution_name if claimed_job else None,
+        }
+
+    discover_and_apply_runtime_config()
     env_details = detect_cloud_run_environment_details()
-    if env_details.get("cloud_run_job_configured"):
+    if env_details.get("cloud_run_job_configured") and not _is_local_worker_fallback_allowed():
         res = trigger_cloud_run_job_execution(job_id)
         if res.get("dispatched"):
             return res
@@ -1310,9 +1372,19 @@ def dispatch_encode_job_background(job_id: str) -> dict[str, Any]:
         store.mark_job_failed(job_id, fail_reason)
         return res
 
+    if env_details.get("cloud_run_job_configured") and os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip():
+        # If running on Cloud Run or when Cloud Run Job API token is available, dispatch via Cloud Run Job
+        if os.getenv("K_SERVICE", "").strip() or os.getenv("UBAGEN_FORCE_CLOUD_RUN_JOB", "").strip().lower() in ("1", "true", "yes"):
+            res = trigger_cloud_run_job_execution(job_id)
+            if res.get("dispatched"):
+                return res
+            fail_reason = f"Cloud Run Job başlatılamadı: {res.get('reason')}"
+            store.mark_job_failed(job_id, fail_reason)
+            return res
+
     if not _is_local_worker_fallback_allowed():
         reason = (
-            "Cloud Run Job (`UBAGEN_CLOUD_RUN_JOB_NAME`) yapılandırılmamış. "
+            "Cloud Run Job (`UBAGEN_CLOUD_RUN_JOB_NAME`) veya GCP proje kimliği (`UBAGEN_GCP_PROJECT_ID`) doğrulanamadı. "
             "Üretim ortamında bot/web servisinin kararlılığını korumak için yerel worker fallback devre dışıdır."
         )
         store.mark_job_failed(job_id, reason)
@@ -1415,7 +1487,37 @@ async def submit_encode_job_from_interaction(
             return None
 
     store = get_job_store()
+    sub_hint = (
+        getattr(altyazi_attachment, "filename", None)
+        if altyazi_attachment is not None
+        else ((altyazi_url or "").strip() or None)
+    )
+    intro_hint = (
+        getattr(intro_attachment, "filename", None)
+        if intro_attachment is not None
+        else ((intro_url or "").strip() or None)
+    )
+
     try:
+        active_dup = await asyncio.to_thread(
+            store.find_active_duplicate_job,
+            user_id=user_id,
+            magnet=mag_or_err,
+            codec=canonical_codec,
+            subtitle_lang=lang_or_err,
+            subtitle_source=sub_hint,
+            intro_source=intro_hint,
+        )
+        if active_dup is not None:
+            if hasattr(interaction, "edit_original_response"):
+                dup_msg = (
+                    f"ℹ️ **Aynı parametrelerle devam eden aktif bir encode işiniz zaten var (`{active_dup.job_id}`).**\n"
+                    f"Aynı işin birden fazla kez başlatılması engellendi; mevcut işinizin durumu aşağıdadır:\n\n"
+                    + format_discord_job_message(active_dup)
+                )
+                await interaction.edit_original_response(content=dup_msg)
+            return active_dup
+
         job = await asyncio.to_thread(
             store.create_job,
             user_id=user_id,

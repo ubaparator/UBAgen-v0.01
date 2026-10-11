@@ -44,6 +44,7 @@ import uuid
 logger = logging.getLogger("ubagen.jobs")
 
 DEFAULT_RETENTION_SECONDS = 7200  # 2 hours (7200 seconds) strict output retention
+DEFAULT_CLOUD_RUN_JOB_NAME = "ubagen-encoder-worker"
 SUPPORTED_CODECS: dict[str, str] = {
     "h264": "libx264",
     "libx264": "libx264",
@@ -64,6 +65,7 @@ VALID_STAGES = {
     "uploading",
     "completed",
     "failed",
+    "cancelled",
     "expired",
 }
 
@@ -74,6 +76,31 @@ class FirestoreUnavailableError(RuntimeError):
 
 class JobNotFoundError(KeyError):
     """Raised when a requested `job_id` does not exist in the authoritative job store."""
+
+
+def compute_job_idempotency_key(
+    *,
+    user_id: str,
+    magnet: str,
+    codec: str = "h264",
+    subtitle_lang: str = "tur",
+    subtitle_source: Optional[str] = None,
+    intro_source: Optional[str] = None,
+) -> str:
+    """
+    Compute a deterministic SHA-256 idempotency key for an encode request so identical
+    in-flight requests from the same user are deduplicated instead of launched multiple times.
+    """
+    clean_user = (user_id or "").strip()
+    clean_magnet = (magnet or "").strip()
+    btih_match = re.search(r"xt=urn:btih:([A-Za-z0-9]{32,40})", clean_magnet, flags=re.IGNORECASE)
+    magnet_canonical = btih_match.group(1).lower() if btih_match else clean_magnet.lower()
+    _, canonical_codec, _ = normalize_video_codec(codec)
+    clean_lang = (subtitle_lang or "tur").strip().lower()
+    sub_part = Path(str(subtitle_source or "")).name if subtitle_source else ""
+    intro_part = Path(str(intro_source or "")).name if intro_source else ""
+    raw = f"{clean_user}|{magnet_canonical}|{canonical_codec}|{clean_lang}|{sub_part}|{intro_part}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 
@@ -151,6 +178,40 @@ def get_gcp_access_token() -> Optional[str]:
     return None
 
 
+def _discover_job_name_from_yaml() -> Optional[str]:
+    """Read canonical Cloud Run Job name from `cloud-run-encoder-job.yaml` in the repository."""
+    candidates = [
+        Path(__file__).resolve().parent / "cloud-run-encoder-job.yaml",
+        Path("cloud-run-encoder-job.yaml").resolve(),
+    ]
+    for yaml_path in candidates:
+        if yaml_path.is_file():
+            with suppress(Exception):
+                content = yaml_path.read_text(encoding="utf-8", errors="replace")
+                m = re.search(r"metadata:\s*\n(?:\s*#.*\n)*\s*name:\s*([A-Za-z0-9_-]+)", content)
+                if m and m.group(1).strip():
+                    return m.group(1).strip()
+    return None
+
+
+def discover_cloud_run_job_name(project_id: Optional[str] = None, region: Optional[str] = None) -> str:
+    """
+    Determine the Cloud Run Job worker name from:
+    1. Explicit `UBAGEN_CLOUD_RUN_JOB_NAME` or `CLOUD_RUN_JOB` environment variable
+    2. `cloud-run-encoder-job.yaml` (`metadata.name`)
+    3. Canonical default `ubagen-encoder-worker`
+    """
+    explicit = os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip() or os.getenv("CLOUD_RUN_JOB", "").strip()
+    if explicit:
+        return explicit
+    if os.getenv("UBAGEN_DISABLE_JOB_AUTODISCOVERY", "").strip().lower() in ("1", "true", "yes"):
+        return ""
+    from_yaml = _discover_job_name_from_yaml()
+    if from_yaml:
+        return from_yaml
+    return DEFAULT_CLOUD_RUN_JOB_NAME
+
+
 def detect_cloud_run_environment_details() -> dict[str, Any]:
     """
     Inspect current Cloud Run service settings, service account, region, project ID,
@@ -192,7 +253,7 @@ def detect_cloud_run_environment_details() -> dict[str, Any]:
         or os.getenv("SHARED_APP_URL", "").strip()
         or None
     )
-    cloud_run_job_name = os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip() or None
+    cloud_run_job_name = discover_cloud_run_job_name(project_id=project_id, region=region) or None
     gcs_bucket = os.getenv("UBAGEN_GCS_BUCKET", "").strip() or os.getenv("GCS_BUCKET_NAME", "").strip() or None
     firestore_collection = os.getenv("UBAGEN_FIRESTORE_COLLECTION", "ubagen_encode_jobs").strip() or "ubagen_encode_jobs"
     firestore_db = os.getenv("UBAGEN_FIRESTORE_DATABASE", "(default)").strip() or "(default)"
@@ -215,6 +276,7 @@ def detect_cloud_run_environment_details() -> dict[str, Any]:
         "cloud_run_job_configured": bool(cloud_run_job_name and project_id),
         "gcs_bucket": gcs_bucket,
         "gcs_configured": bool(gcs_bucket),
+        "recommended_gcs_bucket": f"{project_id}-ubagen-media" if project_id else "ubagen-media",
         "firestore_enabled": firestore_enabled,
         "firestore_database": firestore_db,
         "firestore_collection": firestore_collection,
@@ -253,7 +315,9 @@ def discover_and_apply_runtime_config() -> dict[str, Any]:
 
     _apply_if_missing("UBAGEN_GCP_PROJECT_ID", details.get("project_id"))
     _apply_if_missing("UBAGEN_GCP_REGION", details.get("region"))
+    _apply_if_missing("UBAGEN_SERVICE_ACCOUNT_EMAIL", details.get("service_account_email"))
     _apply_if_missing("UBAGEN_PUBLIC_BASE_URL", details.get("public_base_url"))
+    _apply_if_missing("UBAGEN_CLOUD_RUN_JOB_NAME", details.get("cloud_run_job_name"))
     _apply_if_missing("UBAGEN_FIRESTORE_COLLECTION", details.get("firestore_collection"))
     _apply_if_missing("UBAGEN_FIRESTORE_DATABASE", details.get("firestore_database"))
     _apply_if_missing("UBAGEN_ENCODE_RETENTION_SECONDS", str(details.get("retention_seconds") or DEFAULT_RETENTION_SECONDS))
@@ -326,6 +390,11 @@ class EncodeJob:
     worker_execution_name: Optional[str] = None
     staged_gcs_objects: list[str] = field(default_factory=list)
     command_source: str = "encode"
+    idempotency_key: Optional[str] = None
+    retry_count: int = 0
+    max_retries: int = 1
+    cancelled_at: Optional[float] = None
+    cancelled_by: Optional[str] = None
 
 
     def is_expired(self, now: Optional[float] = None) -> bool:
@@ -457,6 +526,11 @@ class EncodeJob:
             "deleted_at_iso": _iso_utc(self.deleted_at),
             "worker_execution_name": self.worker_execution_name,
             "command_source": self.command_source,
+            "idempotency_key": self.idempotency_key,
+            "retry_count": int(self.retry_count or 0),
+            "max_retries": int(self.max_retries or 1),
+            "cancelled_at": self.cancelled_at,
+            "cancelled_at_iso": _iso_utc(self.cancelled_at),
         }
 
 
@@ -1130,6 +1204,15 @@ class PersistentJobStore:
         now = time.time()
         job_id = f"job_{int(now)}_{uuid.uuid4().hex[:8]}"
         ret_sec = retention_seconds if retention_seconds is not None else get_configured_retention_seconds()
+        clean_lang = (subtitle_lang or "tur").strip().lower()
+        idem_key = compute_job_idempotency_key(
+            user_id=clean_user,
+            magnet=magnet.strip(),
+            codec=canonical_codec,
+            subtitle_lang=clean_lang,
+            subtitle_source=subtitle_source,
+            intro_source=intro_source,
+        )
 
         job = EncodeJob(
             job_id=job_id,
@@ -1143,7 +1226,7 @@ class PersistentJobStore:
             magnet=magnet.strip(),
             codec=canonical_codec,
             video_encoder=video_encoder,
-            subtitle_lang=(subtitle_lang or "tur").strip().lower(),
+            subtitle_lang=clean_lang,
             subtitle_source=subtitle_source,
             intro_source=intro_source,
             has_intro=bool(intro_source and str(intro_source).strip()),
@@ -1160,8 +1243,177 @@ class PersistentJobStore:
             retention_seconds=ret_sec,
             staged_gcs_objects=list(staged_gcs_objects or []),
             command_source=command_source,
+            idempotency_key=idem_key,
         )
         return self.save_job(job)
+
+    def find_active_duplicate_job(
+        self,
+        *,
+        user_id: str,
+        magnet: str,
+        codec: str = "h264",
+        subtitle_lang: str = "tur",
+        subtitle_source: Optional[str] = None,
+        intro_source: Optional[str] = None,
+        max_age_seconds: float = 3600.0,
+    ) -> Optional[EncodeJob]:
+        """
+        Check if `user_id` already has an active (`queued` or `running`) encode job
+        with the exact same parameters so the same job is not launched multiple times.
+        """
+        clean_user = (user_id or "").strip()
+        if not clean_user:
+            return None
+        target_key = compute_job_idempotency_key(
+            user_id=clean_user,
+            magnet=magnet,
+            codec=codec,
+            subtitle_lang=subtitle_lang,
+            subtitle_source=subtitle_source,
+            intro_source=intro_source,
+        )
+        now = time.time()
+        user_jobs = self.list_jobs(user_id=clean_user, limit=30)
+        for existing in user_jobs:
+            if existing.status not in ("queued", "running"):
+                continue
+            if (now - float(existing.updated_at or existing.created_at or 0.0)) > max_age_seconds:
+                continue
+            existing_key = existing.idempotency_key or compute_job_idempotency_key(
+                user_id=existing.user_id,
+                magnet=existing.magnet,
+                codec=existing.codec,
+                subtitle_lang=existing.subtitle_lang,
+                subtitle_source=existing.subtitle_source,
+                intro_source=existing.intro_source,
+            )
+            if existing_key == target_key:
+                return existing
+        return None
+
+    def acquire_dispatch_claim(
+        self,
+        job_id: str,
+        *,
+        allow_retry: bool = False,
+    ) -> tuple[bool, Optional[EncodeJob], str]:
+        """
+        Prevent the same `job_id` from being dispatched multiple times concurrently.
+        Returns `(can_dispatch, job, reason)`.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return False, None, "Job bulunamadı."
+        if job.status in ("completed", "cancelled", "expired"):
+            return False, job, f"İş zaten sonlanmış durumda (`{job.status}`); tekrar başlatılamaz."
+        if job.worker_execution_name and job.status in ("queued", "running") and not allow_retry:
+            return (
+                False,
+                job,
+                f"İş (`{job.job_id}`) zaten aktif bir worker üzerinde çalışıyor (`{job.worker_execution_name}`).",
+            )
+        if allow_retry and job.status == "failed":
+            if int(job.retry_count or 0) >= int(job.max_retries or 1):
+                return False, job, f"Maksimum yeniden deneme sınırına ({job.max_retries}) ulaşıldı."
+            job.retry_count = int(job.retry_count or 0) + 1
+            job.status = "queued"
+            job.stage = "queued"
+            job.percent = 0.0
+            job.processed_frames = 0
+            job.fps = 0.0
+            job.eta_seconds = None
+            job.error = None
+            job.worker_execution_name = None
+            job = self.save_job(job)
+        return True, job, "OK"
+
+    def prepare_job_for_worker_execution(
+        self,
+        job_id: str,
+        *,
+        is_task_retry: bool = False,
+    ) -> tuple[bool, EncodeJob, str]:
+        """
+        Validate and prepare `job_id` before starting heavy torrent/FFmpeg execution:
+        - Raises `JobNotFoundError` if `job_id` does not exist.
+        - Refuses execution if the job is already `completed` or `cancelled`.
+        - Safely resets transient progress counters if recovering from a previous attempt (`retry_count += 1`).
+        """
+        clean_id = (job_id or "").strip()
+        if not clean_id:
+            raise JobNotFoundError("Job ID boş olamaz.")
+        job = self.get_job(clean_id)
+        if job is None:
+            raise JobNotFoundError(f"Encode işi bulunamadı: {clean_id}")
+
+        if job.status == "completed" and job.gcs_upload_verified:
+            return False, job, "already_completed"
+        if job.status == "cancelled" or job.stage == "cancelled":
+            return False, job, "cancelled"
+        if job.status == "expired" or job.stage == "expired":
+            return False, job, "expired"
+
+        # If recovering from a previous failed attempt or Cloud Run task retry, increment retry_count cleanly
+        if job.status == "failed" or is_task_retry or (job.started_at is not None and job.processed_frames > 0):
+            job.retry_count = int(job.retry_count or 0) + 1
+            job.percent = 0.0
+            job.processed_frames = 0
+            job.fps = 0.0
+            job.eta_seconds = None
+            job.error = None
+
+        job.started_at = time.time()
+        job.status = "running"
+        job.stage = "downloading"
+        job = self.save_job(job)
+        return True, job, "ready"
+
+    def cancel_job(
+        self,
+        job_id: str,
+        *,
+        requester_user_id: Optional[str] = None,
+        is_admin: bool = False,
+        reason: Optional[str] = None,
+    ) -> tuple[bool, Optional[EncodeJob], str]:
+        """
+        Cancel a queued or running job, verifying user ownership (unless `is_admin=True`),
+        and clean up any temporary GCS staging objects.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return False, None, "Encode işi bulunamadı."
+        if not is_admin:
+            clean_req = (requester_user_id or "").strip()
+            if not clean_req or not hmac.compare_digest(clean_req.encode("utf-8"), job.user_id.encode("utf-8")):
+                return False, job, "Bu encode işini yalnızca işi başlatan kullanıcı veya yönetici iptal edebilir."
+        if job.status in ("completed", "expired"):
+            return False, job, f"Tamamlanmış veya süresi dolmuş iş (`{job.status}`) iptal edilemez."
+        if job.status == "cancelled":
+            return True, job, "İş zaten iptal edilmiş."
+
+        now = time.time()
+        job.stage = "cancelled"
+        job.status = "cancelled"
+        job.eta_seconds = 0
+        job.download_url = None
+        job.gcs_upload_verified = False
+        job.cancelled_at = now
+        job.cancelled_by = (requester_user_id or "admin").strip()
+        job.error = (reason or "İşlem kullanıcı tarafından iptal edildi.").strip()
+        with suppress(Exception):
+            self.gcs.cleanup_job_staging_objects(job)
+        saved = self.save_job(job)
+        return True, saved, "İşlem iptal edildi."
+
+    def is_job_cancelled(self, job_id: str) -> bool:
+        """Return True if `job_id` has been marked as `cancelled`."""
+        with suppress(Exception):
+            job = self.get_job(job_id)
+            if job is not None and (job.status == "cancelled" or job.stage == "cancelled"):
+                return True
+        return False
 
     def get_job(self, job_id: str) -> Optional[EncodeJob]:
         """

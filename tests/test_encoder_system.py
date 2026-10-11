@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import json as json_mod
 import os
 from pathlib import Path
 import shutil
@@ -82,10 +83,18 @@ class TestClient:
     def get(self, url: str, headers: dict[str, str] | None = None) -> _AsgiResponse:
         return self._request("GET", url, headers=headers)
 
-    def post(self, url: str, json_body: dict | None = None, headers: dict[str, str] | None = None) -> _AsgiResponse:
-        raw = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
+    def post(
+        self,
+        url: str,
+        json_body: dict | None = None,
+        headers: dict[str, str] | None = None,
+        *,
+        json: dict | None = None,
+    ) -> _AsgiResponse:
+        payload = json if json is not None else json_body
+        raw = json_mod.dumps(payload).encode("utf-8") if payload is not None else b""
         hdrs = dict(headers or {})
-        if json_body is not None:
+        if payload is not None:
             hdrs.setdefault("content-type", "application/json")
         return self._request("POST", url, body=raw, headers=hdrs)
 
@@ -1098,6 +1107,99 @@ class TestEncoderSystem(unittest.TestCase):
         cfg = discover_and_apply_runtime_config()
         self.assertIn("discovered", cfg)
         self.assertEqual(cfg["discovered"]["retention_seconds"], 7200)
+        self.assertEqual(cfg["discovered"]["cloud_run_job_name"], "ubagen-encoder-worker")
+
+    # ------------------------------------------------------------------
+    # 14. Auto-Discovery, Duplicate Job Prevention, Safe Retry & Cancellation
+    # ------------------------------------------------------------------
+    def test_auto_discovery_duplicate_prevention_safe_retry_and_cancellation(self) -> None:
+        # 1. Auto-discovery resolves ubagen-encoder-worker from cloud-run-encoder-job.yaml
+        os.environ.pop("UBAGEN_CLOUD_RUN_JOB_NAME", None)
+        cfg = discover_and_apply_runtime_config()
+        self.assertEqual(cfg["discovered"]["cloud_run_job_name"], "ubagen-encoder-worker")
+        self.assertEqual(os.environ.get("UBAGEN_CLOUD_RUN_JOB_NAME"), "ubagen-encoder-worker")
+
+        # 2. Active duplicate job prevention in PersistentJobStore and POST /api/jobs
+        app = create_health_app()
+        client = TestClient(app)
+
+        res1 = client.post(
+            "/api/jobs",
+            json={
+                "user_id": "dup_user_42",
+                "magnet": SAMPLE_MAGNET,
+                "codec": "h264",
+                "subtitle_lang": "tur",
+                "dispatch": False,
+            },
+        )
+        self.assertEqual(res1.status_code, 201)
+        first_job_id = res1.json()["job"]["job_id"]
+        self.assertFalse(res1.json()["deduplicated"])
+
+        # Second identical request while first job is still queued returns existing active job (200 OK)
+        res2 = client.post(
+            "/api/jobs",
+            json={
+                "user_id": "dup_user_42",
+                "magnet": SAMPLE_MAGNET,
+                "codec": "h264",
+                "subtitle_lang": "tur",
+                "dispatch": False,
+            },
+        )
+        self.assertEqual(res2.status_code, 200)
+        self.assertTrue(res2.json()["deduplicated"])
+        self.assertEqual(res2.json()["job"]["job_id"], first_job_id)
+
+        # 3. Single-dispatch lock prevents launching the same job_id twice while already claimed
+        self.store.update_job_progress(
+            first_job_id,
+            status="running",
+            stage="encoding",
+            worker_execution_name="cloud-run-exec-001",
+        )
+        can_disp, _, reason_disp = self.store.acquire_dispatch_claim(first_job_id, allow_retry=False)
+        self.assertFalse(can_disp)
+        self.assertIn("cloud-run-exec-001", reason_disp)
+
+        # 4. Job cancellation enforces user ownership and stops worker execution
+        unauth_cancel = client.post(
+            f"/api/jobs/{first_job_id}/cancel",
+            json={"user_id": "other_attacker_user"},
+        )
+        self.assertEqual(unauth_cancel.status_code, 403)
+
+        owner_cancel = client.post(
+            f"/api/jobs/{first_job_id}/cancel",
+            json={"user_id": "dup_user_42", "reason": "Kullanıcı testi iptal etti."},
+        )
+        self.assertEqual(owner_cancel.status_code, 200)
+        self.assertEqual(owner_cancel.json()["job"]["status"], "cancelled")
+        self.assertEqual(owner_cancel.json()["job"]["stage"], "cancelled")
+
+        # Worker invoked on a cancelled job must skip execution immediately without running aria2c/ffmpeg
+        skipped_cancelled = execute_encode_job_sync(first_job_id, job_store=self.store)
+        self.assertEqual(skipped_cancelled.status, "cancelled")
+
+        # 5. Safe retry on failed job resets transient progress and increments retry_count
+        retry_job = self.store.create_job(user_id="retry_user_99", magnet=SAMPLE_MAGNET, codec="h264")
+        self.store.update_job_progress(
+            retry_job.job_id,
+            stage="encoding",
+            status="running",
+            percent=60.0,
+            processed_frames=600,
+        )
+        self.store.mark_job_failed(retry_job.job_id, "Geçici ağ kesintisi")
+        can_retry, retried_obj, _ = self.store.acquire_dispatch_claim(retry_job.job_id, allow_retry=True)
+        self.assertTrue(can_retry)
+        assert retried_obj is not None
+        self.assertEqual(retried_obj.retry_count, 1)
+        self.assertEqual(retried_obj.status, "queued")
+        self.assertEqual(retried_obj.percent, 0.0)
+        self.assertEqual(retried_obj.processed_frames, 0)
+        self.assertIsNone(retried_obj.error)
 
 
 if __name__ == "__main__":

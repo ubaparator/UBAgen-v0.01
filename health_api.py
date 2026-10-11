@@ -468,7 +468,29 @@ def create_health_app(
             )
 
         store = get_job_store()
+        force_new = bool(body.get("force_new", False))
         try:
+            if not force_new:
+                active_dup = await asyncio.to_thread(
+                    store.find_active_duplicate_job,
+                    user_id=user_id,
+                    magnet=mag_or_err,
+                    codec=canonical_codec,
+                    subtitle_lang=lang_or_err,
+                    subtitle_source=subtitle_source,
+                    intro_source=intro_source,
+                )
+                if active_dup is not None:
+                    return JSONResponse(
+                        content={
+                            "status": "existing_active_job",
+                            "deduplicated": True,
+                            "job": active_dup.to_public_dict(requester_user_id=user_id),
+                        },
+                        status_code=200,
+                        headers={"Cache-Control": "no-store"},
+                    )
+
             job = await asyncio.to_thread(
                 store.create_job,
                 user_id=user_id,
@@ -493,10 +515,76 @@ def create_health_app(
         return JSONResponse(
             content={
                 "status": "created",
+                "deduplicated": False,
                 "job": job.to_public_dict(requester_user_id=user_id),
                 "dispatch": dispatch_result,
             },
             status_code=201,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/jobs/{job_id}/cancel", summary="Cancel a Queued or Running Encode Job")
+    async def cancel_job_api(
+        job_id: str,
+        request: Request = None,
+        user_id: Optional[str] = None,
+        x_user_id: Optional[str] = Header(default=None),
+        authorization: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """Cancel a queued or running encode job (requires job owner `user_id` or admin token)."""
+        body: dict[str, Any] = {}
+        if request is not None:
+            with suppress(Exception):
+                body = await request.json()
+        requester = (
+            str(body.get("user_id") or "").strip()
+            or (x_user_id or "").strip()
+            or (user_id or "").strip()
+        )
+        reason = str(body.get("reason") or "").strip() or None
+        expected_admin = os.getenv("UBAGEN_ADMIN_TOKEN", "").strip()
+        auth_header = authorization
+        if not auth_header and request is not None and hasattr(request, "headers"):
+            auth_header = request.headers.get("authorization")
+        is_admin = bool(expected_admin and auth_header and verify_admin_token(auth_header, expected_admin))
+
+        store = get_job_store()
+        try:
+            ok, job, msg = await asyncio.to_thread(
+                store.cancel_job,
+                job_id,
+                requester_user_id=requester or None,
+                is_admin=is_admin,
+                reason=reason,
+            )
+        except FirestoreUnavailableError as exc:
+            return JSONResponse(
+                content={"status": "firestore_unavailable", "error": str(exc)},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if job is None:
+            return JSONResponse(
+                content={"error": msg},
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not ok:
+            code = 409 if job.status in ("completed", "expired") else 403
+            return JSONResponse(
+                content={"error": msg, "job": job.to_public_dict(requester_user_id=requester or None)},
+                status_code=code,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        return JSONResponse(
+            content={
+                "status": "cancelled",
+                "message": msg,
+                "job": job.to_public_dict(requester_user_id=requester or job.user_id),
+            },
+            status_code=200,
             headers={"Cache-Control": "no-store"},
         )
 
