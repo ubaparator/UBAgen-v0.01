@@ -195,6 +195,10 @@ def ensure_runtime_binaries(auto_install: bool = True) -> dict[str, dict[str, An
                 install_res = subprocess.run(
                     [
                         apt_get_path,
+                        "-o",
+                        "Dpkg::Options::=--force-confdef",
+                        "-o",
+                        "Dpkg::Options::=--force-confold",
                         "install",
                         "-y",
                         "--no-install-recommends",
@@ -269,12 +273,33 @@ def cleanup_stale_workdirs(base_dir: Optional[Path] = None) -> int:
     return removed
 
 
+def _is_public_ip_address(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True strictly if `ip_obj` (including any IPv4-mapped IPv6 address) is a public routable IP."""
+    mapped = getattr(ip_obj, "ipv4_mapped", None)
+    if mapped is not None:
+        return _is_public_ip_address(mapped)
+    if (
+        not ip_obj.is_global
+        or ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    ):
+        return False
+    return True
+
+
 def validate_video_source(source: str) -> tuple[bool, str]:
     """
     Accept a torrent magnet URI or a direct HTTP(S) media URL.
-    Reject local/private literal addresses to reduce SSRF risk when fetching user-supplied URLs.
+    Reject local/private literal addresses, metadata hosts, credentials, and non-HTTP schemes
+    to prevent SSRF when fetching user-supplied URLs.
     """
     raw = (source or "").strip()
+    if not raw:
+        return False, "Video kaynağı boş olamaz. Lütfen bir magnet bağlantısı veya doğrudan HTTP/HTTPS medya URL'si girin."
     if raw.lower().startswith("magnet:"):
         # Preserve the existing torrent validation and compatibility.
         return validate_magnet_uri(raw)
@@ -282,22 +307,70 @@ def validate_video_source(source: str) -> tuple[bool, str]:
         parsed = urlparse(raw)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             return False, "Video kaynağı magnet bağlantısı veya doğrudan HTTP/HTTPS medya URL'si olmalıdır."
-        if parsed.username or parsed.password:
+        if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
             return False, "Kimlik bilgisi içeren URL'ler kabul edilmiyor."
         host = parsed.hostname.rstrip(".").lower()
-        if host in {"localhost", "localhost.localdomain", "metadata.google.internal", "metadata"} or host.endswith(".localhost") or host.endswith(".local"):
+        if (
+            host in {"localhost", "localhost.localdomain", "metadata.google.internal", "metadata", "instance-data"}
+            or host.endswith(".localhost")
+            or host.endswith(".local")
+            or host.endswith(".internal")
+        ):
             return False, "Yerel ağ/metadata adresleri video kaynağı olarak kabul edilmiyor."
         try:
             ip = ipaddress.ip_address(host)
         except ValueError:
             ip = None
-        if ip is not None and not ip.is_global:
+        if ip is not None and not _is_public_ip_address(ip):
             return False, "Özel veya yerel IP adresleri video kaynağı olarak kabul edilmiyor."
         if any(ch.isspace() for ch in raw) or len(raw) > 4096:
             return False, "Video URL'si geçersiz veya çok uzun."
         return True, raw
     except Exception:
         return False, "Video kaynağı URL formatı geçersiz."
+
+
+def verify_url_resolved_ips(url: str) -> tuple[bool, str]:
+    """
+    Resolve the hostname of an HTTP(S) URL via DNS and verify that all resolved IPs are public
+    (mitigates DNS rebinding against internal/metadata addresses during worker download).
+    """
+    ok, val_or_err = validate_video_source(url)
+    if not ok:
+        return False, val_or_err
+    parsed = urlparse(val_or_err)
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if not host:
+        return False, "Video URL'sinde geçerli bir sunucu adı bulunamadı."
+    try:
+        ip_literal = ipaddress.ip_address(host)
+        if not _is_public_ip_address(ip_literal):
+            return False, "Özel veya yerel IP adresleri video kaynağı olarak kabul edilmiyor."
+        return True, val_or_err
+    except ValueError:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme.lower() == "https" else 80), type=socket.SOCK_STREAM)
+    except OSError:
+        return False, f"Video kaynağı sunucu adresi çözümlenemedi (`{host}`)."
+
+    if not infos:
+        return False, f"Video kaynağı sunucu adresi çözümlenemedi (`{host}`)."
+
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip_str = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False, "Çözümlenen IP adresi geçersiz."
+        if not _is_public_ip_address(ip_obj):
+            return False, "Güvenlik engeli: Video URL sunucusu özel veya yerel bir IP adresine çözümlendi."
+
+    return True, val_or_err
 
 
 def validate_magnet_uri(magnet: Optional[str]) -> tuple[bool, str]:

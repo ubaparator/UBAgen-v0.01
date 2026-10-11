@@ -194,6 +194,25 @@ async function runTests() {
     assert.equal(rStats.status, 200);
     const rHealth = await fetch(`${baseUrl}/health`);
     assert.equal(rHealth.status, 200);
+
+    // 3h. /api/discord/wake authentication and method checks
+    const wake405 = await fetch(`${baseUrl}/api/discord/wake`, { method: 'GET' });
+    assert.equal(wake405.status, 405);
+    const wake401 = await fetch(`${baseUrl}/api/discord/wake`, { method: 'POST' });
+    assert.equal(wake401.status, 401);
+    const wake202 = await fetch(`${baseUrl}/api/discord/wake`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer node-admin-secret',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ reason: 'node_test' }),
+    });
+    assert.equal(wake202.status, 202);
+
+    // 3i. /api/discord/interactions method check
+    const int405 = await fetch(`${baseUrl}/api/discord/interactions`, { method: 'GET' });
+    assert.equal(int405.status, 405);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

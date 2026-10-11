@@ -67,6 +67,8 @@ from stats import redact_sensitive_text
 from storage_manager import format_storage_bytes, get_storage_manager
 from subtitle_extract import (
     BITMAP_SUBTITLE_CODECS,
+    MAX_INPUT,
+    VIDEO_SUFFIXES,
     build_aria2c_command,
     build_ffmpeg_extract_command,
     clean_srt_file,
@@ -78,6 +80,7 @@ from subtitle_extract import (
     subtitle_format,
     validate_magnet_uri,
     validate_video_source,
+    verify_url_resolved_ips,
 )
 
 logger = logging.getLogger("ubagen.encoder")
@@ -778,6 +781,116 @@ def _materialize_input_file(
 
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Validate every HTTP redirect target against SSRF rules before following."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved_target = urllib.parse.urljoin(req.full_url, newurl)
+        ok_src, src_or_err = validate_video_source(resolved_target)
+        if not ok_src:
+            raise urllib.error.URLError(f"Güvenli olmayan yönlendirme engellendi: {src_or_err}")
+        ok_dns, dns_or_err = verify_url_resolved_ips(src_or_err)
+        if not ok_dns:
+            raise urllib.error.URLError(f"Güvenli olmayan yönlendirme hedefi engellendi: {dns_or_err}")
+        return super().redirect_request(req, fp, code, msg, headers, src_or_err)
+
+
+def download_http_video_source(
+    url: str,
+    dest_dir: Path,
+    timeout: int = 900,
+) -> subprocess.CompletedProcess[str]:
+    """
+    Safely download a direct HTTP/HTTPS video source into `dest_dir` with SSRF, DNS-rebinding,
+    redirect, and byte-size protections. Preserves or assigns a valid video file extension.
+    """
+    ok_src, clean_url_or_err = validate_video_source(url)
+    if not ok_src:
+        return subprocess.CompletedProcess(
+            args=["http-download", url],
+            returncode=1,
+            stdout="",
+            stderr=clean_url_or_err,
+        )
+
+    ok_dns, dns_or_err = verify_url_resolved_ips(clean_url_or_err)
+    if not ok_dns:
+        return subprocess.CompletedProcess(
+            args=["http-download", url],
+            returncode=1,
+            stdout="",
+            stderr=dns_or_err,
+        )
+
+    parsed = urllib.parse.urlparse(clean_url_or_err)
+    raw_name = Path(urllib.parse.unquote(parsed.path or "")).name.strip()
+    ext = Path(raw_name).suffix.lower() if raw_name else ""
+    stem = Path(raw_name).stem if raw_name else "source_video"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")[:60] or "source_video"
+
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    req = urllib.request.Request(
+        clean_url_or_err,
+        headers={"User-Agent": "UBAgen-EncoderWorker/1.0"},
+    )
+    try:
+        with opener.open(req, timeout=min(float(timeout), 300.0)) as resp:
+            if ext not in VIDEO_SUFFIXES:
+                ct = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                mime_ext_map = {
+                    "video/mp4": ".mp4",
+                    "video/x-matroska": ".mkv",
+                    "video/webm": ".webm",
+                    "video/quicktime": ".mov",
+                    "video/x-msvideo": ".avi",
+                    "video/mp2t": ".ts",
+                }
+                ext = mime_ext_map.get(ct, ".mp4")
+
+            target_path = dest_dir / f"{safe_stem}{ext}"
+            total_written = 0
+            chunk_size = 256 * 1024
+            with open(target_path, "wb") as out_f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    total_written += len(chunk)
+                    if total_written > MAX_INPUT:
+                        out_f.close()
+                        with suppress(Exception):
+                            target_path.unlink(missing_ok=True)
+                        return subprocess.CompletedProcess(
+                            args=["http-download", clean_url_or_err],
+                            returncode=1,
+                            stdout="",
+                            stderr="İndirilen video dosyası maksimum boyut sınırını (1.5 GB) aşıyor.",
+                        )
+                    out_f.write(chunk)
+
+        if not target_path.is_file() or target_path.stat().st_size == 0:
+            return subprocess.CompletedProcess(
+                args=["http-download", clean_url_or_err],
+                returncode=1,
+                stdout="",
+                stderr="İndirilen HTTP/HTTPS video kaynağı boş (0 byte).",
+            )
+
+        return subprocess.CompletedProcess(
+            args=["http-download", clean_url_or_err],
+            returncode=0,
+            stdout=str(target_path),
+            stderr="",
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=["http-download", clean_url_or_err],
+            returncode=1,
+            stdout="",
+            stderr=sanitize_process_output(str(exc), max_chars=300),
+        )
+
+
 def execute_encode_job_sync(
     job_id: str,
     *,
@@ -788,10 +901,10 @@ def execute_encode_job_sync(
     download_timeout: int = 900,
 ) -> EncodeJob:
     """
-    Execute the complete Cloud Run Job encoder workflow synchronously:
+    Execute the complete Cloud Run Job / Service Worker encoder workflow synchronously:
     1. Load job from persistent `JobStore`.
     2. Create isolated temporary worker workspace (`worker_temp/job_<id>/download` & `encode`).
-    3. Download video from magnet via `aria2c` (or injected `download_runner`).
+    3. Download video from magnet via `aria2c` or from direct HTTP/HTTPS URL (or injected `download_runner`).
     4. Extract or prepare ASS/SRT subtitle file.
     5. Prepare optional intro video if specified.
     6. Run FFmpeg with `libx264` or `libx265`, parsing `-progress pipe:1` in real time for
@@ -833,12 +946,14 @@ def execute_encode_job_sync(
             return cancelled_job
         return None
 
-    # Validate magnet URI and codec before starting heavy work
-    valid_mag, mag_or_err = validate_magnet_uri(job.magnet)
+    # Validate video source (magnet URI or direct HTTP/HTTPS URL) and codec before starting heavy work
+    valid_mag, mag_or_err = validate_video_source(job.magnet)
     if not valid_mag:
         failed = store.mark_job_failed(job_id, mag_or_err)
         _emit_update(failed)
         return failed or job
+
+    is_http_source = mag_or_err.lower().startswith(("http://", "https://"))
 
     ok_codec, canonical_codec, video_encoder = normalize_video_codec(job.codec)
     if not ok_codec:
@@ -846,11 +961,12 @@ def execute_encode_job_sync(
         _emit_update(failed)
         return failed or job
 
-    # Ensure aria2c, ffmpeg, and ffprobe exist
-    if shutil.which("aria2c") is None or shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+    # Ensure ffmpeg, ffprobe, and (for magnet torrents) aria2c exist
+    need_aria2 = download_runner is None and not is_http_source
+    if (need_aria2 and shutil.which("aria2c") is None) or shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         ensure_runtime_binaries(auto_install=True)
 
-    if download_runner is None and shutil.which("aria2c") is None:
+    if need_aria2 and shutil.which("aria2c") is None:
         failed = store.mark_job_failed(job_id, "Worker ortamında `aria2c` bulunamadı.")
         _emit_update(failed)
         return failed or job
@@ -883,7 +999,7 @@ def execute_encode_job_sync(
         if cancelled := _abort_if_cancelled():
             return cancelled
 
-        # STAGE 1: Downloading torrent via aria2c
+        # STAGE 1: Downloading video source (magnet torrent via aria2c or direct HTTP/HTTPS URL)
         job = store.update_job_progress(
             job_id,
             stage="downloading",
@@ -895,6 +1011,8 @@ def execute_encode_job_sync(
 
         if download_runner is not None:
             dl_res = download_runner(mag_or_err, download_dir)
+        elif is_http_source:
+            dl_res = download_http_video_source(mag_or_err, download_dir, timeout=download_timeout)
         else:
             aria_cmd = build_aria2c_command(mag_or_err, download_dir)
             dl_res = subprocess.run(
@@ -909,11 +1027,30 @@ def execute_encode_job_sync(
             return cancelled
 
         videos = find_video_files(download_dir)
+        if not videos and is_http_source and download_dir.exists():
+            # If a direct URL had no file extension (e.g. /watch), normalize any downloaded regular file to .mp4
+            for candidate_file in download_dir.iterdir():
+                if (
+                    candidate_file.is_file()
+                    and not candidate_file.name.endswith(".aria2")
+                    and candidate_file.stat().st_size > 0
+                    and candidate_file.suffix.lower() not in VIDEO_SUFFIXES
+                ):
+                    normalized_target = candidate_file.with_name(f"{candidate_file.name}.mp4")
+                    candidate_file.rename(normalized_target)
+            videos = find_video_files(download_dir)
+
         if dl_res.returncode != 0 and not videos:
             err_tail = sanitize_process_output(dl_res.stderr or dl_res.stdout or "")
-            msg = f"Torrent indirilemedi (aria2c kod {dl_res.returncode}). Magnet bağlantısını ve seeder durumunu kontrol edin."
+            if is_http_source:
+                msg = (
+                    f"Video URL'si indirilemedi (geçerli bir `magnet:?` bağlantısı veya erişilebilir HTTP/HTTPS video URL'si gerekli): "
+                    f"{err_tail or f'kod {dl_res.returncode}'}"
+                )
+            else:
+                msg = f"Torrent indirilemedi (aria2c kod {dl_res.returncode}). Magnet bağlantısını ve seeder durumunu kontrol edin."
             if err_tail:
-                logger.warning("Job %s aria2c failure: %s", job_id, err_tail)
+                logger.warning("Job %s download failure: %s", job_id, err_tail)
             failed = store.mark_job_failed(job_id, msg)
             _emit_update(failed)
             return failed or job

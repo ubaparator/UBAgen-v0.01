@@ -56,6 +56,9 @@ interface StatsResponse {
     status?: string;
     is_ready: boolean;
     connected: boolean;
+    http_alive?: boolean;
+    gateway_connected?: boolean;
+    bot_ready?: boolean;
     latency_ms: number | null;
     user: string;
     guild_count: number;
@@ -65,6 +68,14 @@ interface StatsResponse {
     sync_status?: string | null;
     client_id?: string | null;
     invite_url?: string | null;
+    reconnect_attempts?: number;
+    wake_in_progress?: boolean;
+    wake_attempts?: number;
+    last_wake_time?: number | null;
+    last_wake_reason?: string | null;
+    interactions_endpoint_configured?: boolean;
+    interactions_endpoint_path?: string;
+    wake_endpoint_path?: string;
   };
   compute: {
     cpu_usage_pct: number | null;
@@ -735,39 +746,79 @@ export default function App() {
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
-            <span className="text-slate-400">Discord Gateway:</span>
-            {stats?.bot?.connected ? (
-              <span className="flex items-center gap-1 text-emerald-400 font-semibold">
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                Connected ({stats.bot.latency_ms !== null ? `${stats.bot.latency_ms} ms` : 'Unavailable'})
-              </span>
-            ) : stats?.bot?.status === 'invalid_token' ? (
-              <span className="flex items-center gap-1 text-rose-400 font-semibold" title="Authentication failed: verify DISCORD_BOT_TOKEN">
-                <XCircle className="w-3.5 h-3.5" />
-                Auth Failed (Invalid Token)
-              </span>
-            ) : stats?.bot?.status === 'connecting' ? (
-              <span className="flex items-center gap-1 text-sky-400 font-semibold">
-                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                Connecting...
-              </span>
-            ) : stats?.bot?.status === 'not_configured' ? (
-              <span className="flex items-center gap-1 text-slate-400 font-semibold" title="Running in Web Monitor mode">
-                <HelpCircle className="w-3.5 h-3.5" />
-                Web Monitor Mode
-              </span>
-            ) : stats?.bot?.status === 'network_error' ? (
-              <span className="flex items-center gap-1 text-amber-400 font-semibold">
-                <AlertTriangle className="w-3.5 h-3.5" />
-                Network Reconnecting
-              </span>
-            ) : (
-              <span className="flex items-center gap-1 text-rose-400 font-semibold">
-                <XCircle className="w-3.5 h-3.5" />
-                Disconnected
-              </span>
-            )}
+          <div className="flex flex-wrap items-center gap-2.5">
+            {/* 1. HTTP Alive State */}
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border bg-emerald-500/10 border-emerald-500/30 text-emerald-300 font-mono text-[11px]">
+              <span className="w-1.5 h-1.5 rounded-sm bg-emerald-400" />
+              HTTP Alive: <strong>{error ? 'DEGRADED' : 'ONLINE'}</strong>
+            </span>
+
+            {/* 2. Discord Gateway Connection State */}
+            <span
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-mono text-[11px] ${
+                stats?.bot?.connected
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                  : stats?.bot?.status === 'connecting' || stats?.bot?.wake_in_progress
+                  ? 'bg-sky-500/10 border-sky-500/30 text-sky-300'
+                  : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-sm ${
+                  stats?.bot?.connected
+                    ? 'bg-emerald-400'
+                    : stats?.bot?.status === 'connecting' || stats?.bot?.wake_in_progress
+                    ? 'bg-sky-400 animate-pulse'
+                    : 'bg-rose-400'
+                }`}
+              />
+              Discord Gateway:{' '}
+              <strong>
+                {stats?.bot?.connected
+                  ? 'CONNECTED'
+                  : stats?.bot?.status === 'connecting' || stats?.bot?.wake_in_progress
+                  ? 'CONNECTING'
+                  : 'DISCONNECTED'}
+              </strong>
+            </span>
+
+            {/* 3. Bot Ready State (Never shown online unless is_ready === true) */}
+            <span
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-mono text-[11px] ${
+                stats?.bot?.is_ready
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                  : stats?.bot?.connected || stats?.bot?.status === 'connecting' || stats?.bot?.wake_in_progress
+                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-300'
+              }`}
+            >
+              {stats?.bot?.is_ready ? (
+                <>
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                  Bot Ready: <strong>READY ({stats.bot.latency_ms !== null ? `${stats.bot.latency_ms} ms` : 'OK'})</strong>
+                </>
+              ) : stats?.bot?.connected || stats?.bot?.status === 'connecting' || stats?.bot?.wake_in_progress ? (
+                <>
+                  <RefreshCw className="w-3 h-3 text-amber-400 animate-spin" />
+                  Bot Ready: <strong>{stats?.bot?.wake_in_progress ? 'WAKING' : 'HANDSHAKING'}</strong>
+                </>
+              ) : stats?.bot?.status === 'invalid_token' ? (
+                <>
+                  <XCircle className="w-3 h-3 text-rose-400" />
+                  Bot Ready: <strong>AUTH FAILED</strong>
+                </>
+              ) : stats?.bot?.status === 'not_configured' ? (
+                <>
+                  <HelpCircle className="w-3 h-3 text-slate-400" />
+                  Bot Ready: <strong>STANDBY (WEB MODE)</strong>
+                </>
+              ) : (
+                <>
+                  <XCircle className="w-3 h-3 text-rose-400" />
+                  Bot Ready: <strong>NOT READY</strong>
+                </>
+              )}
+            </span>
           </div>
         </div>
 
@@ -1043,12 +1094,12 @@ export default function App() {
                   </span>
                   <span
                     className={`px-2 py-0.5 text-xs font-semibold rounded-md border flex items-center gap-1 ${
-                      stats.bot.connected
+                      stats.bot.is_ready
                         ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                        : stats.bot.connected || stats.bot.status === 'connecting' || stats.bot.wake_in_progress
+                        ? 'bg-sky-500/10 text-sky-400 border-sky-500/30'
                         : stats.bot.status === 'invalid_token'
                         ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
-                        : stats.bot.status === 'connecting'
-                        ? 'bg-sky-500/10 text-sky-400 border-sky-500/30'
                         : stats.bot.status === 'network_error'
                         ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
                         : stats.bot.status === 'not_configured'
@@ -1057,10 +1108,10 @@ export default function App() {
                     }`}
                   >
                     <span
-                      className={`w-1.5 h-1.5 rounded-full ${
-                        stats.bot.connected
+                      className={`w-1.5 h-1.5 rounded-sm ${
+                        stats.bot.is_ready
                           ? 'bg-emerald-400'
-                          : stats.bot.status === 'connecting'
+                          : stats.bot.connected || stats.bot.status === 'connecting' || stats.bot.wake_in_progress
                           ? 'bg-sky-400 animate-pulse'
                           : stats.bot.status === 'network_error'
                           ? 'bg-amber-400'
@@ -1069,8 +1120,12 @@ export default function App() {
                           : 'bg-rose-400'
                       }`}
                     />
-                    {stats.bot.connected
-                      ? 'Connected'
+                    {stats.bot.is_ready
+                      ? 'Ready'
+                      : stats.bot.wake_in_progress
+                      ? 'Waking'
+                      : stats.bot.connected
+                      ? 'Handshaking'
                       : stats.bot.status === 'invalid_token'
                       ? 'Auth Failed'
                       : stats.bot.status === 'connecting'
@@ -1079,7 +1134,7 @@ export default function App() {
                       ? 'Network Error'
                       : stats.bot.status === 'not_configured'
                       ? 'Not Configured'
-                      : 'Disconnected'}
+                      : 'Offline'}
                   </span>
                 </div>
 
@@ -1087,18 +1142,52 @@ export default function App() {
                   {stats.bot.user}
                 </div>
                 <p className="text-xs text-slate-400 mt-1">
-                  {stats.bot.connected
-                    ? `Connected to ${stats.bot.guild_count} Discord server(s)`
+                  {stats.bot.is_ready
+                    ? `Ready across ${stats.bot.guild_count} Discord server(s)`
+                    : stats.bot.connected
+                    ? 'Gateway WebSocket open — waiting for guild & command readiness'
                     : stats.bot.status === 'invalid_token'
                     ? 'DISCORD_BOT_TOKEN rejected by Discord Gateway'
                     : stats.bot.status === 'not_configured'
                     ? 'Running in Web Monitor mode (token not provided)'
-                    : 'Backend attempting connection to Discord'}
+                    : 'Wake-on-Command ready or reconnecting to Discord Gateway'}
                 </p>
+
+                {/* Separate Tri-State Breakdown: HTTP Alive vs Gateway vs Bot Ready */}
+                <div className="mt-3 grid grid-cols-3 gap-1.5 text-[11px] font-mono">
+                  <div className="p-1.5 rounded-lg bg-slate-950/80 border border-slate-800/80 flex flex-col">
+                    <span className="text-[10px] text-slate-400 uppercase">HTTP Alive</span>
+                    <span className="text-emerald-400 font-semibold mt-0.5">ONLINE</span>
+                  </div>
+                  <div className="p-1.5 rounded-lg bg-slate-950/80 border border-slate-800/80 flex flex-col">
+                    <span className="text-[10px] text-slate-400 uppercase">Gateway WS</span>
+                    <span
+                      className={`font-semibold mt-0.5 ${
+                        stats.bot.connected ? 'text-emerald-400' : 'text-rose-400'
+                      }`}
+                    >
+                      {stats.bot.connected ? 'CONNECTED' : 'CLOSED'}
+                    </span>
+                  </div>
+                  <div className="p-1.5 rounded-lg bg-slate-950/80 border border-slate-800/80 flex flex-col">
+                    <span className="text-[10px] text-slate-400 uppercase">Bot Ready</span>
+                    <span
+                      className={`font-semibold mt-0.5 ${
+                        stats.bot.is_ready
+                          ? 'text-emerald-400'
+                          : stats.bot.connected || stats.bot.wake_in_progress
+                          ? 'text-amber-400'
+                          : 'text-rose-400'
+                      }`}
+                    >
+                      {stats.bot.is_ready ? 'READY' : stats.bot.connected ? 'SYNCING' : 'OFFLINE'}
+                    </span>
+                  </div>
+                </div>
 
                 {/* Safe Diagnostic Message Box */}
                 {stats.bot.diagnostic_message && (
-                  <div className="mt-3 p-2 rounded-xl bg-slate-950/70 border border-slate-800/80 text-[11px] text-slate-300">
+                  <div className="mt-2.5 p-2 rounded-xl bg-slate-950/70 border border-slate-800/80 text-[11px] text-slate-300">
                     <span className="font-semibold text-slate-400 block text-[10px] uppercase tracking-wider mb-0.5">
                       Diagnostic Status
                     </span>
@@ -1112,12 +1201,31 @@ export default function App() {
                   <div className="flex justify-between">
                     <span className="text-slate-400">Gateway Latency:</span>
                     <span className="font-mono text-indigo-300 font-semibold">
-                      {stats.bot.latency_ms !== null ? `${stats.bot.latency_ms} ms` : 'Offline'}
+                      {stats.bot.is_ready && stats.bot.latency_ms !== null
+                        ? `${stats.bot.latency_ms} ms`
+                        : 'Offline'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Wake-on-Command:</span>
+                    <span
+                      className={`font-mono text-[11px] font-semibold ${
+                        stats.bot.interactions_endpoint_configured
+                          ? 'text-emerald-400'
+                          : 'text-sky-300'
+                      }`}
+                      title="POST /api/discord/interactions (Ed25519) & POST /api/discord/wake"
+                    >
+                      {stats.bot.interactions_endpoint_configured
+                        ? `Ed25519 Active (${stats.bot.wake_attempts ?? 0} wakes)`
+                        : `HTTP /api/discord/wake (${stats.bot.wake_attempts ?? 0} wakes)`}
                     </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-400">Slash Commands:</span>
-                    <span className="font-mono text-emerald-400">/stats, /altyazı_ayıklama, /encode</span>
+                    <span className="font-mono text-emerald-400 text-[11px]">
+                      /encode, /encodeal, /is_durumu, /discord, /stats
+                    </span>
                   </div>
                   {stats.bot.sync_status && (
                     <div className="flex justify-between text-[11px] pt-0.5 border-t border-slate-800/60">

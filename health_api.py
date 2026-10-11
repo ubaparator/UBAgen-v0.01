@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from discord_interactions import handle_discord_interaction_request
 from encoder_worker import dispatch_encode_job_background
 from job_store import (
     FirestoreUnavailableError,
@@ -75,10 +76,16 @@ def _degraded_stats(reason: str) -> dict[str, Any]:
         "diagnostic_message": reason,
         "bot": {
             "status": "unavailable", "connected": False, "is_ready": False,
+            "http_alive": True, "gateway_connected": False, "bot_ready": False,
             "diagnostic_message": "Bot statistics are temporarily unavailable.",
             "latency_ms": None, "user": "Unavailable", "guild_count": 0,
             "uptime_seconds": None, "uptime_str": "Unavailable",
             "sync_status": None, "client_id": None, "invite_url": None,
+            "reconnect_attempts": 0, "wake_in_progress": False, "wake_attempts": 0,
+            "last_wake_time": None, "last_wake_reason": None,
+            "interactions_endpoint_configured": False,
+            "interactions_endpoint_path": "/api/discord/interactions",
+            "wake_endpoint_path": "/api/discord/wake",
         },
         "compute": {
             "cpu_usage_pct": None, "logical_cores": None, "physical_cores": None,
@@ -151,9 +158,72 @@ def create_health_app(
     app.state.last_restart_at = 0.0
     app.state.restart_cooldown_seconds = restart_cooldown_seconds
     app.state.restart_bot = None
+    app.state.wake_bot = None
+    app.state.wake_lock = asyncio.Lock()
+    app.state.last_wake_at = 0.0
+    app.state.wake_cooldown_seconds = 10.0
 
     if bot_manager is not None and hasattr(bot_manager, "attach_health_app"):
         bot_manager.attach_health_app(app)
+
+    async def _fallback_wake_bot(reason: str = "wake_endpoint") -> tuple[int, dict[str, Any]]:
+        """Fallback in-process wake-on-command handler when create_health_app is used without BotLifecycleManager."""
+        current_bot = getattr(app.state, "bot", None)
+        tracker = getattr(current_bot, "tracker", None) if current_bot is not None else None
+        live_ready = bool(
+            (tracker is not None and getattr(tracker, "is_ready", False))
+            or (current_bot is not None and hasattr(current_bot, "is_ready") and callable(current_bot.is_ready) and current_bot.is_ready())
+        )
+        if live_ready:
+            return 200, {
+                "status": "ready",
+                "woke": False,
+                "ready": True,
+                "message": "Discord bot is already connected and ready.",
+            }
+
+        bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+        token_configured = bool(bot_token) and bot_token not in (
+            "your_discord_bot_token_here",
+            "MY_DISCORD_BOT_TOKEN",
+            "CHANGE_ME",
+        )
+        if current_bot is None and not token_configured:
+            return 503, {
+                "error": "Cannot wake Discord bot: DISCORD_BOT_TOKEN is not configured on the server.",
+            }
+
+        cooldown = float(getattr(app.state, "wake_cooldown_seconds", 10.0))
+        now = time.monotonic()
+        last_wake = float(getattr(app.state, "last_wake_at", 0.0))
+        if last_wake > 0 and (now - last_wake) < cooldown:
+            remaining = max(1, int(round(cooldown - (now - last_wake))))
+            return 429, {
+                "error": f"Wake-on-command cooldown is active. Wait {remaining} seconds before trying again.",
+                "retry_after": remaining,
+            }
+
+        async with app.state.wake_lock:
+            app.state.last_wake_at = time.monotonic()
+            if tracker is not None:
+                tracker.status = "connecting"
+                tracker.is_ready = False
+                tracker.wake_in_progress = True
+                tracker.wake_attempts = int(getattr(tracker, "wake_attempts", 0)) + 1
+                tracker.last_wake_time = time.time()
+                tracker.last_wake_reason = str(reason or "wake_endpoint")[:80]
+                tracker.diagnostic_message = f"Wake-on-command triggered ({reason}). Connecting to Discord Gateway..."
+            if current_bot is not None and hasattr(current_bot, "wake") and callable(current_bot.wake):
+                res = current_bot.wake()
+                if asyncio.iscoroutine(res):
+                    await res
+            app.state.last_stats = None
+            return 202, {
+                "status": "waking",
+                "woke": True,
+                "ready": False,
+                "message": "Wake-on-command accepted. Discord bot worker is reconnecting to Gateway.",
+            }
 
     async def _fallback_restart_bot() -> tuple[int, dict[str, Any]]:
         """Fallback in-process restart handler when create_health_app is used without BotLifecycleManager."""
@@ -281,6 +351,119 @@ def create_health_app(
             headers["Retry-After"] = str(payload["retry_after"])
         return JSONResponse(content=payload, status_code=status_code, headers=headers)
 
+    @app.api_route(
+        "/api/discord/wake",
+        methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
+        summary="Authenticated Discord Bot Wake-on-Command Trigger",
+    )
+    async def wake_bot_api(
+        request: Request = None,
+        authorization: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """
+        Authenticated control endpoint to wake the Discord bot worker when it is offline or in backoff,
+        without forcing a destructive restart if the bot is already ready.
+        Requires 'Authorization: Bearer <UBAGEN_ADMIN_TOKEN>'.
+        """
+        method = request.method.upper() if (request is not None and getattr(request, "method", None)) else "POST"
+        if method != "POST":
+            return JSONResponse(
+                content={"error": "Method not allowed. Use POST /api/discord/wake."},
+                status_code=405,
+                headers={"Allow": "POST, OPTIONS", "Cache-Control": "no-store"},
+            )
+
+        expected_token = os.getenv("UBAGEN_ADMIN_TOKEN", "").strip()
+        if not expected_token:
+            return JSONResponse(
+                content={
+                    "error": "Bot wake endpoint is disabled: UBAGEN_ADMIN_TOKEN is not configured on the server."
+                },
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        auth_header: Optional[str] = None
+        if isinstance(authorization, str):
+            auth_header = authorization
+        elif request is not None and hasattr(request, "headers"):
+            auth_header = request.headers.get("authorization")
+
+        if not verify_admin_token(auth_header, expected_token):
+            return JSONResponse(
+                content={"error": "Unauthorized. The admin token is missing or invalid."},
+                status_code=401,
+                headers={"Cache-Control": "no-store", "WWW-Authenticate": "Bearer"},
+            )
+
+        reason = "api_discord_wake"
+        if request is not None:
+            with suppress(Exception):
+                body = await request.json()
+                if isinstance(body, dict) and body.get("reason"):
+                    reason = str(body.get("reason"))[:64]
+
+        wake_fn = getattr(app.state, "wake_bot", None) or _fallback_wake_bot
+        try:
+            status_code, payload = await wake_fn(reason=reason)
+        except TypeError:
+            status_code, payload = await wake_fn()
+        headers = {"Cache-Control": "no-store"}
+        if status_code == 429 and "retry_after" in payload:
+            headers["Retry-After"] = str(payload["retry_after"])
+        return JSONResponse(content=payload, status_code=status_code, headers=headers)
+
+    @app.api_route(
+        "/api/discord/interactions",
+        methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
+        summary="Discord Signed HTTP Interactions & Wake-on-Command Endpoint",
+    )
+    @app.api_route(
+        "/discord/interactions",
+        methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
+        summary="Discord Signed HTTP Interactions & Wake-on-Command Endpoint (Alias)",
+    )
+    async def discord_interactions_api(
+        request: Request,
+        x_signature_ed25519: Optional[str] = Header(default=None),
+        x_signature_timestamp: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """
+        Discord HTTP Interactions Endpoint:
+        - Validates Ed25519 request signatures (`X-Signature-Ed25519` + `X-Signature-Timestamp`) against `DISCORD_PUBLIC_KEY`.
+        - Responds to Discord PING (`type=1`) with PONG (`{"type": 1}`).
+        - Automatically wakes the Discord Gateway bot worker on slash command (`type=2`) when offline.
+        - Responds within Discord's 3-second deadline (`type=5` deferred or `type=4` immediate) and executes `/encode`, `/encodeal`, `/is_durumu`, `/stats`, or `/discord`.
+        """
+        method = request.method.upper() if (request is not None and getattr(request, "method", None)) else "POST"
+        if method != "POST":
+            return JSONResponse(
+                content={"error": "Method not allowed. Use POST /api/discord/interactions."},
+                status_code=405,
+                headers={"Allow": "POST, OPTIONS", "Cache-Control": "no-store"},
+            )
+
+        raw_body = await request.body()
+        sig_hdr = x_signature_ed25519
+        ts_hdr = x_signature_timestamp
+        if request is not None and hasattr(request, "headers"):
+            if not sig_hdr:
+                sig_hdr = request.headers.get("x-signature-ed25519")
+            if not ts_hdr:
+                ts_hdr = request.headers.get("x-signature-timestamp")
+
+        status_code, payload = await handle_discord_interaction_request(
+            raw_body=raw_body,
+            signature_header=sig_hdr,
+            timestamp_header=ts_hdr,
+            app=app,
+        )
+        return JSONResponse(
+            content=payload,
+            status_code=status_code,
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/stats", summary="Real-time Hardware & Bot Statistics")
     @app.get("/stats", summary="Real-time Hardware & Bot Statistics (Alias)")
     async def get_stats_api() -> JSONResponse:
@@ -326,34 +509,53 @@ def create_health_app(
                             tracker.latency_ms = round(float(raw_lat) * 1000, 1)
                 except Exception:
                     pass
-            bot_is_ready = tracker.is_ready
-            bot_connected = tracker.connected
+            bot_is_ready = bool(tracker.is_ready)
+            bot_connected = bool(tracker.connected)
             latency_ms = tracker.latency_ms
             bot_user = tracker.user
             diagnostic_msg = tracker.diagnostic_message
             bot_state = tracker.status
+            if bot_state == "connected" and not bot_is_ready:
+                bot_state = "connecting"
+            wake_in_progress = bool(getattr(tracker, "wake_in_progress", False))
+            wake_attempts = int(getattr(tracker, "wake_attempts", 0))
         else:
             bot_is_ready = bool(current_bot and hasattr(current_bot, "is_ready") and current_bot.is_ready())
-            bot_connected = bot_is_ready
+            bot_connected = bool(
+                bot_is_ready
+                or (current_bot and hasattr(current_bot, "is_closed") and callable(current_bot.is_closed) and not current_bot.is_closed() and getattr(current_bot, "ws", None) is not None)
+            )
             latency_ms = (
                 round(current_bot.latency * 1000, 2)
                 if (bot_is_ready and current_bot and getattr(current_bot, "latency", None) is not None)
                 else None
             )
             bot_user = str(current_bot.user) if (bot_is_ready and current_bot and getattr(current_bot, "user", None)) else None
-            bot_state = "connected" if bot_is_ready else "disconnected"
-            diagnostic_msg = "Bot is connected." if bot_is_ready else "Bot is disconnected."
+            bot_state = "connected" if bot_is_ready else ("connecting" if bot_connected else "disconnected")
+            diagnostic_msg = "Bot is connected and ready." if bot_is_ready else ("Bot is connected to Gateway, awaiting readiness." if bot_connected else "Bot is disconnected.")
+            wake_in_progress = False
+            wake_attempts = 0
 
         uptime_sec = int(time.time() - SERVICE_START_TIME)
+        pub_key_configured = len(os.getenv("DISCORD_PUBLIC_KEY", "").strip()) == 64
 
         payload = {
             "status": "healthy",
             "service": "ubagen-backend",
             "http": "alive",
+            "http_alive": True,
+            "discord_gateway_connected": bot_connected,
+            "discord_bot_ready": bot_is_ready,
             "discord_bot": {
                 "status": bot_state,
                 "connected": bot_connected,
                 "ready": bot_is_ready,
+                "http_alive": True,
+                "gateway_connected": bot_connected,
+                "bot_ready": bot_is_ready,
+                "wake_in_progress": wake_in_progress,
+                "wake_attempts": wake_attempts,
+                "interactions_endpoint_configured": pub_key_configured,
                 "latency_ms": latency_ms,
                 "user": bot_user,
                 "diagnostic_message": diagnostic_msg,

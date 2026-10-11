@@ -165,6 +165,7 @@ class BotTracker:
     """
     Thread-safe, robust tracking structure for Discord bot lifecycle and gateway state.
     Provides diagnostic messages without exposing tokens or credentials.
+    Separates HTTP liveness, Gateway WebSocket connection, and full Bot Readiness.
     """
     def __init__(self) -> None:
         self.status: str = "not_configured"  # not_configured, connecting, connected, invalid_token, network_error, api_error, sync_error, disconnected, library_missing
@@ -180,34 +181,48 @@ class BotTracker:
         self.last_error_time: Optional[float] = None
         self.client_id: Optional[str] = extract_discord_client_id()
         self.invite_url: Optional[str] = generate_discord_invite_url(self.client_id)
+        self.wake_in_progress: bool = False
+        self.wake_attempts: int = 0
+        self.last_wake_time: Optional[float] = None
+        self.last_wake_reason: Optional[str] = None
 
     def to_dict(self, now: Optional[float] = None) -> dict[str, Any]:
         cur_now = now or time.time()
         uptime_sec = (cur_now - self.last_connected_time) if (self.is_ready and self.last_connected_time) else None
-        
+
+        # Never report status="connected" until the bot is genuinely ready (is_ready == True)
+        effective_status = self.status
+        if effective_status == "connected" and not self.is_ready:
+            effective_status = "connecting"
+
         # Determine friendly display name for user
         if self.user:
             display_user = self.user
-        elif self.is_ready or self.connected or self.status == "connected":
+        elif self.is_ready:
             display_user = "Connected"
-        elif self.status == "invalid_token":
-            display_user = "Authentication Failed"
-        elif self.status == "connecting":
+        elif self.connected or effective_status == "connecting":
             display_user = "Connecting..."
-        elif self.status == "network_error":
+        elif effective_status == "invalid_token":
+            display_user = "Authentication Failed"
+        elif effective_status == "network_error":
             display_user = "Network Error"
-        elif self.status == "not_configured":
+        elif effective_status == "not_configured":
             display_user = "Not configured"
         else:
             display_user = "Disconnected"
 
         cid = self.client_id or extract_discord_client_id()
         inv_url = self.invite_url or generate_discord_invite_url(cid)
+        pub_key = os.getenv("DISCORD_PUBLIC_KEY", "").strip()
+        interactions_configured = bool(len(pub_key) == 64)
 
         return {
-            "status": self.status,
-            "connected": self.connected,
-            "is_ready": self.is_ready,
+            "status": effective_status,
+            "connected": bool(self.connected),
+            "is_ready": bool(self.is_ready),
+            "http_alive": True,
+            "gateway_connected": bool(self.connected),
+            "bot_ready": bool(self.is_ready),
             "diagnostic_message": self.diagnostic_message,
             "latency_ms": self.latency_ms,
             "user": display_user,
@@ -218,6 +233,14 @@ class BotTracker:
             "sync_status": self.sync_status,
             "client_id": cid,
             "invite_url": inv_url,
+            "reconnect_attempts": int(getattr(self, "reconnect_attempts", 0)),
+            "wake_in_progress": bool(getattr(self, "wake_in_progress", False)),
+            "wake_attempts": int(getattr(self, "wake_attempts", 0)),
+            "last_wake_time": getattr(self, "last_wake_time", None),
+            "last_wake_reason": getattr(self, "last_wake_reason", None),
+            "interactions_endpoint_configured": interactions_configured,
+            "interactions_endpoint_path": "/api/discord/interactions",
+            "wake_endpoint_path": "/api/discord/wake",
         }
 
 
@@ -668,20 +691,53 @@ def check_environment_variables() -> list[dict[str, str]]:
     })
 
     job_name = os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip()
+    encoder_mode = os.getenv("UBAGEN_ENCODER_MODE", "").strip().lower()
+    in_proc_mode = encoder_mode in ("service_worker", "in_process", "local")
     local_fb = os.getenv("UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK", "").strip().lower() in ("1", "true", "yes")
+    results.append({
+        "name": "UBAGEN_ENCODER_MODE",
+        "status": (
+            f"{encoder_mode} (In-Process Background Worker — No Cloud Run Job IAM Required)"
+            if in_proc_mode
+            else "cloud_run_job (Cloud Run Job v2 Execution Mode)"
+        ),
+        "indicator": "✅",
+        "type": "Encoder Mode",
+    })
     results.append({
         "name": "UBAGEN_CLOUD_RUN_JOB_NAME",
         "status": (
             f"Configured ({job_name})"
             if job_name
             else (
-                "Not configured (Dev local worker fallback enabled)"
-                if local_fb
-                else "Not configured (Required for production Cloud Run Job dispatch)"
+                "Optional (Bypassed in service_worker mode)"
+                if in_proc_mode
+                else (
+                    "Not configured (Dev local worker fallback enabled)"
+                    if local_fb
+                    else "Not configured (Required for production Cloud Run Job dispatch)"
+                )
             )
         ),
-        "indicator": "✅" if job_name else ("⚠️" if local_fb else "⚪"),
+        "indicator": "✅" if (job_name or in_proc_mode) else ("⚠️" if local_fb else "⚪"),
         "type": "Cloud Run Job",
+    })
+
+    discord_pub_key = os.getenv("DISCORD_PUBLIC_KEY", "").strip()
+    valid_pub_key = bool(re.fullmatch(r"[0-9a-fA-F]{64}", discord_pub_key))
+    results.append({
+        "name": "DISCORD_PUBLIC_KEY",
+        "status": (
+            "Configured (Ed25519 Signed HTTP Interactions & Wake-on-Command Active)"
+            if valid_pub_key
+            else (
+                "Invalid Format (Expected 64-char hex Ed25519 public key)"
+                if discord_pub_key
+                else "Not configured (Set for signed HTTP Interactions wake-on-command)"
+            )
+        ),
+        "indicator": "✅" if valid_pub_key else ("⚠️" if discord_pub_key else "⚪"),
+        "type": "Discord Wake-on-Command",
     })
 
     gcp_proj = (
@@ -811,6 +867,11 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
     sync_status = None
     bot_client_id = None
     bot_invite_url = None
+    reconnect_attempts = 0
+    wake_in_progress = False
+    wake_attempts = 0
+    last_wake_time = None
+    last_wake_reason = None
 
     state_file = "/tmp/ubagen_bot_state.json"
     if not bot_tracker and os.path.exists(state_file):
@@ -820,9 +881,11 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
                 with open(state_file, "r", encoding="utf-8") as f:
                     cached_dict = json.load(f)
                 if isinstance(cached_dict, dict) and "status" in cached_dict:
-                    bot_status_str = cached_dict.get("status", "disconnected")
                     is_ready = bool(cached_dict.get("is_ready", False))
                     is_connected = bool(cached_dict.get("connected", False))
+                    bot_status_str = cached_dict.get("status", "disconnected")
+                    if bot_status_str == "connected" and not is_ready:
+                        bot_status_str = "connecting"
                     latency_ms = cached_dict.get("latency_ms")
                     bot_user_str = cached_dict.get("user", "Disconnected")
                     guild_count = cached_dict.get("guild_count", 0)
@@ -835,6 +898,11 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
                     sync_status = cached_dict.get("sync_status")
                     bot_client_id = cached_dict.get("client_id")
                     bot_invite_url = cached_dict.get("invite_url")
+                    reconnect_attempts = int(cached_dict.get("reconnect_attempts", 0))
+                    wake_in_progress = bool(cached_dict.get("wake_in_progress", False))
+                    wake_attempts = int(cached_dict.get("wake_attempts", 0))
+                    last_wake_time = cached_dict.get("last_wake_time")
+                    last_wake_reason = cached_dict.get("last_wake_reason")
                     bot_tracker = "cached"
         except Exception as e:
             logger.debug("Failed reading state file: %s", e)
@@ -877,9 +945,17 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
         sync_status = bot_dict["sync_status"]
         bot_client_id = bot_dict.get("client_id")
         bot_invite_url = bot_dict.get("invite_url")
+        reconnect_attempts = int(bot_dict.get("reconnect_attempts", 0))
+        wake_in_progress = bool(bot_dict.get("wake_in_progress", False))
+        wake_attempts = int(bot_dict.get("wake_attempts", 0))
+        last_wake_time = bot_dict.get("last_wake_time")
+        last_wake_reason = bot_dict.get("last_wake_reason")
     elif bot_tracker != "cached":
         is_ready = bool(bot and hasattr(bot, "is_ready") and bot.is_ready())
-        is_connected = is_ready
+        is_connected = bool(
+            is_ready
+            or (bot and hasattr(bot, "is_closed") and callable(bot.is_closed) and not bot.is_closed() and getattr(bot, "ws", None) is not None)
+        )
         latency_ms = (
             round(bot.latency * 1000, 1)
             if (is_ready and bot and getattr(bot, "latency", None) is not None)
@@ -893,6 +969,10 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             bot_user_str = str(bot.user)
             bot_status_str = "connected"
             bot_diag_msg = "Connected to Discord Gateway."
+        elif is_connected:
+            bot_user_str = "Connecting..."
+            bot_status_str = "connecting"
+            bot_diag_msg = "Connected to Discord Gateway WebSocket; waiting for bot readiness."
         elif not is_placeholder:
             bot_user_str = "Disconnected"
             bot_status_str = "disconnected"
@@ -907,6 +987,8 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
         bot_client_id = extract_discord_client_id(bot)
     if not bot_invite_url and bot_client_id:
         bot_invite_url = generate_discord_invite_url(bot_client_id)
+    pub_key_val = os.getenv("DISCORD_PUBLIC_KEY", "").strip()
+    interactions_configured = bool(re.fullmatch(r"[0-9a-fA-F]{64}", pub_key_val))
 
     # 2. CPU Metrics
     cpu_usage_pct = _CPU_SAMPLER.get_percent()
@@ -1026,6 +1108,9 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             "status": bot_status_str,
             "connected": is_connected,
             "is_ready": is_ready,
+            "http_alive": True,
+            "gateway_connected": bool(is_connected),
+            "bot_ready": bool(is_ready),
             "diagnostic_message": bot_diag_msg,
             "latency_ms": latency_ms,
             "user": bot_user_str,
@@ -1035,6 +1120,14 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             "sync_status": sync_status,
             "client_id": bot_client_id,
             "invite_url": bot_invite_url,
+            "reconnect_attempts": reconnect_attempts,
+            "wake_in_progress": wake_in_progress,
+            "wake_attempts": wake_attempts,
+            "last_wake_time": last_wake_time,
+            "last_wake_reason": last_wake_reason,
+            "interactions_endpoint_configured": interactions_configured,
+            "interactions_endpoint_path": "/api/discord/interactions",
+            "wake_endpoint_path": "/api/discord/wake",
         },
         "compute": {
             "cpu_usage_pct": cpu_usage_pct,

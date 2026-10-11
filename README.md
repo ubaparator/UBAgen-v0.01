@@ -99,6 +99,8 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 | `UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK` | Optional | `false` | Permits spawning a local worker subprocess only in local dev/test environments when Cloud Run Job is not configured. Disabled in production to protect bot stability. |
 | `UBAGEN_DISCORD_ADMIN_IDS` | Optional | *Empty* (Bot Owner & Server Admins) | Optional comma-separated Discord User IDs authorized to execute the `/discord` bot restart command. |
 | `UBAGEN_DISCORD_RESTART_MODE` | Optional | `gateway` | Controls `/discord` restart strategy: `gateway` (safe in-process gateway session reconnect) or `cloud_run_revision` (Cloud Run Admin v2 API revision rollout). |
+| `UBAGEN_ENCODER_MODE` | Optional | `cloud_run_job` (or `service_worker`) | Set to `service_worker` (or `in_process` / `local`) to execute FFmpeg encode jobs inside the running service without requiring Cloud Run Job `run.jobs.run` IAM permissions. |
+| `DISCORD_PUBLIC_KEY` | Optional (Required for HTTP Interactions) | *Empty* | 64-character hex Ed25519 application public key from Discord Developer Portal. Enables `POST /api/discord/interactions` for signed HTTP slash commands and automatic Wake-on-Command when the Gateway bot is offline. |
 
 > 🔒 **Security Notice**: Never commit secret tokens or `.env` files to Git, and never place `UBAGEN_ADMIN_TOKEN` or `DISCORD_BOT_TOKEN` in client-exposed `VITE_*` environment variables. Set them securely through your hosting platform's server-side secret manager.
 
@@ -124,7 +126,11 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 - **`GET /api/logs`**:
   Returns recent redacted backend log entries from the thread-safe ring buffer without exposing tokens or secrets.
 - **`GET /health`**:
-  Returns lightweight JSON status (`{"status":"healthy","service":"ubagen-backend","http":"alive","discord_bot":{...}}`) for container health checks.
+  Returns lightweight JSON status (`{"status":"healthy","service":"ubagen-backend","http":"alive","http_alive":true,"discord_gateway_connected":...,"discord_bot_ready":...,"discord_bot":{...}}`) separating HTTP liveness, Gateway WebSocket state, and full Bot Readiness.
+- **`POST /api/discord/interactions`** (and alias **`POST /discord/interactions`**):
+  Discord HTTP Interactions Endpoint with Ed25519 signature verification (`X-Signature-Ed25519` + `X-Signature-Timestamp` verified against `DISCORD_PUBLIC_KEY`). Handles `PING` (`type=1` → `{"type": 1}`) and `APPLICATION_COMMAND` (`type=2` for `/encode`, `/encodeal`, `/is_durumu`, `/stats`, `/discord`), automatically waking the Discord Gateway bot worker on demand when offline and responding within Discord's 3-second callback deadline.
+- **`POST /api/discord/wake`**:
+  Authenticated wake-on-command control endpoint (`Authorization: Bearer <UBAGEN_ADMIN_TOKEN>`). Wakes an offline or backoff-waiting Discord bot worker (`202 Accepted`) with single-flight deduplication and cooldown protection, or returns `200 OK` without disrupting the session if the bot is already ready.
 - **`POST /api/admin/restart-bot`**:
   Supported identically in both the **Python/FastAPI** (`health_api.py` / `main.py` Docker deployment) and **Node/Express** (`server.ts` full-stack) runtime paths.
   - Requires `Authorization: Bearer <UBAGEN_ADMIN_TOKEN>` (validated using constant-time comparison).

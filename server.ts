@@ -103,9 +103,15 @@ function degradedStats(reason: string) {
     epoch_time: Date.now() / 1000,
     diagnostic_message: reason,
     bot: { status: 'unavailable', connected: false, is_ready: false,
+      http_alive: true, gateway_connected: false, bot_ready: false,
       diagnostic_message: 'Bot statistics are temporarily unavailable.', latency_ms: null,
       user: 'Unavailable', guild_count: 0, uptime_seconds: null, uptime_str: 'Unavailable',
-      sync_status: null, client_id: null, invite_url: null },
+      sync_status: null, client_id: null, invite_url: null,
+      reconnect_attempts: 0, wake_in_progress: false, wake_attempts: 0,
+      last_wake_time: null, last_wake_reason: null,
+      interactions_endpoint_configured: false,
+      interactions_endpoint_path: '/api/discord/interactions',
+      wake_endpoint_path: '/api/discord/wake' },
     compute: { cpu_usage_pct: null, logical_cores: null, physical_cores: null,
       os_name: 'Unavailable', python_version: 'Unavailable', python_impl: 'Unavailable',
       system_uptime_sec: null, system_uptime_str: 'Unavailable',
@@ -144,7 +150,13 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
   const getWorker = options.getWorkerProcess ?? (() => pythonWorkerProcess);
   const fetchFn = options.fetchImpl ?? fetch;
 
-  app.use(express.json());
+  app.use(
+    express.json({
+      verify: (req: any, _res, buf) => {
+        req.rawBody = Buffer.from(buf);
+      },
+    })
+  );
 
   // Enable CORS
   app.use((req, res, next) => {
@@ -295,6 +307,152 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     });
   });
 
+  // POST /api/discord/wake: Authenticated wake-on-command endpoint
+  app.post('/api/discord/wake', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const expectedToken = (process.env.UBAGEN_ADMIN_TOKEN || '').trim();
+    if (!expectedToken) {
+      return res.status(503).json({
+        error: 'Bot wake endpoint is disabled: UBAGEN_ADMIN_TOKEN is not configured on the server.',
+      });
+    }
+    const authorization = req.header('authorization');
+    if (!verifyAdminToken(authorization, expectedToken)) {
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      return res.status(401).json({
+        error: 'Unauthorized. The admin token is missing or invalid.',
+      });
+    }
+
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3500);
+      let upstreamRes: Response;
+      try {
+        upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/discord/wake`, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${expectedToken}`,
+          },
+          body: JSON.stringify(req.body || {}),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+      const payload = (await upstreamRes.json().catch(() => null)) as Record<string, any> | null;
+      if (upstreamRes.status === 429 && payload?.retry_after) {
+        res.setHeader('Retry-After', String(payload.retry_after));
+      }
+      statsCache = null;
+      return res.status(upstreamRes.status).json(
+        payload || { status: upstreamRes.ok ? 'waking' : 'error' }
+      );
+    } catch {
+      const botToken = (process.env.DISCORD_BOT_TOKEN || '').trim();
+      const isPlaceholder =
+        !botToken ||
+        botToken === 'your_discord_bot_token_here' ||
+        botToken === 'MY_DISCORD_BOT_TOKEN' ||
+        botToken === 'CHANGE_ME';
+      if (isPlaceholder) {
+        return res.status(503).json({
+          error: 'Cannot wake Discord bot: DISCORD_BOT_TOKEN is not configured on the server.',
+        });
+      }
+      if (!options.getWorkerProcess) {
+        ensurePythonWorker();
+      }
+      statsCache = null;
+      return res.status(202).json({
+        status: 'waking',
+        woke: true,
+        ready: false,
+        message: 'Wake-on-command accepted. Discord bot worker is reconnecting to Gateway.',
+      });
+    }
+  });
+
+  app.all('/api/discord/wake', (_req, res) => {
+    res.setHeader('Allow', 'POST, OPTIONS');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(405).json({
+      error: 'Method not allowed. Use POST /api/discord/wake.',
+    });
+  });
+
+  // POST /api/discord/interactions: Discord Signed HTTP Interactions & Wake-on-Command Endpoint
+  app.post(['/api/discord/interactions', '/discord/interactions'], async (req: any, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const sig = req.header('x-signature-ed25519') || '';
+    const ts = req.header('x-signature-timestamp') || '';
+    const rawBuf: Buffer = Buffer.isBuffer(req.rawBody)
+      ? req.rawBody
+      : Buffer.from(typeof req.body === 'object' ? JSON.stringify(req.body) : String(req.body || ''), 'utf8');
+
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2800);
+      let upstreamRes: Response;
+      try {
+        upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/discord/interactions`, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'X-Signature-Ed25519': sig,
+            'X-Signature-Timestamp': ts,
+          },
+          body: new Uint8Array(rawBuf),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+      const payload = await upstreamRes.json().catch(() => ({ error: 'Invalid response' }));
+      return res.status(upstreamRes.status).json(payload);
+    } catch {
+      // Fallback: execute Python discord_interactions handler directly
+      const b64Body = rawBuf.toString('base64');
+      execFile(
+        'python3',
+        [
+          '-B',
+          '-c',
+          'import asyncio, base64, json, sys; from discord_interactions import handle_discord_interaction_request; raw = base64.b64decode(sys.argv[1]); sig = sys.argv[2]; ts = sys.argv[3]; code, out = asyncio.run(handle_discord_interaction_request(raw_body=raw, signature_header=sig, timestamp_header=ts, app=None)); print(json.dumps({"code": code, "payload": out}))',
+          b64Body,
+          sig,
+          ts,
+        ],
+        { timeout: 2800, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+        (error, stdout) => {
+          if (!error && stdout) {
+            try {
+              const parsed = JSON.parse(stdout);
+              if (parsed.code === 200) {
+                ensurePythonWorker();
+              }
+              return res.status(parsed.code || 500).json(parsed.payload || {});
+            } catch {}
+          }
+          return res.status(500).json({ error: 'Discord interaction handler unavailable.' });
+        }
+      );
+    }
+  });
+
+  app.all(['/api/discord/interactions', '/discord/interactions'], (_req, res) => {
+    res.setHeader('Allow', 'POST, OPTIONS');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(405).json({
+      error: 'Method not allowed. Use POST /api/discord/interactions.',
+    });
+  });
+
   // GET /api/stats: Fetches live hardware metrics from backend
   app.get(['/api/stats', '/stats'], async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
@@ -383,6 +541,9 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       status: 'healthy',
       service: 'ubagen-backend',
       http: 'alive',
+      http_alive: true,
+      discord_gateway_connected: false,
+      discord_bot_ready: false,
       timestamp: new Date().toISOString(),
     });
   });

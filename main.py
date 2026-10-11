@@ -192,14 +192,22 @@ if commands is not None:
             self.write_state_file()
 
         async def on_connect(self) -> None:
-            """Fires when the Discord gateway websocket connection is opened."""
-            logger.info("Connected to Discord Gateway.")
+            """Fires when the Discord gateway websocket connection is opened (before guild cache/ready)."""
+            logger.info("Connected to Discord Gateway (handshaking & caching guilds...).")
             self.tracker.connected = True
-            self.tracker.status = "connected"
+            self.tracker.is_ready = False
+            self.tracker.status = "connecting"
             if self.user:
                 self.tracker.user = str(self.user)
                 self.tracker.client_id = str(self.user.id)
-            self.tracker.diagnostic_message = "Connected to Discord Gateway (caching guilds...)"
+            self.tracker.diagnostic_message = (
+                "Connected to Discord Gateway (waiting for guild cache & command sync before ready...)"
+            )
+            self.write_state_file()
+
+        async def on_interaction(self, interaction: Any) -> None:
+            """Record Gateway interaction activity timestamp."""
+            self.tracker.last_interaction_time = time.time()
             self.write_state_file()
 
         async def on_ready(self) -> None:
@@ -406,13 +414,15 @@ async def run_discord_bot(
     token: str,
     shutdown_event: asyncio.Event,
     stop_event: Optional[asyncio.Event] = None,
+    wake_event: Optional[asyncio.Event] = None,
     bot_factory: Optional[Callable[[], Any]] = None,
     on_bot_replaced: Optional[Callable[[Any], None]] = None,
     initial_retry_delay: float = 5.0,
     max_retry_delay: float = 60.0,
 ) -> None:
     """
-    Runs the Discord bot lifecycle with resilient error handling, controlled retry, and safe diagnostics.
+    Runs the Discord bot lifecycle with resilient error handling, controlled retry,
+    wake-on-command backoff interruption, and safe diagnostics.
     Never exposes tokens or logs secrets.
     Does NOT stop the HTTP monitoring server upon bot error or bot restart.
     """
@@ -429,6 +439,9 @@ async def run_discord_bot(
     max_reconnect_delay = max_retry_delay
 
     while not _should_stop():
+        if wake_event is not None and wake_event.is_set():
+            wake_event.clear()
+
         # If a previous connection attempt closed the bot client, recreate a fresh bot instance
         # so slash commands, event handlers, and aiohttp sessions are cleanly reinitialized.
         if hasattr(bot, "is_closed") and callable(bot.is_closed) and bot.is_closed():
@@ -542,28 +555,40 @@ async def run_discord_bot(
                 with suppress(Exception):
                     await bot.close()
 
-            # Wait with exponential backoff before reconnecting, unless shutdown or restart is signaled
+            # Wait with exponential backoff before reconnecting, unless shutdown, stop, or wake is signaled
+            wait_events: list[asyncio.Event] = [shutdown_event]
+            if stop_event is not None:
+                wait_events.append(stop_event)
+            if wake_event is not None:
+                wait_events.append(wake_event)
             try:
                 await _wait_for_any_event(
-                    [shutdown_event, stop_event] if stop_event else [shutdown_event],
+                    wait_events,
                     timeout=reconnect_delay,
                 )
+                if _should_stop():
+                    break
+                if wake_event is not None and wake_event.is_set():
+                    wake_event.clear()
+                    reconnect_delay = initial_retry_delay
+                    logger.info("Wake-on-command signal received during backoff; reconnecting to Discord Gateway immediately...")
+                    continue
                 break
             except asyncio.TimeoutError:
                 reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
 
 
 # ------------------------------------------------------------------------------
-# Bot Lifecycle Manager (Safe In-Process Restart Orchestration)
+# Bot Lifecycle Manager (Safe In-Process Restart & Wake-on-Command Orchestration)
 # ------------------------------------------------------------------------------
 class BotLifecycleManager:
     """
     Coordinates the Discord bot lifecycle inside the unified Python process.
-    Supports authenticated, lock-protected bot restarts without stopping FastAPI:
+    Supports authenticated, lock-protected bot restarts and wake-on-command triggers without stopping FastAPI:
     - Cleanly closes the current Discord gateway session and cancels its task
     - Instantiates a fresh UBAgenBot (re-registering slash commands, events, and BotTracker)
     - Reconnects using the existing DISCORD_BOT_TOKEN with controlled retry on failure
-    - Enforces concurrency locking and cooldown throttling across restart requests
+    - Enforces concurrency locking and cooldown throttling across restart and wake requests
     """
 
     def __init__(
@@ -572,6 +597,7 @@ class BotLifecycleManager:
         dev_guild_id: Optional[int] = None,
         shutdown_event: Optional[asyncio.Event] = None,
         cooldown_seconds: float = 15.0,
+        wake_cooldown_seconds: float = 10.0,
         retry_delay: float = 5.0,
         health_app: Any = None,
     ) -> None:
@@ -579,13 +605,20 @@ class BotLifecycleManager:
         self._custom_bot_factory = bot_factory
         self.shutdown_event = shutdown_event or asyncio.Event()
         self.cooldown_seconds = cooldown_seconds
+        self.wake_cooldown_seconds = wake_cooldown_seconds
         self.retry_delay = retry_delay
         self.health_app = health_app
 
         self._restart_lock = asyncio.Lock()
+        self._wake_lock = asyncio.Lock()
         self.is_restarting: bool = False
         self.last_restart_at: float = 0.0
+        self.last_wake_at: float = 0.0
+        self.last_wake_epoch: Optional[float] = None
+        self.last_wake_reason: Optional[str] = None
+        self.wake_attempts: int = 0
         self._stop_bot_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
         self.bot_task: Optional[asyncio.Task] = None
 
         self.bot: Any = self._create_bot_instance()
@@ -604,6 +637,31 @@ class BotLifecycleManager:
                 bot_inst.lifecycle_manager = self
         return bot_inst
 
+    def is_gateway_connected(self) -> bool:
+        """Return True if the bot instance has an active Discord Gateway connection."""
+        if self.bot is None:
+            return False
+        if hasattr(self.bot, "is_closed") and callable(self.bot.is_closed):
+            with suppress(Exception):
+                if bool(self.bot.is_closed()):
+                    return False
+        tracker = getattr(self.bot, "tracker", None)
+        return bool(getattr(tracker, "connected", False)) if tracker is not None else False
+
+    def is_bot_ready(self) -> bool:
+        """
+        Return True ONLY when the Discord bot is both connected to Gateway AND fully ready
+        (guilds cached, setup complete, runner task alive). Never reports ready prematurely.
+        """
+        if not self.is_gateway_connected():
+            return False
+        if self.bot_task is not None and self.bot_task.done():
+            return False
+        tracker = getattr(self.bot, "tracker", None)
+        tracker_ready = bool(getattr(tracker, "is_ready", False)) if tracker is not None else False
+        bot_ready_fn = getattr(self.bot, "is_ready", None)
+        live_ready = bool(bot_ready_fn()) if callable(bot_ready_fn) else tracker_ready
+        return bool(tracker_ready and live_ready)
 
     def _update_active_bot(self, new_bot: Any) -> None:
         self.bot = new_bot
@@ -617,6 +675,7 @@ class BotLifecycleManager:
         app.state.bot = self.bot
         app.state.bot_manager = self
         app.state.restart_bot = self.restart_bot
+        app.state.ensure_bot_awake = self.ensure_bot_awake
 
     def get_bot_token(self) -> str:
         """Retrieve current DISCORD_BOT_TOKEN from environment without mutating or logging it."""
@@ -627,12 +686,14 @@ class BotLifecycleManager:
         bot_token = self.get_bot_token()
         if self.bot is not None and not is_placeholder_bot_token(bot_token):
             self._stop_bot_event = asyncio.Event()
+            self._wake_event = asyncio.Event()
             self.bot_task = asyncio.create_task(
                 run_discord_bot(
                     self.bot,
                     bot_token,
                     self.shutdown_event,
                     stop_event=self._stop_bot_event,
+                    wake_event=self._wake_event,
                     bot_factory=self._create_bot_instance,
                     on_bot_replaced=self._update_active_bot,
                     initial_retry_delay=self.retry_delay,
@@ -697,6 +758,179 @@ class BotLifecycleManager:
 
         self.bot_task = None
 
+    async def ensure_bot_awake(
+        self,
+        reason: str = "command_trigger",
+        wait_for_ready_timeout: float = 0.0,
+    ) -> tuple[int, dict[str, Any]]:
+        """
+        Idempotent, single-flight Wake-on-Command handler:
+        - If the bot is already connected and ready, returns 200 without restarting it.
+        - If a wake or restart is already running, coalesces concurrent requests (`deduplicated=True`)
+          so simultaneous commands never start duplicate bot workers.
+        - If the bot is sleeping in retry backoff, signals `_wake_event` to reconnect immediately.
+        - If the bot task is stopped, closed, or disconnected, starts a fresh bot worker with cooldown protection.
+        """
+        clean_reason = (reason or "command_trigger").strip()[:80]
+        if self.is_bot_ready():
+            return 200, {
+                "status": "already_ready",
+                "woken": False,
+                "deduplicated": False,
+                "http_alive": True,
+                "discord_connected": True,
+                "bot_ready": True,
+                "reason": clean_reason,
+                "message": "Discord bot is already connected and ready.",
+            }
+
+        bot_token = self.get_bot_token()
+        if is_placeholder_bot_token(bot_token):
+            return 503, {
+                "status": "not_configured",
+                "woken": False,
+                "http_alive": True,
+                "discord_connected": False,
+                "bot_ready": False,
+                "error": "Cannot wake Discord bot: DISCORD_BOT_TOKEN is not configured on the server.",
+            }
+
+        if self.is_restarting or self._restart_lock.locked() or self._wake_lock.locked():
+            return 202, {
+                "status": "wake_in_progress",
+                "woken": False,
+                "deduplicated": True,
+                "http_alive": True,
+                "discord_connected": self.is_gateway_connected(),
+                "bot_ready": self.is_bot_ready(),
+                "reason": clean_reason,
+                "message": "A bot wake or reconnect operation is already in progress.",
+            }
+
+        async with self._wake_lock:
+            if self.is_bot_ready():
+                return 200, {
+                    "status": "already_ready",
+                    "woken": False,
+                    "deduplicated": False,
+                    "http_alive": True,
+                    "discord_connected": True,
+                    "bot_ready": True,
+                    "reason": clean_reason,
+                    "message": "Discord bot is already connected and ready.",
+                }
+
+            tracker = getattr(self.bot, "tracker", None) if self.bot is not None else None
+            tracker_status = getattr(tracker, "status", "disconnected") if tracker is not None else "disconnected"
+            task_alive = self.bot_task is not None and not self.bot_task.done()
+
+            # If a connection attempt is already actively in flight, coalesce without spawning another worker
+            if task_alive and tracker_status == "connecting":
+                self._wake_event.set()
+                return 202, {
+                    "status": "connecting",
+                    "woken": False,
+                    "deduplicated": True,
+                    "http_alive": True,
+                    "discord_connected": self.is_gateway_connected(),
+                    "bot_ready": False,
+                    "reason": clean_reason,
+                    "message": "Discord bot is currently connecting to the Gateway.",
+                }
+
+            now = time.monotonic()
+            if self.last_wake_at > 0 and (now - self.last_wake_at) < self.wake_cooldown_seconds and task_alive:
+                remaining = max(1, int(round(self.wake_cooldown_seconds - (now - self.last_wake_at))))
+                self._wake_event.set()
+                return 429, {
+                    "status": "cooldown",
+                    "woken": False,
+                    "deduplicated": True,
+                    "http_alive": True,
+                    "discord_connected": self.is_gateway_connected(),
+                    "bot_ready": False,
+                    "retry_after": remaining,
+                    "error": f"Bot wake was triggered recently. Wait {remaining} seconds before trying again.",
+                }
+
+            self.last_wake_at = now
+            self.last_wake_epoch = time.time()
+            self.last_wake_reason = clean_reason
+            self.wake_attempts += 1
+
+            # Case A: Runner task is alive and waiting in retry backoff -> interrupt backoff immediately
+            if task_alive and tracker_status in ("network_error", "api_error", "disconnected"):
+                logger.info("Wake-on-command (%s): signaling active runner to reconnect immediately.", clean_reason)
+                if tracker is not None:
+                    tracker.status = "connecting"
+                    tracker.diagnostic_message = f"Wake-on-command ({clean_reason}): reconnecting to Discord Gateway..."
+                self._wake_event.set()
+            else:
+                # Case B: Bot task is not running, finished, or closed -> start a clean bot worker
+                logger.info("Wake-on-command (%s): starting fresh Discord bot worker...", clean_reason)
+                await self.stop_bot()
+                new_bot = self._create_bot_instance()
+                if new_bot is None:
+                    return 503, {
+                        "status": "unavailable",
+                        "woken": False,
+                        "http_alive": True,
+                        "discord_connected": False,
+                        "bot_ready": False,
+                        "error": "The bot worker is not currently available to start.",
+                    }
+                new_tracker = getattr(new_bot, "tracker", None)
+                if new_tracker is not None:
+                    new_tracker.status = "connecting"
+                    new_tracker.connected = False
+                    new_tracker.is_ready = False
+                    new_tracker.diagnostic_message = (
+                        f"Wake-on-command ({clean_reason}) triggered. Connecting to Discord Gateway..."
+                    )
+                if hasattr(new_bot, "write_state_file"):
+                    with suppress(Exception):
+                        new_bot.write_state_file()
+
+                self._update_active_bot(new_bot)
+                self._stop_bot_event = asyncio.Event()
+                self._wake_event = asyncio.Event()
+                self.bot_task = asyncio.create_task(
+                    run_discord_bot(
+                        new_bot,
+                        bot_token,
+                        self.shutdown_event,
+                        stop_event=self._stop_bot_event,
+                        wake_event=self._wake_event,
+                        bot_factory=self._create_bot_instance,
+                        on_bot_replaced=self._update_active_bot,
+                        initial_retry_delay=self.retry_delay,
+                    )
+                )
+
+            if wait_for_ready_timeout > 0:
+                deadline = time.monotonic() + min(float(wait_for_ready_timeout), 10.0)
+                while time.monotonic() < deadline:
+                    if self.is_bot_ready():
+                        break
+                    await asyncio.sleep(0.05)
+
+            ready_now = self.is_bot_ready()
+            return (200 if ready_now else 202), {
+                "status": "ready" if ready_now else "waking",
+                "woken": True,
+                "deduplicated": False,
+                "http_alive": True,
+                "discord_connected": self.is_gateway_connected(),
+                "bot_ready": ready_now,
+                "reason": clean_reason,
+                "wake_attempts": self.wake_attempts,
+                "message": (
+                    "Discord bot woke up and is ready."
+                    if ready_now
+                    else "Wake-on-command accepted. Discord bot is connecting to Gateway."
+                ),
+            }
+
     async def restart_bot(self) -> tuple[int, dict[str, Any]]:
         """
         Safely restart the Discord bot in-process while keeping the HTTP server online.
@@ -756,12 +990,14 @@ class BotLifecycleManager:
                 self._update_active_bot(new_bot)
 
                 self._stop_bot_event = asyncio.Event()
+                self._wake_event = asyncio.Event()
                 self.bot_task = asyncio.create_task(
                     run_discord_bot(
                         new_bot,
                         bot_token,
                         self.shutdown_event,
                         stop_event=self._stop_bot_event,
+                        wake_event=self._wake_event,
                         bot_factory=self._create_bot_instance,
                         on_bot_replaced=self._update_active_bot,
                         initial_retry_delay=self.retry_delay,
