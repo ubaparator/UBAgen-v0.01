@@ -16,10 +16,16 @@ concurrency:
 
 jobs:
   python-tests-and-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Install FFmpeg tools for encoder integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+          ffmpeg -version
+          ffprobe -version
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -31,7 +37,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
       - name: Install Node dependencies
         run: npm install
       - name: Build frontend
