@@ -1202,6 +1202,15 @@ def _render_oauth_error_html(title: str, safe_message: str) -> str:
 REMOVED_DRIVE_SLASH_COMMANDS = ("drive_bagla", "drive_durum", "drive_ayir", "drive_yardim", "drive")
 
 
+def scrub_legacy_drive_commands_from_tree(tree: Any) -> None:
+    """Idempotently remove legacy Drive slash commands from a Discord CommandTree."""
+    if tree is None:
+        return
+    for command_name in REMOVED_DRIVE_SLASH_COMMANDS:
+        with suppress(Exception):
+            tree.remove_command(command_name)
+
+
 def register_drive_oauth_commands(tree: Any) -> None:
     """
     Ensure legacy Discord Drive slash commands (`/drive_bagla`, `/drive_durum`, `/drive_ayir`, `/drive_yardim`)

@@ -1150,6 +1150,34 @@ class RcloneStorageManager:
     # ------------------------------------------------------------------
     # Connection Test, Safe Disconnect & Reconnect
     # ------------------------------------------------------------------
+    def set_account_enabled(self, remote_name: str, enabled: bool) -> tuple[bool, dict[str, Any]]:
+        """Enable or disable an existing remote for new uploads without deleting remote files."""
+        clean_remote = self.validate_remote_name(remote_name)
+        account = self.get_account(clean_remote)
+        if account is None:
+            return False, {"ok": False, "error": f"Rclone hesabı bulunamadı: {clean_remote}"}
+        if account.status == "disconnected" and enabled:
+            return False, {"ok": False, "error": "Önce hesabı yeniden bağlayıp bağlantıyı test edin."}
+        now = time.time()
+        new_status = "connected" if enabled else "disabled"
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE rclone_accounts SET is_active = ?, status = ?, updated_at = ? WHERE remote_name = ?;",
+                (1 if enabled else 0, new_status, now, clean_remote),
+            )
+            conn.commit()
+        self.sync_rclone_conf_file()
+        updated = self.get_account(clean_remote)
+        return True, {
+            "ok": True,
+            "message": "Hesap etkinleştirildi." if enabled else "Hesap yüklemeler için devre dışı bırakıldı.",
+            "account": updated.to_public_dict(self.count_pending_deletions(clean_remote)) if updated else {},
+        }
+
+    def test_account(self, remote_name: str) -> dict[str, Any]:
+        """Backward-compatible alias used by diagnostics."""
+        return self.test_account_connection(remote_name)
+
     def test_account_connection(self, remote_name: str) -> dict[str, Any]:
         """
         Run a real `rclone about <remote>:` and `rclone lsd <remote>:` probe against the account,
@@ -1721,7 +1749,7 @@ class RcloneStorageManager:
         out = re.sub(r"(?i)(pass|password|token|client_secret|refresh_token|access_token)\s*[=:]\s*\S+", r"\1=[REDACTED]", out)
         return out
 
-    def get_status_summary(self) -> dict[str, Any]:
+    def get_status_summary(self, refresh_storage: bool = False) -> dict[str, Any]:
         """Return complete non-sensitive status of rclone binary, accounts, and pending deletions."""
         bin_info = check_rclone_binary()
         accounts = self.list_accounts()
@@ -2349,4 +2377,26 @@ def register_log_command(
             bot=bot,
             bot_manager=bot_manager,
         )
+
+
+# Backward-compatible names used by health_api.py and older deployments.
+def install_rclone_error_buffer_handler() -> None:
+    install_error_ring_buffer()
+
+
+def collect_log_diagnostics(
+    *,
+    bot: Optional[Any] = None,
+    bot_manager: Optional[Any] = None,
+    run_live_remote_tests: bool = False,
+) -> dict[str, Any]:
+    return collect_diagnostic_log_report(
+        bot=bot,
+        bot_manager=bot_manager,
+        run_live_remote_tests=run_live_remote_tests,
+    )
+
+
+def format_log_diagnostics_report(report: dict[str, Any]) -> str:
+    return format_diagnostic_log_for_discord(report)
 

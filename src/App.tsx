@@ -31,6 +31,7 @@ import {
   X,
 } from 'lucide-react';
 import { executeBotRestartRequest, resolveRestartBotUrl } from './restartBot';
+import RcloneManagement from './RcloneManagement';
 
 export { executeBotRestartRequest, resolveRestartBotUrl };
 
@@ -250,6 +251,7 @@ export default function App() {
     return localStorage.getItem('ubagen_custom_client_id') || '';
   });
   const [permissionPreset, setPermissionPreset] = useState<'recommended' | 'admin' | 'basic'>('recommended');
+  const [showRcloneManagement, setShowRcloneManagement] = useState<boolean>(false);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -520,6 +522,17 @@ export default function App() {
 
         {/* Header Actions & Controls */}
         <div className="flex items-center flex-wrap gap-2.5">
+          {/* Rclone storage management */}
+          <button
+            type="button"
+            onClick={() => setShowRcloneManagement(true)}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-500/10 text-emerald-200 border border-emerald-500/30 hover:bg-emerald-500/20 transition-all flex items-center gap-1.5 cursor-pointer"
+            title="MEGA ve Google Drive hesaplarını ve depolama kotalarını yönet"
+          >
+            <HardDrive className="w-3.5 h-3.5" />
+            <span>Rclone Yönetimi</span>
+          </button>
+
           {/* Pause / Resume Button */}
           <button
             onClick={handleTogglePause}
@@ -608,6 +621,10 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {showRcloneManagement && (
+        <RcloneManagement onClose={() => setShowRcloneManagement(false)} />
+      )}
 
       {/* Endpoint Configuration Bar (Collapsible) */}
       {showConfig && (

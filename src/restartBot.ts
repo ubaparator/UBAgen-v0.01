@@ -36,7 +36,7 @@ export function resolveRestartBotUrl(endpointUrl: string): string {
   }
 
   // Full HTTP(S) URL
-  if (/^https?:\/\//i.test(raw)) {
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
     let parsed: URL;
     try {
       parsed = new URL(raw);
@@ -186,4 +186,17 @@ export async function executeBotRestartRequest(options: {
     message: serverMessage ? `${statusExplanation} (${serverMessage})` : statusExplanation,
     retryAfterSeconds,
   };
+}
+
+/**
+ * Resolve an API path for legacy panels that use same-origin backend routing.
+ * Absolute HTTP(S) URLs are preserved; relative paths are normalized to root-relative paths.
+ */
+export function resolveApiUrl(path: string): string {
+  const raw = (path || '').trim();
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+  if (raw.startsWith('//')) {
+    throw new Error('Protocol-relative API URLs are not supported.');
+  }
+  return raw.startsWith('/') ? raw : `/${raw}`;
 }
