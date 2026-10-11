@@ -102,7 +102,7 @@ function statusLabel(status: string): string {
 
 export default function RcloneManagement({ onClose }: Props) {
   const [status, setStatus] = useState<RcloneStatus | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [busyKey, setBusyKey] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -144,9 +144,9 @@ export default function RcloneManagement({ onClose }: Props) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [adminToken]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { if (adminToken) void refresh(); }, [adminToken, refresh]);
 
   const mutate = async (key: string, url: string, body?: unknown, successMessage?: string) => {
     setBusyKey(key);
@@ -360,7 +360,7 @@ export default function RcloneManagement({ onClose }: Props) {
                 <div className="sm:col-span-2"><h4 className="text-sm font-semibold text-white">Google Drive hesabı bağla</h4><p className="mt-1 text-xs leading-5 text-slate-400">Rclone’un varsayılan OAuth akışı kullanılır; bu arayüz Google Cloud projesi veya özel OAuth anahtarı istemez. Sağlayıcı kısıtlamaları nedeniyle yetkilendirme tamamlanamayabilir.</p></div>
                 <label className="space-y-1 text-xs text-slate-300">Remote adı<input className={inputClass} value={driveName} onChange={e => setDriveName(e.target.value)} placeholder="gdrive_account" autoComplete="off" required /></label>
                 <label className="space-y-1 text-xs text-slate-300">Görünen ad (isteğe bağlı)<input className={inputClass} value={driveDisplayName} onChange={e => setDriveDisplayName(e.target.value)} placeholder="Google Drive hesabım" /></label>
-                <div className="flex flex-wrap gap-2 sm:col-span-2"><button type="submit" disabled={!!busyKey} className={`${buttonClass} border-indigo-500/40 bg-indigo-600 text-white hover:bg-indigo-500`}>{busyKey === 'start-drive' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />} Yönetici Google hesabıyla yetkilendir</button><button type="button" onClick={() => { setShowDriveForm(false); setDriveSession(null); setDriveCodeOrToken(''); }} className={`${buttonClass} border-slate-700 text-slate-300 hover:bg-slate-800`}>İptal</button></div>
+                <div className="flex flex-wrap gap-2 sm:col-span-2"><button type="submit" disabled={!!busyKey || !adminToken} className={`${buttonClass} border-indigo-500/40 bg-indigo-600 text-white hover:bg-indigo-500`}>{busyKey === 'start-drive' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />} Yönetici Google hesabıyla yetkilendir</button><button type="button" onClick={() => { setShowDriveForm(false); setDriveSession(null); setDriveCodeOrToken(''); }} className={`${buttonClass} border-slate-700 text-slate-300 hover:bg-slate-800`}>İptal</button></div>
               </form>
               {driveSession && <form onSubmit={completeDriveAuth} className="space-y-3 rounded-xl border border-indigo-500/25 bg-slate-950/80 p-4">
                 <div className="flex items-start gap-2"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-indigo-300" /><div><p className="text-sm font-semibold text-white">Yetkilendirmeyi tamamla</p><p className="mt-1 whitespace-pre-line text-xs leading-5 text-slate-400">{driveSession.instructions_tr || 'Google yetkilendirmesini tamamladıktan sonra yönlendirme URL’sini, kodu veya rclone token JSON çıktısını aşağıya yapıştır.'}</p></div></div>
