@@ -187,3 +187,16 @@ export async function executeBotRestartRequest(options: {
     retryAfterSeconds,
   };
 }
+
+/**
+ * Resolve an API path for legacy panels that use same-origin backend routing.
+ * Absolute HTTP(S) URLs are preserved; relative paths are normalized to root-relative paths.
+ */
+export function resolveApiUrl(path: string): string {
+  const raw = (path || '').trim();
+  if (/^https?:\\/\\//i.test(raw)) return raw;
+  if (raw.startsWith('//')) {
+    throw new Error('Protocol-relative API URLs are not supported.');
+  }
+  return raw.startsWith('/') ? raw : `/${raw}`;
+}
