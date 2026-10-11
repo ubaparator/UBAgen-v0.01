@@ -54,10 +54,10 @@ const panelClass = 'rounded-xl border border-slate-800 bg-slate-900/80';
 const inputClass = 'w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 placeholder:text-slate-600';
 const buttonClass = 'inline-flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50';
 
-async function requestJson(url: string, init?: RequestInit): Promise<any> {
+async function requestJson(url: string, init?: RequestInit, adminToken?: string): Promise<any> {
   const response = await fetch(url, {
     ...init,
-    headers: { Accept: 'application/json', ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers },
+    headers: { Accept: 'application/json', ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...(adminToken ? { Authorization: `Bearer ${adminToken}` } : {}), ...init?.headers },
     cache: 'no-store',
   });
   const raw = await response.text();
@@ -117,6 +117,9 @@ export default function RcloneManagement({ onClose }: Props) {
   const [driveCodeOrToken, setDriveCodeOrToken] = useState('');
   const [showMegaForm, setShowMegaForm] = useState(false);
   const [showDriveForm, setShowDriveForm] = useState(false);
+  const [adminToken, setAdminToken] = useState('');
+  const [adminTokenInput, setAdminTokenInput] = useState('');
+  const [showAuthForm, setShowAuthForm] = useState(true);
 
   const accounts = status?.accounts || [];
   const sortedAccounts = useMemo(
@@ -125,10 +128,16 @@ export default function RcloneManagement({ onClose }: Props) {
   );
 
   const refresh = useCallback(async (showSpinner = true) => {
+    if (!adminToken) {
+      setLoading(false);
+      setShowAuthForm(true);
+      setError('Rclone yönetimi için önce sunucu yönetici tokenı ile yetkilendir.');
+      return;
+    }
     if (showSpinner) setLoading(true);
     setError('');
     try {
-      const data = await requestJson('/api/rclone/status?refresh=true');
+      const data = await requestJson('/api/rclone/status?refresh=true', undefined, adminToken);
       setStatus(data as RcloneStatus);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Rclone durumu alınamadı.');
@@ -147,7 +156,7 @@ export default function RcloneManagement({ onClose }: Props) {
       await requestJson(url, {
         method: 'POST',
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
+      }, adminToken);
       setNotice(successMessage || 'İşlem tamamlandı.');
       await refresh(false);
       return true;
@@ -199,7 +208,7 @@ export default function RcloneManagement({ onClose }: Props) {
           remote_base_path: 'ubagen_outputs',
           scope: 'drive.file',
         }),
-      });
+      }, adminToken);
       setDriveSession(data);
       setDriveCodeOrToken('');
       setNotice('Yetkilendirme oturumu başlatıldı. Google hesabını onayla, ardından yönlendirme adresini/kodunu veya rclone token JSON çıktısını aşağıya gir.');
@@ -273,7 +282,10 @@ export default function RcloneManagement({ onClose }: Props) {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <button type="button" onClick={() => void refresh()} disabled={loading} className={`${buttonClass} border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700`}>
+            <button type="button" onClick={() => { setShowAuthForm(v => !v); setError(''); }} className={`${buttonClass} ${adminToken ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/30 bg-amber-500/10 text-amber-200'} hover:opacity-90`}>
+              <ShieldCheck className="h-4 w-4" /> {adminToken ? 'Yönetici yetkisi açık' : 'Yönetici ile yetkilendir'}
+            </button>
+            <button type="button" onClick={() => void refresh()} disabled={loading || !adminToken} className={`${buttonClass} border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700`}>
               <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Yenile
             </button>
             <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white" aria-label="Rclone yönetimini kapat"><X className="h-5 w-5" /></button>
@@ -281,6 +293,32 @@ export default function RcloneManagement({ onClose }: Props) {
         </div>
 
         <div className="max-h-[calc(100vh-90px)] space-y-5 overflow-y-auto p-4 sm:p-6">
+          {showAuthForm && <form onSubmit={async event => {
+            event.preventDefault();
+            const candidate = adminTokenInput.trim();
+            if (!candidate) { setError('Sunucuda tanımlı UBAGEN_ADMIN_TOKEN değerini gir.'); return; }
+            setBusyKey('admin-auth');
+            setError('');
+            setNotice('');
+            try {
+              const data = await requestJson('/api/rclone/status?refresh=false', undefined, candidate);
+              setAdminToken(candidate);
+              setStatus(data as RcloneStatus);
+              setAdminTokenInput('');
+              setShowAuthForm(false);
+              setNotice('Yönetici yetkisi doğrulandı. Token yalnızca bu sayfa açıkken bellekte tutulur.');
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'Yönetici yetkilendirmesi başarısız.');
+            } finally { setBusyKey(''); }
+          }} className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-4 sm:p-5">
+            <h3 className="font-semibold text-white">Yönetici hesabıyla yetkilendir</h3>
+            <p className="mt-1 text-xs leading-5 text-slate-400">Sunucuda <code>UBAGEN_ADMIN_TOKEN</code> olarak tanımlı yönetici anahtarını gir. Bu anahtar tarayıcı depolamasına kaydedilmez ve yalnızca korumalı rclone API isteklerinde gönderilir.</p>
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+              <input type="password" autoComplete="current-password" className={inputClass} value={adminTokenInput} onChange={e => setAdminTokenInput(e.target.value)} placeholder="Sunucu yönetici tokenı" required />
+              <button type="submit" disabled={busyKey === 'admin-auth'} className={`${buttonClass} shrink-0 border-emerald-500/30 bg-emerald-600 text-white hover:bg-emerald-500`}>{busyKey === 'admin-auth' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />} Yetkilendir</button>
+            </div>
+            {adminToken && <button type="button" onClick={() => { setAdminToken(''); setStatus(null); setShowAuthForm(true); setNotice('Yönetici oturumu kapatıldı.'); }} className="mt-3 text-xs text-rose-300 underline underline-offset-4">Yetkiyi kaldır</button>}
+          </form>}
           {error && <div role="alert" className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-200"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>{error}</span></div>}
           {notice && <div role="status" className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-sm text-emerald-200"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /><span>{notice}</span></div>}
 
@@ -304,7 +342,7 @@ export default function RcloneManagement({ onClose }: Props) {
               <div><h3 className="font-semibold text-white">Hesaplar</h3><p className="mt-1 text-xs text-slate-400">Kota, bağlantı durumu ve yükleme için etkinlik ayarları</p></div>
               <div className="flex gap-2">
                 <button type="button" onClick={() => { setProviderTab('mega'); setShowMegaForm(v => !v); setShowDriveForm(false); setError(''); }} className={`${buttonClass} border-emerald-500/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20`}><Plus className="h-4 w-4" /> MEGA ekle</button>
-                <button type="button" onClick={() => { setProviderTab('drive'); setShowDriveForm(v => !v); setShowMegaForm(false); setError(''); }} className={`${buttonClass} border-indigo-500/30 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20`}><Plus className="h-4 w-4" /> Drive ekle</button>
+                <button type="button" onClick={() => { setProviderTab('drive'); setShowDriveForm(v => !v); setShowMegaForm(false); setError(''); }} className={`${buttonClass} border-indigo-500/30 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20`}><Plus className="h-4 w-4" /> Google yöneticisini bağla</button>
               </div>
             </div>
 
@@ -322,7 +360,7 @@ export default function RcloneManagement({ onClose }: Props) {
                 <div className="sm:col-span-2"><h4 className="text-sm font-semibold text-white">Google Drive hesabı bağla</h4><p className="mt-1 text-xs leading-5 text-slate-400">Rclone’un varsayılan OAuth akışı kullanılır; bu arayüz Google Cloud projesi veya özel OAuth anahtarı istemez. Sağlayıcı kısıtlamaları nedeniyle yetkilendirme tamamlanamayabilir.</p></div>
                 <label className="space-y-1 text-xs text-slate-300">Remote adı<input className={inputClass} value={driveName} onChange={e => setDriveName(e.target.value)} placeholder="gdrive_account" autoComplete="off" required /></label>
                 <label className="space-y-1 text-xs text-slate-300">Görünen ad (isteğe bağlı)<input className={inputClass} value={driveDisplayName} onChange={e => setDriveDisplayName(e.target.value)} placeholder="Google Drive hesabım" /></label>
-                <div className="flex flex-wrap gap-2 sm:col-span-2"><button type="submit" disabled={!!busyKey} className={`${buttonClass} border-indigo-500/40 bg-indigo-600 text-white hover:bg-indigo-500`}>{busyKey === 'start-drive' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />} Yetkilendirmeyi başlat</button><button type="button" onClick={() => { setShowDriveForm(false); setDriveSession(null); setDriveCodeOrToken(''); }} className={`${buttonClass} border-slate-700 text-slate-300 hover:bg-slate-800`}>İptal</button></div>
+                <div className="flex flex-wrap gap-2 sm:col-span-2"><button type="submit" disabled={!!busyKey} className={`${buttonClass} border-indigo-500/40 bg-indigo-600 text-white hover:bg-indigo-500`}>{busyKey === 'start-drive' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />} Yönetici Google hesabıyla yetkilendir</button><button type="button" onClick={() => { setShowDriveForm(false); setDriveSession(null); setDriveCodeOrToken(''); }} className={`${buttonClass} border-slate-700 text-slate-300 hover:bg-slate-800`}>İptal</button></div>
               </form>
               {driveSession && <form onSubmit={completeDriveAuth} className="space-y-3 rounded-xl border border-indigo-500/25 bg-slate-950/80 p-4">
                 <div className="flex items-start gap-2"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-indigo-300" /><div><p className="text-sm font-semibold text-white">Yetkilendirmeyi tamamla</p><p className="mt-1 whitespace-pre-line text-xs leading-5 text-slate-400">{driveSession.instructions_tr || 'Google yetkilendirmesini tamamladıktan sonra yönlendirme URL’sini, kodu veya rclone token JSON çıktısını aşağıya yapıştır.'}</p></div></div>
