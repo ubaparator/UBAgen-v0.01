@@ -920,9 +920,15 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 4000);
       try {
+        const adminToken = process.env.UBAGEN_ADMIN_TOKEN?.trim();
+        const authHeader = req.headers.authorization || (adminToken ? `Bearer ${adminToken}` : undefined);
+        const headers: Record<string, string> = { Accept: 'application/json' };
+        if (authHeader) {
+          headers.Authorization = authHeader;
+        }
         const upstreamRes = await fetchFn(
           `${standaloneBackendUrl}/api/rclone/status?refresh=${refresh ? 'true' : 'false'}`,
-          { signal: controller.signal, headers: { Accept: 'application/json' } }
+          { signal: controller.signal, headers }
         );
         if (upstreamRes.ok) {
           return res.json(await upstreamRes.json());
@@ -973,13 +979,19 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 8000);
       try {
+        const adminToken = process.env.UBAGEN_ADMIN_TOKEN?.trim();
+        const authHeader = req.headers.authorization || (adminToken ? `Bearer ${adminToken}` : undefined);
+        const headers: Record<string, string> = {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        };
+        if (authHeader) {
+          headers.Authorization = authHeader;
+        }
         const upstreamRes = await fetchFn(`${standaloneBackendUrl}${upstreamPath}`, {
           method: 'POST',
           signal: controller.signal,
-          headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-          },
+          headers,
           body: JSON.stringify(req.body || {}),
         });
         const payload = await upstreamRes.json().catch(() => ({}));

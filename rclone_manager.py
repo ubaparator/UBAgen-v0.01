@@ -806,23 +806,28 @@ class RcloneStorageManager:
     def add_mega_account(
         self,
         *,
-        remote_name: str,
-        user: str,
+        remote_name: Optional[str] = None,
+        user: Optional[str] = None,
+        email: Optional[str] = None,
         password: str,
         display_name: Optional[str] = None,
         remote_base_path: str = "ubagen_outputs",
+        root_folder: Optional[str] = None,
         test_after_add: bool = False,
+        skip_verify: bool = False,
+        enabled: bool = True,
     ) -> dict[str, Any]:
         """
         Add or update a MEGA account using rclone's native authentication (`user` + `rclone obscure` password).
         Supports multiple MEGA accounts simultaneously.
         """
-        clean_remote = self.validate_remote_name(remote_name)
-        clean_user = (user or "").strip()
+        clean_user = (user or email or "").strip()
         if not clean_user:
             raise ValueError("MEGA kullanıcı adı / e-posta adresi zorunludur.")
+        raw_remote = (remote_name or "").strip() or f"mega_{uuid.uuid4().hex[:6]}"
+        clean_remote = self.validate_remote_name(raw_remote)
         obscured_pass = obscure_rclone_password(password)
-        clean_base = (remote_base_path or "ubagen_outputs").strip().strip("/") or "ubagen_outputs"
+        clean_base = (root_folder or remote_base_path or "ubagen_outputs").strip().strip("/") or "ubagen_outputs"
         clean_display = (display_name or f"MEGA ({mask_account_identity(clean_user)})").strip()[:100]
 
         cfg_payload = {
@@ -832,6 +837,7 @@ class RcloneStorageManager:
         }
         encrypted_cfg = self.cipher.encrypt(json.dumps(cfg_payload, ensure_ascii=False))
         now = time.time()
+        initial_status = "connected" if enabled else "disabled"
 
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -840,24 +846,24 @@ class RcloneStorageManager:
                     remote_name, provider, display_name, account_identity,
                     remote_base_path, encrypted_config_json, status, is_active,
                     last_error, created_at, updated_at
-                ) VALUES (?, 'mega', ?, ?, ?, ?, 'connected', 1, NULL, ?, ?)
+                ) VALUES (?, 'mega', ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(remote_name) DO UPDATE SET
                     provider = 'mega',
                     display_name = excluded.display_name,
                     account_identity = excluded.account_identity,
                     remote_base_path = excluded.remote_base_path,
                     encrypted_config_json = excluded.encrypted_config_json,
-                    status = 'connected',
-                    is_active = 1,
+                    status = excluded.status,
+                    is_active = excluded.is_active,
                     last_error = NULL,
                     updated_at = excluded.updated_at;
                 """,
-                (clean_remote, clean_display, clean_user, clean_base, encrypted_cfg, now, now),
+                (clean_remote, clean_display, clean_user, clean_base, encrypted_cfg, initial_status, 1 if enabled else 0, now, now),
             )
             conn.commit()
 
         self.sync_rclone_conf_file()
-        if test_after_add:
+        if test_after_add and not skip_verify:
             return self.test_account_connection(clean_remote)
         acc = self.get_account(clean_remote)
         return acc.to_public_dict(self.count_pending_deletions(clean_remote)) if acc else {}
@@ -1147,6 +1153,49 @@ class RcloneStorageManager:
             test_after_add=test_after_auth,
         )
 
+    def start_gdrive_auth_session(
+        self,
+        *,
+        remote_name: Optional[str] = None,
+        display_name: Optional[str] = "Google Drive",
+        scope: str = "drive.file",
+        root_folder: str = "ubagen_outputs",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Convenience alias for start_drive_authorization."""
+        clean_remote = (remote_name or "").strip() or f"gdrive_{uuid.uuid4().hex[:6]}"
+        base_path = str(kwargs.get("remote_base_path") or root_folder or "ubagen_outputs").strip()
+        return self.start_drive_authorization(
+            remote_name=clean_remote,
+            display_name=display_name,
+            remote_base_path=base_path,
+            scope=scope,
+        )
+
+    def complete_gdrive_auth(
+        self,
+        *,
+        remote_name: Optional[str] = None,
+        code_or_token: Optional[str] = None,
+        token_or_code: Optional[str] = None,
+        display_name: Optional[str] = None,
+        root_folder: str = "ubagen_outputs",
+        skip_verify: bool = False,
+        session_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Convenience alias for complete_drive_authorization."""
+        tok = str(code_or_token or token_or_code or kwargs.get("token") or kwargs.get("code") or "").strip()
+        rname = (remote_name or session_id or "").strip()
+        base_path = str(kwargs.get("remote_base_path") or root_folder or "ubagen_outputs").strip()
+        return self.complete_drive_authorization(
+            remote_name=rname,
+            token_or_callback=tok,
+            display_name=display_name,
+            remote_base_path=base_path,
+            test_after_auth=not skip_verify,
+        )
+
     # ------------------------------------------------------------------
     # Connection Test, Safe Disconnect & Reconnect
     # ------------------------------------------------------------------
@@ -1264,7 +1313,7 @@ class RcloneStorageManager:
         updated = self.get_account(clean_remote)
         return updated.to_public_dict(self.count_pending_deletions(clean_remote)) if updated else {}
 
-    def disconnect_account(self, remote_name: str) -> dict[str, Any]:
+    def disconnect_account(self, remote_name: str, remove_record: bool = False) -> dict[str, Any]:
         """
         Safely disconnect `remote_name`:
         - Sets `status = 'disconnected'` and `is_active = 0`.
@@ -1279,21 +1328,24 @@ class RcloneStorageManager:
 
         now = time.time()
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE rclone_accounts
-                SET status = 'disconnected', is_active = 0, updated_at = ?
-                WHERE remote_name = ?;
-                """,
-                (now, clean_remote),
-            )
+            if remove_record:
+                conn.execute("DELETE FROM rclone_accounts WHERE remote_name = ?;", (clean_remote,))
+            else:
+                conn.execute(
+                    """
+                    UPDATE rclone_accounts
+                    SET status = 'disconnected', is_active = 0, updated_at = ?
+                    WHERE remote_name = ?;
+                    """,
+                    (now, clean_remote),
+                )
             conn.commit()
 
         self._stop_auth_session_process(clean_remote)
         self.sync_rclone_conf_file()
         preserved_deletions = self.count_pending_deletions(clean_remote)
         updated = self.get_account(clean_remote)
-        result = updated.to_public_dict(preserved_deletions) if updated else {}
+        result = updated.to_public_dict(preserved_deletions) if updated else {"remote_name": clean_remote, "status": "removed"}
         result["files_deleted"] = False
         result["pending_deletions_preserved"] = True
         result["pending_deletions_count"] = preserved_deletions
@@ -1746,7 +1798,11 @@ class RcloneStorageManager:
         from stats import redact_sensitive_text
 
         out = redact_sensitive_text(text or "")
-        out = re.sub(r"(?i)(pass|password|token|client_secret|refresh_token|access_token)\s*[=:]\s*\S+", r"\1=[REDACTED]", out)
+        out = re.sub(
+            r"(?i)(pass|password|token|client_secret|refresh_token|access_token|auth|secret|key)\s*[=:]\s*\S+",
+            r"\1=[REDACTED]",
+            out,
+        )
         return out
 
     def get_status_summary(self, refresh_storage: bool = False) -> dict[str, Any]:
@@ -1784,6 +1840,13 @@ def get_rclone_manager() -> RcloneStorageManager:
         if _GLOBAL_RCLONE_MANAGER is None:
             _GLOBAL_RCLONE_MANAGER = RcloneStorageManager()
         return _GLOBAL_RCLONE_MANAGER
+
+
+def redact_rclone_text(text: str) -> str:
+    return RcloneStorageManager.redact_rclone_text(text)
+
+
+sanitize_rclone_text = redact_rclone_text
 
 
 def reset_rclone_manager_for_tests(mgr: Optional[RcloneStorageManager] = None) -> None:
