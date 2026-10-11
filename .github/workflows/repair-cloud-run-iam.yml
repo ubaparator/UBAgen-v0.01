@@ -1,74 +1,40 @@
-name: Repair Cloud Run encoder IAM
+name: Validate no-IAM encoder migration
 
 on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      confirm:
-        description: "Type APPLY to grant the runtime service account permission to execute the encoder Job"
-        required: true
-        type: string
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
-  group: ubagen-cloud-run-iam
-  cancel-in-progress: false
+  group: ubagen-encoder-validation-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  grant-job-execution:
-    if: ${{ inputs.confirm == 'APPLY' }}
+  python-tests-and-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    env:
-      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-      GCP_REGION: ${{ vars.GCP_REGION }}
-      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      GCP_DEPLOYER_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
-      UBAGEN_RUNTIME_SERVICE_ACCOUNT: ${{ vars.UBAGEN_RUNTIME_SERVICE_ACCOUNT }}
-      UBAGEN_CLOUD_RUN_JOB_NAME: ${{ vars.UBAGEN_CLOUD_RUN_JOB_NAME }}
+    timeout-minutes: 20
     steps:
-      - name: Validate repository configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          for name in GCP_PROJECT_ID GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOYER_SERVICE_ACCOUNT UBAGEN_RUNTIME_SERVICE_ACCOUNT; do
-            if [[ -z "${!name}" ]]; then
-              echo "::error::Missing GitHub Actions repository variable: $name"
-              exit 1
-            fi
-          done
-          echo "Region: ${GCP_REGION:-europe-west2}"
-          echo "Job: ${UBAGEN_CLOUD_RUN_JOB_NAME:-ubagen-encoder-worker}"
-          echo "Runtime service account: ${UBAGEN_RUNTIME_SERVICE_ACCOUNT}"
-
-      - name: Authenticate to Google Cloud with Workload Identity Federation
-        id: auth
-        uses: google-github-actions/auth@v2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
-
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Grant execution permission on the encoder Job
-        shell: bash
-        run: |
-          set -euo pipefail
-          gcloud run jobs add-iam-policy-binding "${UBAGEN_CLOUD_RUN_JOB_NAME:-ubagen-encoder-worker}" \
-            --project="${GCP_PROJECT_ID}" \
-            --region="${GCP_REGION:-europe-west2}" \
-            --member="serviceAccount:${UBAGEN_RUNTIME_SERVICE_ACCOUNT}" \
-            --role="roles/run.jobsExecutor"
-
-      - name: Verify the Job IAM policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          gcloud run jobs get-iam-policy "${UBAGEN_CLOUD_RUN_JOB_NAME:-ubagen-encoder-worker}" \
-            --project="${GCP_PROJECT_ID}" \
-            --region="${GCP_REGION:-europe-west2}" \
-            --format="table(bindings.role,bindings.members)"
+          python-version: "3.12"
+          cache: pip
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Run Python tests
+        run: python -B -m unittest discover -s tests -p "test_*.py" -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install Node dependencies
+        run: npm install
+      - name: Build frontend
+        run: npm run build
+      - name: Type-check
+        run: npm run lint
