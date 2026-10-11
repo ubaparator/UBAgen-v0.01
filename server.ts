@@ -911,8 +911,24 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     );
   });
 
+  const authorizeRcloneAdmin = (req: express.Request, res: express.Response): boolean => {
+    res.setHeader('Cache-Control', 'no-store');
+    const expectedToken = (process.env.UBAGEN_ADMIN_TOKEN || '').trim();
+    if (!expectedToken) {
+      res.status(503).json({ ok: false, error: 'Rclone yönetimi devre dışı: sunucuda UBAGEN_ADMIN_TOKEN tanımlı değil.' });
+      return false;
+    }
+    if (!verifyAdminToken(req.header('authorization'), expectedToken)) {
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      res.status(401).json({ ok: false, error: 'Yetkisiz erişim. Rclone yönetimi için yönetici tokenı gerekli.' });
+      return false;
+    }
+    return true;
+  };
+
   // GET /api/rclone/status: Multi-account MEGA & Google Drive Rclone status
   app.get('/api/rclone/status', async (req, res) => {
+    if (!authorizeRcloneAdmin(req, res)) return;
     res.setHeader('Cache-Control', 'no-store');
     const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
     const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
@@ -921,11 +937,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       const timeout = setTimeout(() => controller.abort(), 4000);
       try {
         const adminToken = process.env.UBAGEN_ADMIN_TOKEN?.trim();
-        const authHeader = req.headers.authorization || (adminToken ? `Bearer ${adminToken}` : undefined);
-        const headers: Record<string, string> = { Accept: 'application/json' };
-        if (authHeader) {
-          headers.Authorization = authHeader;
-        }
+        const headers: Record<string, string> = { Accept: 'application/json', Authorization: `Bearer ${adminToken}` };
         const upstreamRes = await fetchFn(
           `${standaloneBackendUrl}/api/rclone/status?refresh=${refresh ? 'true' : 'false'}`,
           { signal: controller.signal, headers }
@@ -973,6 +985,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     pyArgs: string[],
     successStatus = 200
   ) => {
+    if (!authorizeRcloneAdmin(req, res)) return;
     res.setHeader('Cache-Control', 'no-store');
     const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
     try {
@@ -980,14 +993,11 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       const timeout = setTimeout(() => controller.abort(), 8000);
       try {
         const adminToken = process.env.UBAGEN_ADMIN_TOKEN?.trim();
-        const authHeader = req.headers.authorization || (adminToken ? `Bearer ${adminToken}` : undefined);
         const headers: Record<string, string> = {
           Accept: 'application/json',
           'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
         };
-        if (authHeader) {
-          headers.Authorization = authHeader;
-        }
         const upstreamRes = await fetchFn(`${standaloneBackendUrl}${upstreamPath}`, {
           method: 'POST',
           signal: controller.signal,
@@ -1027,7 +1037,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       req,
       res,
       '/api/rclone/accounts/mega',
-      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); ok, out = get_rclone_manager().add_mega_account(display_name=str(b.get("display_name") or ""), email=str(b.get("email") or ""), password=str(b.get("password") or ""), remote_name=str(b.get("remote_name") or "").strip() or None, root_folder=str(b.get("root_folder") or "UBAgen_Outputs").strip(), enabled=bool(b.get("enabled", True)), skip_verify=bool(b.get("skip_verify", False))); out["_http_status"] = 201 if ok else 400; print(json.dumps(out))',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); out = get_rclone_manager().add_mega_account(display_name=str(b.get("display_name") or ""), user=str(b.get("user") or b.get("email") or ""), password=str(b.get("password") or ""), remote_name=str(b.get("remote_name") or "").strip() or None, remote_base_path=str(b.get("remote_base_path") or b.get("root_folder") or "ubagen_outputs").strip(), test_after_add=True); ok = bool(out.get("last_test_ok", out.get("status") == "connected")); print(json.dumps({"ok": ok, "account": out, **({"error": out.get("last_error") or "MEGA bağlantı testi başarısız."} if not ok else {})})); sys.exit(0)',
       [bodyJson],
       201
     );
@@ -1039,7 +1049,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       req,
       res,
       '/api/rclone/accounts/gdrive/start',
-      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); ok, out = get_rclone_manager().start_gdrive_auth_session(display_name=str(b.get("display_name") or "Google Drive"), remote_name=str(b.get("remote_name") or "").strip() or None, scope=str(b.get("scope") or "drive.file").strip(), root_folder=str(b.get("root_folder") or "UBAgen_Outputs").strip()); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); out = get_rclone_manager().start_gdrive_auth_session(display_name=str(b.get("display_name") or "Google Drive"), remote_name=str(b.get("remote_name") or "").strip() or None, scope=str(b.get("scope") or "drive.file").strip(), root_folder=str(b.get("remote_base_path") or b.get("root_folder") or "ubagen_outputs").strip()); print(json.dumps({"ok": True, **out}))',
       [bodyJson],
       200
     );
@@ -1051,7 +1061,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       req,
       res,
       '/api/rclone/accounts/gdrive/complete',
-      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); ok, out = get_rclone_manager().complete_gdrive_auth(session_id=str(b.get("session_id") or "").strip() or None, remote_name=str(b.get("remote_name") or "").strip() or None, display_name=str(b.get("display_name") or "").strip() or None, code_or_token=str(b.get("code_or_token") or b.get("token") or b.get("code") or ""), root_folder=str(b.get("root_folder") or "UBAgen_Outputs").strip(), scope=str(b.get("scope") or "drive.file").strip(), skip_verify=bool(b.get("skip_verify", False))); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[1]); out = get_rclone_manager().complete_gdrive_auth(session_id=str(b.get("session_id") or "").strip() or None, remote_name=str(b.get("remote_name") or "").strip() or None, display_name=str(b.get("display_name") or "").strip() or None, code_or_token=str(b.get("code_or_token") or b.get("token") or b.get("code") or ""), root_folder=str(b.get("remote_base_path") or b.get("root_folder") or "ubagen_outputs").strip(), scope=str(b.get("scope") or "drive.file").strip(), skip_verify=False); ok = bool(out.get("last_test_ok", out.get("status") == "connected")); out["_http_status"] = 200 if ok else 400; print(json.dumps({"ok": ok, "account": out, **({"error": out.get("last_error") or "Google Drive yetkilendirmesi doğrulanamadı."} if not ok else {})}))',
       [bodyJson],
       200
     );
@@ -1063,7 +1073,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       req,
       res,
       `/api/rclone/accounts/${encodeURIComponent(remoteName)}/test`,
-      'import json, sys; from rclone_manager import get_rclone_manager; ok, out = get_rclone_manager().test_account_connection(sys.argv[1]); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      'import json, sys; from rclone_manager import get_rclone_manager; out = get_rclone_manager().test_account_connection(sys.argv[1]); ok = bool(out.get("last_test_ok", out.get("status") == "connected")); print(json.dumps({"ok": ok, "account": out, **({"error": out.get("last_error") or "Bağlantı testi başarısız."} if not ok else {})}))',
       [remoteName],
       200
     );
@@ -1076,7 +1086,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       req,
       res,
       `/api/rclone/accounts/${encodeURIComponent(remoteName)}/reconnect`,
-      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[2]); ok, out = get_rclone_manager().reconnect_account(sys.argv[1], password=str(b.get("password") or "").strip() or None, code_or_token=str(b.get("code_or_token") or b.get("token") or "").strip() or None, email=str(b.get("email") or "").strip() or None, skip_verify=bool(b.get("skip_verify", False))); out["_http_status"] = 200 if ok else 400; print(json.dumps(out))',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[2]); out = get_rclone_manager().reconnect_account(sys.argv[1], password=str(b.get("password") or "").strip() or None, token_json=b.get("code_or_token") or b.get("token"), run_test=True); ok = bool(out.get("last_test_ok", out.get("status") == "connected")); print(json.dumps({"ok": ok, "account": out, **({"error": out.get("last_error") or "Hesap yeniden bağlanamadı."} if not ok else {})}))',
       [remoteName, bodyJson],
       200
     );
@@ -1089,7 +1099,7 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
       req,
       res,
       `/api/rclone/accounts/${encodeURIComponent(remoteName)}/disconnect`,
-      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[2]); ok, out = get_rclone_manager().disconnect_account(sys.argv[1], remove_record=bool(b.get("remove_record", False))); out["_http_status"] = 200 if ok else 404; print(json.dumps(out))',
+      'import json, sys; from rclone_manager import get_rclone_manager; b = json.loads(sys.argv[2]); out = get_rclone_manager().disconnect_account(sys.argv[1], remove_record=bool(b.get("remove_record", False))); ok = out.get("status") in ("disconnected", "removed"); print(json.dumps({"ok": ok, "account": out, **({"error": "Hesap bağlantısı kesilemedi."} if not ok else {})}))',
       [remoteName, bodyJson],
       200
     );
