@@ -109,7 +109,62 @@ interface StatsResponse {
     free_bytes: number | null;
     free_str: string;
     percent: number | null;
+    mount_point?: string;
+    fs_type?: string;
+    writable?: boolean;
+    is_persistent?: boolean;
+    persistence_verified?: boolean;
+    storage_mode?: string;
+    decision_branch?: string;
+    summary?: string;
+    video_outputs_dir?: string;
+    download_temp_dir?: string;
+    encode_temp_dir?: string;
+    video_outputs_str?: string;
+    video_outputs_count?: number;
+    temp_workspace_str?: string;
+    effective_budget_str?: string;
   };
+  storage?: {
+    separation?: {
+      persistent_output_storage?: {
+        provider?: string;
+        gcs_bucket?: string | null;
+        local_outputs_dir?: string;
+        is_persistent?: boolean;
+        retention_seconds?: number;
+        deletion_policy?: string;
+      };
+      ephemeral_worker_scratch_disk?: {
+        worker_scratch_dir?: string;
+        download_temp_dir?: string;
+        encode_temp_dir?: string;
+        fs_type?: string;
+        mount_point?: string;
+        is_ephemeral?: boolean;
+        free_str?: string;
+        cleanup_policy?: string;
+      };
+      job_state_database?: {
+        backend_type?: string;
+        in_memory_only?: boolean;
+        firestore_collection?: string;
+        sqlite_db_path?: string;
+        setup_note?: string;
+      };
+      cloud_run_architecture?: {
+        k_service?: string | null;
+        k_revision?: string | null;
+        project_id?: string | null;
+        region?: string | null;
+        service_account_email?: string | null;
+        cloud_run_job_name?: string | null;
+        cloud_run_job_configured?: boolean;
+        gcs_bucket?: string | null;
+        retention_seconds?: number;
+      };
+    };
+  } | null;
   binaries: {
     ffmpeg: {
       installed: boolean;
@@ -135,8 +190,31 @@ interface StatsResponse {
   }>;
 }
 
+interface EncodeJobItem {
+  job_id: string;
+  user_id: string;
+  stage: string;
+  status: string;
+  percent: number;
+  processed_frames: number;
+  total_frames: number | null;
+  fps: number;
+  eta_seconds: number | null;
+  codec: string;
+  video_encoder: string;
+  subtitle_lang: string;
+  has_intro: boolean;
+  error: string | null;
+  expires_at_iso: string | null;
+  expires_in_seconds: number | null;
+  retention_seconds: number;
+  gcs_upload_verified: boolean;
+  deleted_from_gcs: boolean;
+}
+
 export default function App() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
+  const [encodeJobs, setEncodeJobs] = useState<EncodeJobItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [restartingBot, setRestartingBot] = useState<boolean>(false);
@@ -227,6 +305,14 @@ export default function App() {
             setStats(data);
             setError(null);
             setLastUpdated(new Date());
+            fetch('/api/jobs?limit=10', { headers: { Accept: 'application/json' }, cache: 'no-store' })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((jData) => {
+                if (jData && Array.isArray(jData.jobs)) {
+                  setEncodeJobs(jData.jobs);
+                }
+              })
+              .catch(() => {});
             return;
           } catch (candidateError: any) {
             lastFailure = candidateError instanceof Error
@@ -916,11 +1002,34 @@ export default function App() {
                     style={{ width: `${Math.min(stats.disk.percent || 0, 100)}%` }}
                   />
                 </div>
+
+                <div className="mt-3 text-xs space-y-1 text-slate-300">
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Persistence:</span>
+                    <span
+                      className={`font-mono font-semibold ${
+                        stats.disk.is_persistent ? 'text-emerald-400' : 'text-amber-400'
+                      }`}
+                    >
+                      {stats.disk.is_persistent
+                        ? 'Persistent Disk'
+                        : `Ephemeral (${stats.disk.fs_type || 'overlay'})`}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Outputs / Temp:</span>
+                    <span className="font-mono text-slate-200">
+                      {stats.disk.video_outputs_str || '0.00 B'} / {stats.disk.temp_workspace_str || '0.00 B'}
+                    </span>
+                  </div>
+                </div>
               </div>
 
               <div className="border-t border-slate-800/80 pt-3 mt-4 text-xs flex items-center justify-between text-slate-400">
-                <span>Mount Path:</span>
-                <span className="text-slate-200 font-mono font-medium">/ (Root filesystem)</span>
+                <span>Mount &amp; FS:</span>
+                <span className="text-slate-200 font-mono font-medium">
+                  {stats.disk.mount_point || '/'} ({stats.disk.fs_type || 'root'})
+                </span>
               </div>
             </div>
 
@@ -1008,7 +1117,7 @@ export default function App() {
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-400">Slash Commands:</span>
-                    <span className="font-mono text-emerald-400">/stats, /altyazı_ayıklama</span>
+                    <span className="font-mono text-emerald-400">/stats, /altyazı_ayıklama, /encode</span>
                   </div>
                   {stats.bot.sync_status && (
                     <div className="flex justify-between text-[11px] pt-0.5 border-t border-slate-800/60">
@@ -1166,6 +1275,155 @@ export default function App() {
                 <span className="text-slate-200 font-mono font-medium">Bundled in Dockerfile</span>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Storage Infrastructure & Persistence Decision Tree Section */}
+        {stats && (
+          <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-lg space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+                <HardDrive className="w-4 h-4 text-indigo-400" />
+                Storage Infrastructure &amp; Persistence Audit
+              </h3>
+              <span
+                className={`text-xs font-mono font-semibold ${
+                  stats.disk.is_persistent ? 'text-emerald-400' : 'text-amber-400'
+                }`}
+              >
+                {stats.disk.decision_branch || 'B_EPHEMERAL_CONTAINER_STORAGE'} &bull;{' '}
+                {stats.disk.writable !== false ? 'Writable' : 'Read-Only'}
+              </span>
+            </div>
+
+            {stats.disk.summary && (
+              <p className="text-xs text-slate-300 leading-relaxed bg-slate-950/70 border border-slate-800 rounded-xl p-3">
+                {stats.disk.summary}
+              </p>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+              <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3">
+                <span className="text-slate-400 block font-semibold">
+                  1. Persistent Video Outputs (GCS • 7200s TTL)
+                </span>
+                <span
+                  className="font-mono text-emerald-300 block truncate mt-0.5"
+                  title={
+                    stats.storage?.separation?.persistent_output_storage?.gcs_bucket
+                      ? `gs://${stats.storage.separation.persistent_output_storage.gcs_bucket}`
+                      : stats.disk.video_outputs_dir || 'video_outputs'
+                  }
+                >
+                  {stats.storage?.separation?.persistent_output_storage?.gcs_bucket
+                    ? `gs://${stats.storage.separation.persistent_output_storage.gcs_bucket}`
+                    : stats.disk.video_outputs_dir || 'video_outputs (GCS Unconfigured)'}
+                </span>
+                <span className="text-[11px] text-slate-400 mt-1 block">
+                  Retention: {stats.storage?.separation?.persistent_output_storage?.retention_seconds ?? 7200}s (2h) &bull; Active GCS Deletion
+                </span>
+              </div>
+
+              <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3">
+                <span className="text-slate-400 block font-semibold">
+                  2. Ephemeral Worker Scratch Disk
+                </span>
+                <span
+                  className="font-mono text-amber-300 block truncate mt-0.5"
+                  title={
+                    stats.storage?.separation?.ephemeral_worker_scratch_disk?.worker_scratch_dir ||
+                    stats.disk.download_temp_dir ||
+                    'download_temp/worker_jobs'
+                  }
+                >
+                  {stats.storage?.separation?.ephemeral_worker_scratch_disk?.worker_scratch_dir ||
+                    stats.disk.download_temp_dir ||
+                    'download_temp/worker_jobs'}
+                </span>
+                <span className="text-[11px] text-slate-400 mt-1 block">
+                  Temp Usage: {stats.disk.temp_workspace_str || '0.00 B'} (Isolated per-job &bull; Wiped in finally)
+                </span>
+              </div>
+
+              <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3">
+                <span className="text-slate-400 block font-semibold">
+                  3. Job State Database (Non-Memory)
+                </span>
+                <span className="font-mono text-indigo-300 block truncate mt-0.5">
+                  {stats.storage?.separation?.job_state_database?.backend_type || 'sqlite_wal_persistent'}
+                </span>
+                <span className="text-[11px] text-slate-400 mt-1 block truncate">
+                  Collection: {stats.storage?.separation?.job_state_database?.firestore_collection || 'ubagen_encode_jobs'}
+                </span>
+              </div>
+
+              <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3">
+                <span className="text-slate-400 block font-semibold">
+                  4. Cloud Run Job Worker Profile
+                </span>
+                <span className="font-mono text-slate-200 block truncate mt-0.5">
+                  {stats.storage?.separation?.cloud_run_architecture?.cloud_run_job_name ||
+                    'ubagen-encoder-worker (4 vCPU / 8 GiB)'}
+                </span>
+                <span className="text-[11px] text-slate-400 mt-1 block">
+                  Timeout: 3600s &bull; Parallelism: 1 &bull; Max Retries: 1
+                </span>
+              </div>
+            </div>
+
+            {encodeJobs.length > 0 && (
+              <div className="pt-2">
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
+                  Recent Cloud Encoder Jobs (H.264 / H.265 Telemetry)
+                </h4>
+                <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/70">
+                  <table className="w-full text-left text-xs">
+                    <thead className="border-b border-slate-800 text-slate-400 bg-slate-900/60">
+                      <tr>
+                        <th className="px-3 py-2">Job ID</th>
+                        <th className="px-3 py-2">User ID</th>
+                        <th className="px-3 py-2">Codec</th>
+                        <th className="px-3 py-2">Stage</th>
+                        <th className="px-3 py-2">Progress</th>
+                        <th className="px-3 py-2">Frames</th>
+                        <th className="px-3 py-2">FPS / ETA</th>
+                        <th className="px-3 py-2">7200s TTL</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70 font-mono">
+                      {encodeJobs.map((j) => (
+                        <tr key={j.job_id} className="text-slate-200">
+                          <td className="px-3 py-2 truncate max-w-[140px]" title={j.job_id}>
+                            {j.job_id}
+                          </td>
+                          <td className="px-3 py-2">{j.user_id}</td>
+                          <td className="px-3 py-2 uppercase">
+                            {j.codec} ({j.video_encoder})
+                          </td>
+                          <td className="px-3 py-2">{j.stage}</td>
+                          <td className="px-3 py-2">{j.percent.toFixed(1)}%</td>
+                          <td className="px-3 py-2">
+                            {j.processed_frames}
+                            {j.total_frames ? ` / ${j.total_frames}` : ''}
+                          </td>
+                          <td className="px-3 py-2">
+                            {j.fps.toFixed(1)} FPS &bull;{' '}
+                            {j.eta_seconds !== null ? `${j.eta_seconds}s` : '-'}
+                          </td>
+                          <td className="px-3 py-2">
+                            {j.deleted_from_gcs || j.status === 'expired'
+                              ? 'Deleted from GCS'
+                              : j.expires_in_seconds !== null
+                              ? `${j.expires_in_seconds}s left`
+                              : `${j.retention_seconds}s policy`}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </div>
         )}
 

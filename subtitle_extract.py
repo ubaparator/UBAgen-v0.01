@@ -28,6 +28,11 @@ except ImportError:
     def clear_binary_cache() -> None:
         pass
 
+try:
+    from storage_manager import get_storage_manager
+except ImportError:
+    get_storage_manager = None
+
 logger = logging.getLogger("ubagen.subtitles")
 
 COMMAND_NAME = "altyazı_ayıklama"
@@ -38,6 +43,8 @@ FFPROBE_TIMEOUT = 30
 FFMPEG_TIMEOUT = 180
 
 DOWNLOAD_TEMP_DIR = Path("download_temp")
+ENCODE_TEMP_DIR = DOWNLOAD_TEMP_DIR / "encode_temp"
+VIDEO_OUTPUTS_DIR = Path("video_outputs")
 PRIMARY_VIDEO_SUFFIXES = (".mkv", ".mp4")
 VIDEO_SUFFIXES = {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm", ".ts", ".m2ts"}
 BITMAP_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
@@ -235,16 +242,27 @@ def log_runtime_binaries_status(auto_install: bool = True) -> dict[str, dict[str
 
 
 def cleanup_stale_workdirs(base_dir: Optional[Path] = None) -> int:
-    """Remove any leftover `job_*` directories inside `download_temp` on startup."""
+    """Remove any leftover `job_*` and `encode_*` directories inside `download_temp` and run output retention cleanup."""
     root = Path(base_dir) if base_dir is not None else DOWNLOAD_TEMP_DIR
-    if not root.exists():
-        return 0
     removed = 0
-    for child in root.iterdir():
-        if child.is_dir() and child.name.startswith("job_"):
-            with suppress(Exception):
-                shutil.rmtree(child, ignore_errors=True)
-                removed += 1
+    if root.exists():
+        for child in root.iterdir():
+            if child.is_dir() and (child.name.startswith("job_") or child.name.startswith("encode_")):
+                with suppress(Exception):
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+        encode_root = root / "encode_temp"
+        if encode_root.exists():
+            for child in encode_root.iterdir():
+                if child.is_dir() and child.name.startswith("encode_"):
+                    with suppress(Exception):
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+    if base_dir is None and get_storage_manager is not None:
+        with suppress(Exception):
+            mgr = get_storage_manager()
+            removed += mgr.cleanup_stale_temp_dirs()
+            mgr.cleanup_outputs()
     return removed
 
 
@@ -277,6 +295,14 @@ def create_job_workdir(base_dir: Optional[Path] = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     job_dir = tempfile.mkdtemp(prefix=f"job_{uuid.uuid4().hex[:8]}_", dir=str(root))
     return Path(job_dir)
+
+
+def create_encode_workdir(base_dir: Optional[Path] = None) -> Path:
+    """Create a unique, per-invocation isolated temporary directory for FFmpeg encoding."""
+    root = Path(base_dir) if base_dir is not None else ENCODE_TEMP_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    enc_dir = tempfile.mkdtemp(prefix=f"encode_{uuid.uuid4().hex[:8]}_", dir=str(root))
+    return Path(enc_dir)
 
 
 def build_aria2c_command(magnet: str, workdir: Path) -> list[str]:
@@ -543,6 +569,15 @@ async def execute_subtitle_extraction(
         )
         return
 
+    if base_temp_dir is None and get_storage_manager is not None:
+        space_ok, space_msg = await asyncio.to_thread(
+            get_storage_manager().check_space_for_job,
+            256 * 1024 * 1024,
+        )
+        if not space_ok:
+            await _send_final_error(interaction, space_msg)
+            return
+
     workdir: Optional[Path] = None
     try:
         workdir = create_job_workdir(base_temp_dir)
@@ -665,17 +700,37 @@ async def execute_subtitle_extraction(
             await _send_final_error(interaction, "Çıkarılan altyazı dosyası temizleme sonrasında boş kaldı.")
             return
 
-        if file_size > MAX_OUTPUT:
-            await _send_final_error(
-                interaction,
-                "Çıkarılan altyazı dosyası 8 MB Discord gönderim sınırını aşıyor.",
-            )
-            return
-
-        # 6. Send extracted file to Discord user
+        # 6. Prepare output filename and store/deliver
         safe_stem = re.sub(r"[^\w.\-]+", "_", selected_video.stem).strip("_")[:70] or "subtitle"
         effective_lang_label = lang if matched_lang else stream_lang
         out_filename = f"{safe_stem}_{effective_lang_label}{suffix}"
+
+        if file_size > MAX_OUTPUT:
+            stored_info: Optional[dict[str, Any]] = None
+            if get_storage_manager is not None:
+                with suppress(Exception):
+                    stored_info = await asyncio.to_thread(
+                        get_storage_manager().store_output_file,
+                        output_path,
+                        out_filename,
+                    )
+            if stored_info:
+                persistence_note = (
+                    "Kalıcı sunucu diskine kaydedildi."
+                    if stored_info.get("is_persistent")
+                    else "Geçici sunucu depolamasına kaydedildi (konteyner yeniden başlatılırsa silinir)."
+                )
+                await _send_final_error(
+                    interaction,
+                    f"Çıkarılan altyazı dosyası 8 MB Discord gönderim sınırını aşıyor (`{stored_info['size_str']}`). "
+                    f"Dosya sunucunun `video_outputs` dizinine alındı: `{stored_info['download_url']}` ({persistence_note})",
+                )
+            else:
+                await _send_final_error(
+                    interaction,
+                    "Çıkarılan altyazı dosyası 8 MB Discord gönderim sınırını aşıyor.",
+                )
+            return
 
         match_note = (
             f"Hedef dil (`{lang}`) eşleşti."

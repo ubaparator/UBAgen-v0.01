@@ -11,16 +11,24 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 from datetime import datetime, timezone
 import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Optional
+
+try:
+    from storage_manager import get_storage_manager
+except ImportError:
+    get_storage_manager = None
 
 # Optional psutil with pure-procfs fallback
 try:
@@ -40,6 +48,69 @@ logger = logging.getLogger("ubagen.stats")
 
 # Process start time for uptime calculation
 PROCESS_START_TIME = time.time()
+
+
+# ------------------------------------------------------------------------------
+# Thread-Safe Redacted Log Ring Buffer (for GET /api/logs)
+# ------------------------------------------------------------------------------
+_LOG_LOCK = threading.Lock()
+_LOG_BUFFER: deque[dict[str, Any]] = deque(maxlen=250)
+_LOG_HANDLER_INSTALLED = False
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Scrub any potential tokens, bearer credentials, or secret env values from log lines."""
+    if not text:
+        return ""
+    cleaned = text
+    for env_key in ("DISCORD_BOT_TOKEN", "UBAGEN_ADMIN_TOKEN", "GOOGLE_DRIVE_CREDENTIALS"):
+        secret_val = os.getenv(env_key, "").strip()
+        if secret_val and len(secret_val) >= 6:
+            cleaned = cleaned.replace(secret_val, "[REDACTED]")
+    cleaned = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._\-+/=]+", r"\1[REDACTED]", cleaned)
+    return cleaned
+
+
+class RedactedRingLogHandler(logging.Handler):
+    """Captures application log records into a bounded thread-safe ring buffer."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = redact_sensitive_text(record.getMessage())
+            entry = {
+                "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+                "epoch": round(record.created, 3),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": msg,
+            }
+            with _LOG_LOCK:
+                _LOG_BUFFER.append(entry)
+        except Exception:
+            pass
+
+
+def install_log_buffer_handler() -> None:
+    """Attach the ring buffer log handler once to the root logger."""
+    global _LOG_HANDLER_INSTALLED
+    if _LOG_HANDLER_INSTALLED:
+        return
+    with _LOG_LOCK:
+        if _LOG_HANDLER_INSTALLED:
+            return
+        root_logger = logging.getLogger()
+        handler = RedactedRingLogHandler(level=logging.INFO)
+        root_logger.addHandler(handler)
+        _LOG_HANDLER_INSTALLED = True
+
+
+def get_recent_logs(limit: int = 100) -> list[dict[str, Any]]:
+    """Return up to `limit` recent redacted log entries (newest last)."""
+    install_log_buffer_handler()
+    safe_limit = max(1, min(int(limit or 100), 250))
+    with _LOG_LOCK:
+        items = list(_LOG_BUFFER)
+    return items[-safe_limit:]
 
 
 # ------------------------------------------------------------------------------
@@ -588,6 +659,30 @@ def check_environment_variables() -> list[dict[str, str]]:
             "type": "Cloud Storage",
         })
 
+    gcs_bucket = os.getenv("UBAGEN_GCS_BUCKET", "").strip() or os.getenv("GCS_BUCKET_NAME", "").strip()
+    results.append({
+        "name": "UBAGEN_GCS_BUCKET",
+        "status": f"Configured ({gcs_bucket} • 7200s TTL)" if gcs_bucket else "Not configured (Required for persistent GCS outputs)",
+        "indicator": "✅" if gcs_bucket else "⚪",
+        "type": "Cloud Storage",
+    })
+
+    job_name = os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip()
+    results.append({
+        "name": "UBAGEN_CLOUD_RUN_JOB_NAME",
+        "status": f"Configured ({job_name})" if job_name else "Not configured (Using local subprocess worker fallback)",
+        "indicator": "✅" if job_name else "⚪",
+        "type": "Cloud Run Job",
+    })
+
+    use_fs = os.getenv("UBAGEN_USE_FIRESTORE", "").strip().lower() in ("1", "true", "yes")
+    results.append({
+        "name": "UBAGEN_USE_FIRESTORE",
+        "status": "Enabled (Firestore Job State)" if use_fs else "Disabled (SQLite WAL Persistent Fallback)",
+        "indicator": "✅" if use_fs else "⚪",
+        "type": "Database",
+    })
+
     return results
 
 
@@ -843,11 +938,18 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
         if proc_ram_rss is not None and system_ram_total is not None and system_ram_total > 0:
             proc_ram_pct = round((proc_ram_rss / system_ram_total) * 100.0, 2)
 
-    # 6. Disk Usage
+    # 6. Disk Usage & Storage Infrastructure Audit
     disk_total: Optional[int] = None
     disk_used: Optional[int] = None
     disk_free: Optional[int] = None
     disk_pct: Optional[float] = None
+    storage_audit: Optional[dict[str, Any]] = None
+
+    if get_storage_manager is not None:
+        try:
+            storage_audit = get_storage_manager().inspect()
+        except Exception as e:
+            logger.debug("StorageManager.inspect error: %s", e)
 
     try:
         stat = os.statvfs("/")
@@ -858,6 +960,11 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             disk_pct = round((disk_used / disk_total) * 100.0, 1)
     except Exception as e:
         logger.debug("os.statvfs error: %s", e)
+
+    root_mount = (storage_audit or {}).get("mounts", {}).get("root", {})
+    out_mount = (storage_audit or {}).get("mounts", {}).get("video_outputs", {})
+    storage_usage = (storage_audit or {}).get("usage", {})
+    storage_dirs = (storage_audit or {}).get("directories", {})
 
     # 7. System & Backend Uptime
     system_uptime_sec: Optional[float] = None
@@ -935,7 +1042,23 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             "free_bytes": disk_free,
             "free_str": format_bytes(disk_free),
             "percent": disk_pct,
+            "mount_point": out_mount.get("mount_point") or root_mount.get("mount_point") or "/",
+            "fs_type": out_mount.get("fs_type") or root_mount.get("fs_type") or "unknown",
+            "writable": bool(out_mount.get("writable", True)),
+            "is_persistent": bool((storage_audit or {}).get("is_persistent", False)),
+            "persistence_verified": bool((storage_audit or {}).get("persistence_verified", False)),
+            "storage_mode": (storage_audit or {}).get("storage_mode", "ephemeral_container_fs"),
+            "decision_branch": (storage_audit or {}).get("decision_branch", "B_EPHEMERAL_CONTAINER_STORAGE"),
+            "summary": (storage_audit or {}).get("summary", ""),
+            "video_outputs_dir": storage_dirs.get("video_outputs_dir"),
+            "download_temp_dir": storage_dirs.get("download_temp_dir"),
+            "encode_temp_dir": storage_dirs.get("encode_temp_dir"),
+            "video_outputs_str": storage_usage.get("video_outputs_str", "0.00 B"),
+            "video_outputs_count": storage_usage.get("video_outputs_count", 0),
+            "temp_workspace_str": storage_usage.get("temp_workspace_str", "0.00 B"),
+            "effective_budget_str": storage_usage.get("effective_budget_str", format_bytes(disk_free)),
         },
+        "storage": storage_audit,
         "binaries": {
             "ffmpeg": ffmpeg_info,
             "ffprobe": ffprobe_info,
@@ -1055,15 +1178,25 @@ def build_stats_embed(stats: dict[str, Any]) -> Any:
         inline=True,
     )
 
-    # 4. Storage (Disk Space)
+    # 4. Storage (Disk Space & Persistence Classification)
     disk_total_str = disk["total_str"]
     disk_used_str = disk["used_str"]
     disk_free_str = disk["free_str"]
     disk_pct_str = f"{disk['percent']:.1f}%" if disk["percent"] is not None else "Unavailable"
+    fs_type = disk.get("fs_type", "unknown")
+    mount_pt = disk.get("mount_point", "/")
+    is_persistent = disk.get("is_persistent", False)
+    persistence_label = (
+        f"🟢 Persistent Disk (`{fs_type}` on `{mount_pt}`)"
+        if is_persistent
+        else f"⚠️ Ephemeral Container FS (`{fs_type}` on `{mount_pt}` — wiped on restart/redeploy)"
+    )
 
     disk_lines = [
         f"**Total Storage:** {disk_total_str}",
         f"**Used / Free:** {disk_used_str} / {disk_free_str} (`{disk_pct_str}` used)",
+        f"**Persistence:** {persistence_label}",
+        f"**Workspaces:** `video_outputs` ({disk.get('video_outputs_str', '0.00 B')}) • `download_temp` ({disk.get('temp_workspace_str', '0.00 B')})",
     ]
     embed.add_field(
         name="💿 Storage (Disk Volume)",

@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "start": "tsx server.ts",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "python3 -B -m unittest discover -s tests -p \"test_*.py\" -v && npx tsx --test tests/node_restart.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

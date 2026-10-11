@@ -6,6 +6,7 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { execFile, spawn, ChildProcess } from 'child_process';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { timingSafeEqual } from 'crypto';
@@ -119,7 +120,11 @@ function degradedStats(reason: string) {
         description: 'Container metrics unavailable' },
       process_rss_bytes: null, process_rss_str: 'Unavailable', process_percent: null },
     disk: { total_bytes: null, total_str: 'Unavailable', used_bytes: null,
-      used_str: 'Unavailable', free_bytes: null, free_str: 'Unavailable', percent: null },
+      used_str: 'Unavailable', free_bytes: null, free_str: 'Unavailable', percent: null,
+      mount_point: '/', fs_type: 'Unavailable', writable: false,
+      is_persistent: false, persistence_verified: false,
+      storage_mode: 'unavailable', decision_branch: 'UNAVAILABLE', summary: reason },
+    storage: null,
     binaries: { ffmpeg: { installed: false, version: 'Unavailable', path: null },
       ffprobe: { installed: false, version: 'Unavailable', path: null },
       aria2: { installed: false, version: 'Unavailable', path: null } },
@@ -382,12 +387,240 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     });
   });
 
+  // GET /api/storage: Storage infrastructure audit and stored output files
+  app.get('/api/storage', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1500);
+      try {
+        const upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/storage`, {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+        if (upstreamRes.ok) {
+          const data = await upstreamRes.json();
+          return res.json(data);
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    execFile(
+      'python3',
+      [
+        '-B',
+        '-c',
+        'import json; from storage_manager import get_storage_manager; from job_store import get_job_store; m = get_storage_manager(); s = get_job_store(); s.cleanup_expired_jobs(); print(json.dumps({"status":"online","storage":m.inspect(),"outputs":m.list_output_files(),"jobs":[j.to_public_dict() for j in s.list_jobs(limit=25)]}))',
+      ],
+      { timeout: 3000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        if (!error && stdout) {
+          try {
+            return res.json(JSON.parse(stdout));
+          } catch {}
+        }
+        return res.status(200).json({ status: 'degraded', storage: null, outputs: [], jobs: [] });
+      }
+    );
+  });
+
+  // GET /api/jobs: List persistent video encode jobs
+  app.get('/api/jobs', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    const qs = new URLSearchParams();
+    if (typeof req.query.user_id === 'string') qs.set('user_id', req.query.user_id);
+    if (typeof req.query.status === 'string') qs.set('status', req.query.status);
+    if (typeof req.query.limit === 'string') qs.set('limit', req.query.limit);
+    const querySuffix = qs.toString() ? `?${qs.toString()}` : '';
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1500);
+      try {
+        const headers: Record<string, string> = { Accept: 'application/json' };
+        const xUser = req.header('x-user-id');
+        if (xUser) headers['X-User-Id'] = xUser;
+        const upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/jobs${querySuffix}`, {
+          signal: controller.signal,
+          headers,
+        });
+        if (upstreamRes.ok) {
+          const data = await upstreamRes.json();
+          return res.json(data);
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    const reqUser = (req.header('x-user-id') || (typeof req.query.user_id === 'string' ? req.query.user_id : '') || '').trim();
+    execFile(
+      'python3',
+      [
+        '-B',
+        '-c',
+        'import json, sys; from job_store import get_job_store; s = get_job_store(); s.cleanup_expired_jobs(); u = sys.argv[1] or None; jobs = s.list_jobs(user_id=u, limit=50); print(json.dumps({"status":"online","backend":s.get_backend_status(),"count":len(jobs),"jobs":[j.to_public_dict(requester_user_id=u) for j in jobs]}))',
+        reqUser,
+      ],
+      { timeout: 3000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        if (!error && stdout) {
+          try {
+            return res.json(JSON.parse(stdout));
+          } catch {}
+        }
+        return res.status(200).json({ status: 'online', count: 0, jobs: [] });
+      }
+    );
+  });
+
+  // POST /api/jobs/cleanup-expired: Server-side 7200s retention cleanup trigger
+  app.post('/api/jobs/cleanup-expired', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      try {
+        const headers: Record<string, string> = { Accept: 'application/json' };
+        const auth = req.header('authorization');
+        if (auth) headers.Authorization = auth;
+        const upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/jobs/cleanup-expired`, {
+          method: 'POST',
+          signal: controller.signal,
+          headers,
+        });
+        const data = await upstreamRes.json().catch(() => ({}));
+        return res.status(upstreamRes.status).json(data);
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    execFile(
+      'python3',
+      [
+        '-B',
+        '-c',
+        'import json; from job_store import get_job_store; s = get_job_store(); c = s.cleanup_expired_jobs(); r = s.recover_stale_running_jobs(); print(json.dumps({"status":"ok","cleanup":c,"recovered_crashed_jobs":[j.job_id for j in r]}))',
+      ],
+      { timeout: 4000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        if (!error && stdout) {
+          try {
+            return res.json(JSON.parse(stdout));
+          } catch {}
+        }
+        return res.status(500).json({ error: 'Cleanup execution failed.' });
+      }
+    );
+  });
+
+  // GET /api/jobs/:jobId/download: User-authorized 7200s GCS video output download
+  app.get('/api/jobs/:jobId/download', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const jobId = (req.params.jobId || '').trim();
+    const userId = (
+      (typeof req.query.user_id === 'string' ? req.query.user_id : '') ||
+      req.header('x-user-id') ||
+      ''
+    ).trim();
+    const token = (
+      (typeof req.query.token === 'string' ? req.query.token : '') ||
+      (req.header('authorization') || '').replace(/^Bearer\s+/i, '') ||
+      ''
+    ).trim();
+
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    const qs = new URLSearchParams();
+    if (userId) qs.set('user_id', userId);
+    if (token) qs.set('token', token);
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const upstreamRes = await fetchFn(
+          `${standaloneBackendUrl}/api/jobs/${encodeURIComponent(jobId)}/download?${qs.toString()}`,
+          { signal: controller.signal }
+        );
+        const contentType = upstreamRes.headers.get('content-type') || 'application/json';
+        if (contentType.includes('application/json')) {
+          const payload = await upstreamRes.json().catch(() => ({}));
+          return res.status(upstreamRes.status).json(payload);
+        }
+        const buf = Buffer.from(await upstreamRes.arrayBuffer());
+        const disp = upstreamRes.headers.get('content-disposition');
+        if (disp) res.setHeader('Content-Disposition', disp);
+        res.setHeader('Content-Type', contentType);
+        return res.status(upstreamRes.status).send(buf);
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    return res.status(503).json({ error: 'Backend download service temporarily unavailable.' });
+  });
+
+  // GET /api/logs: Redacted real-time backend logs
+  app.get('/api/logs', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 100, 250));
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1200);
+      try {
+        const upstreamRes = await fetchFn(`${standaloneBackendUrl}/api/logs?limit=${limit}`, {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+        if (upstreamRes.ok) {
+          const data = await upstreamRes.json();
+          return res.json(data);
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    return res.json({ status: 'online', count: 0, logs: [] });
+  });
+
+  // GET /api/outputs/:filename: Serve stored video or subtitle output file with Range support
+  app.get('/api/outputs/:filename', (req, res) => {
+    const rawName = (req.params.filename || '').trim();
+    if (!rawName || rawName.includes('/') || rawName.includes('\\') || rawName.includes('..') || rawName.startsWith('.')) {
+      return res.status(404).json({ error: 'Requested output file was not found or has expired.' });
+    }
+    const baseOutDir = path.resolve(
+      process.env.UBAGEN_OUTPUT_DIR ||
+        path.join(process.env.UBAGEN_STORAGE_DIR || __dirname, 'video_outputs')
+    );
+    const resolvedFile = path.resolve(baseOutDir, rawName);
+    if (path.dirname(resolvedFile) !== baseOutDir || !fs.existsSync(resolvedFile) || !fs.statSync(resolvedFile).isFile()) {
+      return res.status(404).json({ error: 'Requested output file was not found or has expired.' });
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(resolvedFile)}"`);
+    return res.sendFile(resolvedFile);
+  });
+
   return app;
 }
 
 async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
-  const PORT = isProduction ? parseInt(process.env.PORT || '8080', 10) : 3000;
+  const nginxPort = (process.env.NGINX_PORT || '').trim();
+  const rawPort = (process.env.PORT || '8080').trim();
+  const defaultAppPort = (process.env.DEFAULT_APP_PORT || '3000').trim();
+  const PORT =
+    !isProduction || (nginxPort && nginxPort === rawPort)
+      ? parseInt(defaultAppPort || '3000', 10)
+      : parseInt(rawPort || '8080', 10);
 
   // Launch background Python Discord & FastAPI companion worker
   ensurePythonWorker();

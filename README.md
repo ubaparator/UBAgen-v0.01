@@ -7,6 +7,8 @@ Provides real-time host and container telemetry through:
 2. **Discord Slash Commands**:
    - `/stats` returning a rich diagnostic embed to any Discord server without blocking the event loop.
    - `/altyazı_ayıklama` (`magnet`, `dil`) downloading torrents via `aria2c` into an isolated `download_temp` workspace and extracting/cleaning embedded `.srt`/`.ass` subtitles via `ffprobe`/`ffmpeg`.
+   - `/encode` (`magnet`, `codec` (`h264`/`h265`), `altyazi_ekle`, `altyazi_dili`, `intro_path`, `crf`, `preset`) creating a persistent encode job, dispatching it to the dedicated **Cloud Run Job worker** (`encoder_worker.py`), updating Discord progress messages with real-time `frame/total_frames`, `FPS`, `ETA`, and percentage, uploading the final output to **Google Cloud Storage (GCS)**, and issuing a 7200-second (2-hour) owner-authorized download link.
+   - `/is_durumu` (`job_id`) inspecting persistent encode job state, progress, and expiration countdown across Cloud Run instance restarts.
 3. **HTTP Health Probes** (`GET /health`) for container orchestrators (Render, Railway, Fly.io, Cloud Run, Docker).
 
 ---
@@ -29,16 +31,21 @@ Provides real-time host and container telemetry through:
 
 ```
 ubagen/
-├── server.ts           # Full-stack Node/Express server running Vite, companion worker & /api/stats
-├── main.py             # Python service coordinating Discord bot & FastAPI server with signal handling
-├── stats.py            # Hardware statistics measurement engine (psutil, cgroups, Linux /proc, /stats embed)
-├── health_api.py       # FastAPI application serving GET /api/stats and GET /health
-├── Dockerfile          # Multi-stage production container (React build + Python 3.12 + FFmpeg + aria2)
-├── requirements.txt    # Python dependencies (discord.py, fastapi, uvicorn, psutil, aiohttp, python-dotenv)
-├── package.json        # Frontend & full-stack dependencies
-├── .env.example        # Clean environment variables template
+├── server.ts                   # Full-stack Node/Express server running Vite, companion worker & API proxy
+├── main.py                     # Python service coordinating Discord bot, FastAPI & 7200s retention sweeper
+├── encoder_worker.py           # Cloud Run Job video encoder worker (aria2c + FFmpeg libx264/libx265 + GCS)
+├── job_store.py                # Persistent job state store (Firestore / SQLite WAL) & GCS output lifecycle
+├── storage_manager.py          # Runtime storage inspector & persistent vs worker scratch separation
+├── subtitle_extract.py         # /altyazı_ayıklama slash command & ASS/SRT stream extraction
+├── stats.py                    # Hardware statistics measurement engine (psutil, cgroups, /stats embed)
+├── health_api.py               # FastAPI application serving /api/stats, /api/storage, /api/jobs, /api/logs
+├── cloud-run-encoder-job.yaml  # Declarative Google Cloud Run Job manifest (4 vCPU, 8 GiB, 3600s timeout)
+├── Dockerfile                  # Multi-stage production container (React build + Python 3.12 + FFmpeg + aria2)
+├── requirements.txt            # Python dependencies (discord.py, fastapi, google-cloud-storage, firestore)
+├── package.json                # Frontend & full-stack dependencies
+├── .env.example                # Clean environment variables template
 └── src/
-    └── App.tsx         # Live dark telemetry dashboard (CPU, RAM, Disks, Uptime, Bot, Cgroups, Toolchain)
+    └── App.tsx                 # Live dark telemetry dashboard (CPU, RAM, Storage Separation, Jobs, Bot)
 ```
 
 ---
@@ -74,6 +81,16 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 | `HOST` | Optional | `0.0.0.0` | Network bind interface address (e.g. `0.0.0.0` or `127.0.0.1`). **Do not** place admin tokens or URLs in `HOST`. |
 | `ENVIRONMENT` | Optional | `production` | Informational label displayed in logs and monitoring cards. |
 | `GOOGLE_DRIVE_CREDENTIALS` | Optional | *Empty* | Optional Google Drive credentials JSON or file path (tested safely without leaking contents). |
+| `UBAGEN_STORAGE_DIR` | Optional | `.` | Root storage directory for separated `video_outputs` and `download_temp` workspaces. Mount a persistent disk or Cloud Storage FUSE volume here in production for persistence across restarts. |
+| `UBAGEN_OUTPUT_DIR` | Optional | `<UBAGEN_STORAGE_DIR>/video_outputs` | Dedicated directory for completed video/subtitle output files served via `/api/outputs/{filename}`. |
+| `UBAGEN_TEMP_DIR` | Optional | `<UBAGEN_STORAGE_DIR>/download_temp` | Dedicated temporary directory for `aria2c` torrent downloads (`job_*`) and `ffmpeg` intermediate encodes (`encode_temp/encode_*`). Cleaned up in `finally` and on startup. |
+| `UBAGEN_STORAGE_MAX_GB` | Optional | `200` | Maximum storage quota ceiling (GB), bounded automatically by actual available space minus `UBAGEN_MIN_FREE_RESERVE_GB`. |
+| `UBAGEN_OUTPUT_RETENTION_HOURS` | Optional | `24` | Retention TTL (hours) before expired files in local `video_outputs` are automatically purged. |
+| `UBAGEN_GCS_BUCKET` | Recommended (Production) | *Empty* | Google Cloud Storage bucket name for persistent encoded video outputs (authenticated via Workload Identity / ADC; no credentials in source code). |
+| `UBAGEN_CLOUD_RUN_JOB_NAME` | Recommended (Production) | *Empty* | Dedicated Google Cloud Run Job name (`ubagen-encoder-worker`) triggered via Cloud Run v2 `jobs.run` API (`UBAGEN_JOB_ID=<job_id>`). |
+| `UBAGEN_USE_FIRESTORE` | Optional | `auto` | Persistent job state backend selector (`auto`, `true`, `false`). Uses Google Cloud Firestore in multi-instance Cloud Run or SQLite WAL on persistent volumes. |
+| `UBAGEN_FIRESTORE_COLLECTION` | Optional | `ubagen_encode_jobs` | Firestore collection storing encode jobs across Cloud Run Service and Cloud Run Job worker instances. |
+| `UBAGEN_OUTPUT_TTL_SECONDS` | Optional | `7200` | Exact output retention TTL in seconds (`7200` = 2 hours). After expiry, download access is revoked (`410 Gone`) and the object is deleted from GCS. |
 
 > 🔒 **Security Notice**: Never commit secret tokens or `.env` files to Git, and never place `UBAGEN_ADMIN_TOKEN` or `DISCORD_BOT_TOKEN` in client-exposed `VITE_*` environment variables. Set them securely through your hosting platform's server-side secret manager.
 
@@ -82,8 +99,22 @@ Configure these variables in your hosting provider's dashboard (Render, Railway,
 ## API Endpoints
 
 - **`GET /api/stats`** (and alias **`GET /stats`**):
-  Returns complete live hardware and bot status in JSON format.
+  Returns complete live hardware, storage persistence audit, and bot status in JSON format.
   Headers: `Cache-Control: no-store, no-cache, max-age=0`.
+- **`GET /api/storage`**:
+  Returns the runtime storage decision tree (`A_PERSISTENT_DISK`, `B_EXTERNAL_CLOUD_STORAGE`, or `B_EPHEMERAL_CONTAINER_STORAGE`), explicit separation between **Persistent Output Storage (GCS)**, **Ephemeral Worker Scratch Disk**, and **Persistent Job State DB**, real mount/filesystem metrics (`os.statvfs`, `/proc/mounts`, write probe), and active encode jobs.
+- **`GET /api/jobs`** & **`POST /api/jobs`**:
+  Lists or creates persistent video encode jobs (`magnet`, `codec` (`h264`/`h265`), `user_id`, `burn_subtitles`, `subtitle_lang`, `intro_path`, `crf`, `preset`). Never stores job state exclusively in Cloud Run instance memory.
+- **`GET /api/jobs/{job_id}`**:
+  Returns persistent job progress (`stage`, `percent`, `processed_frames`, `total_frames`, `fps`, `eta_seconds`, `codec`, `error`, `output_expires_at`, `output_remaining_seconds`). Only includes `download_url` when the requester is authorized.
+- **`GET /api/jobs/{job_id}/download`**:
+  Owner-authorized download endpoint requiring matching `user_id` and `token`. Verifies `7200`s retention window, revokes access (`410 Gone`) and deletes the GCS object immediately upon expiry, and blocks cross-user access (`403 Forbidden`).
+- **`POST /api/jobs/cleanup-expired`**:
+  Server-side retention sweep endpoint suitable for **Cloud Scheduler** (`*/5 * * * *`) as well as the internal background task and worker CLI (`python3 encoder_worker.py --cleanup-expired`). Deletes expired GCS objects and recovers crashed/timed-out workers.
+- **`GET /api/outputs/{filename}`**:
+  Serves stored output files from `video_outputs` with path-traversal protection and HTTP `Range` (`206 Partial Content`) support.
+- **`GET /api/logs`**:
+  Returns recent redacted backend log entries from the thread-safe ring buffer without exposing tokens or secrets.
 - **`GET /health`**:
   Returns lightweight JSON status (`{"status":"healthy","service":"ubagen-backend","http":"alive","discord_bot":{...}}`) for container health checks.
 - **`POST /api/admin/restart-bot`**:

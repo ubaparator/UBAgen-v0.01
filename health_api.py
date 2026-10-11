@@ -24,13 +24,18 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from stats import collect_all_stats
+from encoder_worker import dispatch_encode_job_background
+from job_store import get_job_store, normalize_video_codec
+from stats import collect_all_stats, get_recent_logs, install_log_buffer_handler
+from storage_manager import get_storage_manager
+from subtitle_extract import normalize_language_code, validate_magnet_uri
 
 SERVICE_START_TIME = time.time()
 logger = logging.getLogger("ubagen.health")
+install_log_buffer_handler()
 
 
 def verify_admin_token(authorization_header: Optional[str], expected_token: str) -> bool:
@@ -92,7 +97,11 @@ def _degraded_stats(reason: str) -> dict[str, Any]:
         "disk": {
             "total_bytes": None, "total_str": "Unavailable", "used_bytes": None,
             "used_str": "Unavailable", "free_bytes": None, "free_str": "Unavailable", "percent": None,
+            "mount_point": "/", "fs_type": "Unavailable", "writable": False,
+            "is_persistent": False, "persistence_verified": False,
+            "storage_mode": "unavailable", "decision_branch": "UNAVAILABLE", "summary": reason,
         },
+        "storage": None,
         "binaries": {
             "ffmpeg": {"installed": False, "version": "Unavailable", "path": None},
             "ffprobe": {"installed": False, "version": "Unavailable", "path": None},
@@ -349,6 +358,309 @@ def create_health_app(
         }
 
         return JSONResponse(content=payload, status_code=200)
+
+    @app.get("/api/storage", summary="Runtime Storage Infrastructure & Output Files Audit")
+    async def get_storage_api() -> JSONResponse:
+        """Return detailed runtime storage decision tree, mount info, persistent vs worker scratch separation, and stored output files."""
+        mgr = get_storage_manager()
+        store = get_job_store()
+        with suppress(Exception):
+            await asyncio.to_thread(store.cleanup_expired_jobs)
+        inspection = await asyncio.to_thread(mgr.inspect)
+        outputs = await asyncio.to_thread(mgr.list_output_files)
+        jobs = await asyncio.to_thread(store.list_jobs, None, None, 25)
+        return JSONResponse(
+            content={
+                "status": "online",
+                "storage": inspection,
+                "outputs": outputs,
+                "jobs": [j.to_public_dict() for j in jobs],
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/jobs", summary="List Persistent Video Encode Jobs")
+    async def list_jobs_api(
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+        x_user_id: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """Return persistent encode jobs from Firestore/SQLite store."""
+        store = get_job_store()
+        with suppress(Exception):
+            await asyncio.to_thread(store.cleanup_expired_jobs)
+        requester = (x_user_id or user_id or "").strip() or None
+        jobs = await asyncio.to_thread(store.list_jobs, user_id, status, limit)
+        return JSONResponse(
+            content={
+                "status": "online",
+                "backend": store.get_backend_status(),
+                "count": len(jobs),
+                "jobs": [j.to_public_dict(requester_user_id=requester) for j in jobs],
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/jobs", summary="Create and Optionally Dispatch an Encode Job")
+    async def create_job_api(request: Request) -> JSONResponse:
+        """Create a persistent encode job and optionally dispatch it to the Cloud Run Job worker."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                content={"error": "Geçersiz JSON gövdesi."},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        user_id = str(body.get("user_id") or "").strip()
+        magnet = str(body.get("magnet") or "").strip()
+        codec = str(body.get("codec") or "h264").strip()
+        subtitle_lang = str(body.get("subtitle_lang") or body.get("dil") or "tur").strip()
+        subtitle_source = body.get("subtitle_source")
+        intro_source = body.get("intro_source")
+        should_dispatch = bool(body.get("dispatch", False))
+
+        if not user_id:
+            return JSONResponse(
+                content={"error": "Kullanıcı kimliği (`user_id`) zorunludur."},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        ok_mag, mag_or_err = validate_magnet_uri(magnet)
+        if not ok_mag:
+            return JSONResponse(
+                content={"error": mag_or_err},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        ok_codec, canonical_codec, enc_or_err = normalize_video_codec(codec)
+        if not ok_codec:
+            return JSONResponse(
+                content={"error": enc_or_err},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        ok_lang, lang_or_err = normalize_language_code(subtitle_lang)
+        if not ok_lang:
+            return JSONResponse(
+                content={"error": lang_or_err},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        store = get_job_store()
+        job = await asyncio.to_thread(
+            store.create_job,
+            user_id=user_id,
+            magnet=mag_or_err,
+            codec=canonical_codec,
+            subtitle_lang=lang_or_err,
+            subtitle_source=subtitle_source,
+            intro_source=intro_source,
+            user_name=body.get("user_name"),
+        )
+        dispatch_result = None
+        if should_dispatch:
+            dispatch_result = await asyncio.to_thread(dispatch_encode_job_background, job.job_id)
+            job = await asyncio.to_thread(store.get_job, job.job_id) or job
+
+        return JSONResponse(
+            content={
+                "status": "created",
+                "job": job.to_public_dict(requester_user_id=user_id),
+                "dispatch": dispatch_result,
+            },
+            status_code=201,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/jobs/cleanup-expired", summary="Server-Side 7200s Retention Cleanup & Stale Worker Recovery")
+    async def cleanup_expired_jobs_api(
+        request: Request = None,
+        authorization: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """
+        Trigger server-side 7200-second expiration cleanup (deleting expired objects from GCS and revoking access)
+        and recover any crashed/stale running jobs. Can be called by Cloud Scheduler or internal timers.
+        """
+        expected_token = os.getenv("UBAGEN_ADMIN_TOKEN", "").strip()
+        auth_header = authorization
+        if not auth_header and request is not None and hasattr(request, "headers"):
+            auth_header = request.headers.get("authorization")
+
+        # If UBAGEN_ADMIN_TOKEN is configured and caller supplies an Authorization header, verify it
+        if expected_token and auth_header and not verify_admin_token(auth_header, expected_token):
+            return JSONResponse(
+                content={"error": "Unauthorized cleanup trigger."},
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        store = get_job_store()
+        cleanup_res = await asyncio.to_thread(store.cleanup_expired_jobs)
+        recovered = await asyncio.to_thread(store.recover_stale_running_jobs)
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "cleanup": cleanup_res,
+                "recovered_crashed_jobs": [j.job_id for j in recovered],
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/jobs/{job_id}", summary="Get Single Encode Job Progress & Telemetry")
+    async def get_job_detail_api(
+        job_id: str,
+        user_id: Optional[str] = None,
+        x_user_id: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        """Retrieve a single job record from persistent storage."""
+        store = get_job_store()
+        job = await asyncio.to_thread(store.get_job, job_id)
+        if job is None:
+            return JSONResponse(
+                content={"error": f"Encode işi bulunamadı: {job_id}"},
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        if job.is_expired() and not job.deleted_from_gcs:
+            await asyncio.to_thread(store.cleanup_expired_jobs)
+            job = await asyncio.to_thread(store.get_job, job_id) or job
+
+        requester = (x_user_id or user_id or "").strip() or None
+        return JSONResponse(
+            content={
+                "status": "online",
+                "job": job.to_public_dict(requester_user_id=requester),
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/jobs/{job_id}/download", summary="Authorized & 7200s-Bounded GCS Video Download")
+    async def download_job_output_api(
+        job_id: str,
+        user_id: Optional[str] = None,
+        token: Optional[str] = None,
+        x_user_id: Optional[str] = Header(default=None),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        """
+        Serve or stream a completed video output from Google Cloud Storage:
+        - Enforces per-user ownership (`user_id` + `token`) -> returns 403 Forbidden on cross-user access.
+        - Enforces 7200-second retention -> actively deletes expired object from GCS and returns 410 Gone.
+        - Verifies `gcs_upload_verified` is True before serving -> returns 409 if not verified.
+        """
+        store = get_job_store()
+        job = await asyncio.to_thread(store.get_job, job_id)
+        if job is None:
+            return JSONResponse(
+                content={"error": "İstenen encode işi bulunamadı."},
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        effective_user = (user_id or x_user_id or "").strip()
+        effective_token = (token or "").strip()
+        if not effective_token and authorization and authorization.lower().startswith("bearer "):
+            effective_token = authorization.split(None, 1)[1].strip()
+
+        if not job.can_user_access(effective_user, effective_token):
+            return JSONResponse(
+                content={
+                    "error": "Erişim reddedildi (403): Bu video çıktısını yalnızca işi başlatan kullanıcı indirebilir."
+                },
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if job.is_expired():
+            # Actively purge the object from GCS if it hasn't been deleted yet
+            await asyncio.to_thread(store.cleanup_expired_jobs)
+            return JSONResponse(
+                content={
+                    "error": "Çıktının 7200 saniyelik (2 saat) saklama süresi dolduğu için erişim iptal edildi ve dosya GCS'den silindi."
+                },
+                status_code=410,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if job.status != "completed" or not job.gcs_upload_verified or not job.gcs_bucket or not job.gcs_object_name:
+            return JSONResponse(
+                content={
+                    "error": "Video çıktısı henüz tamamlanmadı veya Google Cloud Storage yüklemesi doğrulanmadı."
+                },
+                status_code=409,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        local_file, raw_bytes = await asyncio.to_thread(
+            store.gcs.open_download_stream_or_path,
+            job.gcs_bucket,
+            job.gcs_object_name,
+        )
+        filename = job.output_filename or f"{job.job_id}.mp4"
+        if local_file is not None and local_file.is_file():
+            return FileResponse(
+                path=str(local_file),
+                filename=filename,
+                media_type="video/mp4",
+                headers={"Cache-Control": "no-store"},
+            )
+        if raw_bytes is not None:
+            return Response(
+                content=raw_bytes,
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Cache-Control": "no-store",
+                },
+            )
+
+        return JSONResponse(
+            content={"error": "GCS nesnesine erişilemedi veya dosya silinmiş."},
+            status_code=404,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/logs", summary="Redacted Real-Time Backend Logs")
+    async def get_logs_api(limit: int = 100) -> JSONResponse:
+        """Return recent redacted backend log entries from the in-memory ring buffer."""
+        entries = get_recent_logs(limit=limit)
+        return JSONResponse(
+            content={
+                "status": "online",
+                "count": len(entries),
+                "logs": entries,
+            },
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/outputs/{filename}", summary="Download Stored Video or Subtitle Output")
+    async def download_output_file(filename: str):
+        """Serve a stored file from video_outputs with path-traversal protection and HTTP Range support."""
+        mgr = get_storage_manager()
+        resolved = await asyncio.to_thread(mgr.resolve_output_file, filename)
+        if resolved is None:
+            return JSONResponse(
+                content={"error": "Requested output file was not found or has expired."},
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        return FileResponse(
+            path=str(resolved),
+            filename=resolved.name,
+            media_type="application/octet-stream",
+        )
 
     # Mount static frontend files if dist/ directory exists (production container deployment)
     if os.path.isdir("dist"):

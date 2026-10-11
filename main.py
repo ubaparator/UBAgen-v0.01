@@ -55,8 +55,11 @@ except ImportError:
 
 import uvicorn
 
+from encoder_worker import notify_discord_webhook_sync, register_encoder_commands
 from health_api import create_health_app
-from stats import register_stats_command, BotTracker
+from job_store import get_job_store
+from stats import BotTracker, install_log_buffer_handler, register_stats_command
+from storage_manager import get_storage_manager
 from subtitle_extract import (
     cleanup_stale_workdirs,
     log_runtime_binaries_status,
@@ -72,6 +75,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+install_log_buffer_handler()
 logger = logging.getLogger("ubagen.main")
 
 
@@ -115,6 +119,7 @@ if commands is not None:
             logger.info("Registering slash commands...")
             register_stats_command(self.tree, self)
             register_subtitle_extract_command(self.tree)
+            register_encoder_commands(self.tree)
 
             # Sync slash commands with robust fallback
             if self.dev_guild_id:
@@ -778,9 +783,85 @@ async def run_fastapi_server(app: Any, host: str, port: int, shutdown_event: asy
             await watcher_task
 
 
+def _is_port_available(host: str, port: int) -> bool:
+    """Return True if TCP `port` can be bound on `host`."""
+    bind_addr = "0.0.0.0" if host in ("", "0.0.0.0", "::") else host
+    with suppress(Exception):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind_addr, port))
+            return True
+    return False
+
+
+def resolve_safe_http_port(host: str, preferred_port: int) -> int:
+    """
+    Ensure the HTTP monitoring port is available before launching uvicorn.
+    Prevents [Errno 98] Address already in use crashes when NGINX_PORT=8080
+    or another companion process is already bound to the default port.
+    """
+    if _is_port_available(host, preferred_port):
+        return preferred_port
+
+    for candidate in (5050, 5051, 5052, 8081, 8082):
+        if candidate != preferred_port and _is_port_available(host, candidate):
+            logger.warning(
+                "Port %d is already in use on %s; falling back to available port %d.",
+                preferred_port,
+                host,
+                candidate,
+            )
+            return candidate
+    return preferred_port
+
+
+async def run_job_retention_sweeper_loop(
+    shutdown_event: asyncio.Event,
+    interval_seconds: float = 60.0,
+) -> None:
+    """
+    Server-side scheduled background task enforcing the 7200-second (2-hour) retention policy:
+    - Actively deletes expired video outputs from Google Cloud Storage and revokes download links.
+    - Detects crashed/stale worker jobs and marks them as failed with Discord notifications.
+    """
+    while not shutdown_event.is_set():
+        try:
+            store = get_job_store()
+            cleanup_info = await asyncio.to_thread(store.cleanup_expired_jobs)
+            if cleanup_info.get("expired_jobs_processed", 0) > 0:
+                logger.info(
+                    "7200s Retention Sweeper: purged %d expired job(s) (%d GCS object(s) deleted).",
+                    cleanup_info["expired_jobs_processed"],
+                    cleanup_info["gcs_objects_deleted"],
+                )
+            recovered = await asyncio.to_thread(store.recover_stale_running_jobs)
+            for crashed_job in recovered:
+                logger.warning("Recovered crashed/stale worker job: %s", crashed_job.job_id)
+                await asyncio.to_thread(notify_discord_webhook_sync, crashed_job)
+        except Exception as exc:
+            logger.debug("Job retention sweeper error: %s", exc)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
 async def main() -> None:
     """Main application loop coordinating bot and web service."""
-    port_str = os.getenv("UBAGEN_HTTP_PORT", "").strip() or os.getenv("PORT", "8080").strip()
+    ubagen_port_env = os.getenv("UBAGEN_HTTP_PORT", "").strip()
+    raw_port_env = os.getenv("PORT", "8080").strip()
+    nginx_port_env = os.getenv("NGINX_PORT", "").strip()
+
+    if ubagen_port_env:
+        port_str = ubagen_port_env
+    elif nginx_port_env and nginx_port_env == raw_port_env:
+        # Inside AI Studio container where nginx occupies PORT=8080, use companion port 5050
+        port_str = "5050"
+    else:
+        port_str = raw_port_env
+
     try:
         http_port = int(port_str)
     except ValueError:
@@ -788,11 +869,22 @@ async def main() -> None:
         http_port = 8080
 
     http_host = validate_bind_host(os.getenv("HOST", "0.0.0.0"), port=http_port)
+    http_port = resolve_safe_http_port(http_host, http_port)
     dev_guild_id = parse_dev_guild_id()
 
-    # Clean up any leftover temporary job directories and verify aria2c, ffmpeg, and ffprobe
+    # Clean up any leftover temporary job directories, audit storage, and verify aria2c, ffmpeg, and ffprobe
     with suppress(Exception):
         await asyncio.to_thread(cleanup_stale_workdirs)
+    with suppress(Exception):
+        storage_report = await asyncio.to_thread(get_storage_manager().inspect)
+        logger.info(
+            "Storage Audit [%s]: mode=%s, persistent=%s, outputs=%s, temp=%s",
+            storage_report.get("decision_branch"),
+            storage_report.get("storage_mode"),
+            storage_report.get("is_persistent"),
+            storage_report.get("directories", {}).get("video_outputs_dir"),
+            storage_report.get("directories", {}).get("download_temp_dir"),
+        )
     with suppress(Exception):
         await asyncio.to_thread(log_runtime_binaries_status, True)
 
@@ -821,6 +913,11 @@ async def main() -> None:
         run_fastapi_server(health_app, host=http_host, port=http_port, shutdown_event=shutdown_event)
     )
 
+    # Start server-side 7200s GCS retention sweeper & crash recovery loop
+    sweeper_task = asyncio.create_task(
+        run_job_retention_sweeper_loop(shutdown_event, interval_seconds=60.0)
+    )
+
     # Start Discord bot in background if token is supplied and valid
     bot_manager.start()
 
@@ -834,6 +931,10 @@ async def main() -> None:
 
     logger.info("Shutdown initiated. Cleaning up active tasks...")
     shutdown_event.set()
+
+    sweeper_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await sweeper_task
 
     await bot_manager.stop_bot()
 

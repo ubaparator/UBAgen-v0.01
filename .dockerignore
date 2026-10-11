@@ -18,3 +18,5 @@ dist/
 .github
 tests/
 download_temp/
+encode_temp/
+video_outputs/

@@ -1,0 +1,72 @@
+# ==============================================================================
+# UBAgen — Google Cloud Run Job Specification (Dedicated Video Encoder Worker)
+# ==============================================================================
+# Deploy or update with:
+#   gcloud run jobs replace cloud-run-encoder-job.yaml --region=europe-west2
+#
+# Or create via gcloud CLI:
+#   gcloud run jobs create ubagen-encoder-worker \
+#     --image=europe-west2-docker.pkg.dev/<PROJECT_ID>/ubagen-repo/ubagen:latest \
+#     --region=europe-west2 \
+#     --service-account=ubagen-worker-sa@<PROJECT_ID>.iam.gserviceaccount.com \
+#     --command="python3" \
+#     --args="-B,encoder_worker.py" \
+#     --cpu=4 \
+#     --memory=8Gi \
+#     --task-timeout=3600s \
+#     --max-retries=1 \
+#     --tasks=1 \
+#     --parallelism=1 \
+#     --set-env-vars="UBAGEN_GCS_BUCKET=<BUCKET_NAME>,UBAGEN_USE_FIRESTORE=true,UBAGEN_GCP_PROJECT_ID=<PROJECT_ID>,UBAGEN_WORKER_TEMP_DIR=/tmp/ubagen_worker_scratch,UBAGEN_ENCODE_RETENTION_SECONDS=7200"
+# ==============================================================================
+
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: ubagen-encoder-worker
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      parallelism: 1
+      taskCount: 1
+      template:
+        spec:
+          # Dedicated least-privilege Service Account (roles/storage.objectAdmin on bucket + roles/datastore.user)
+          serviceAccountName: ubagen-worker-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com
+          timeoutSeconds: 3600
+          maxRetries: 1
+          containers:
+            - image: europe-west2-docker.pkg.dev/YOUR_PROJECT_ID/ubagen-repo/ubagen:latest
+              command: ["python3"]
+              args: ["-B", "encoder_worker.py"]
+              env:
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: UBAGEN_GCP_PROJECT_ID
+                  value: "YOUR_PROJECT_ID"
+                - name: UBAGEN_GCP_REGION
+                  value: "europe-west2"
+                - name: UBAGEN_USE_FIRESTORE
+                  value: "true"
+                - name: UBAGEN_FIRESTORE_COLLECTION
+                  value: "ubagen_encode_jobs"
+                - name: UBAGEN_GCS_BUCKET
+                  value: "YOUR_GCS_BUCKET_NAME"
+                - name: UBAGEN_WORKER_TEMP_DIR
+                  value: "/tmp/ubagen_worker_scratch"
+                - name: UBAGEN_ENCODE_RETENTION_SECONDS
+                  value: "7200"
+                - name: UBAGEN_PUBLIC_BASE_URL
+                  value: "https://YOUR_CLOUD_RUN_SERVICE_URL"
+              resources:
+                limits:
+                  # 4 vCPU + 8 GiB RAM recommended for libx264/libx265 encoding and Gen2 in-memory /tmp scratch
+                  cpu: "4"
+                  memory: "8Gi"

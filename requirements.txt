@@ -4,3 +4,5 @@ uvicorn[standard]>=0.32.0
 psutil>=6.0.0
 python-dotenv>=1.0.1
 aiohttp>=3.10.0
+google-cloud-storage>=2.14.0
+google-cloud-firestore>=2.16.0

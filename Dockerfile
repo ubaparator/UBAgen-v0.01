@@ -34,6 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     procps \
     ca-certificates \
+    fontconfig \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/* \
     && aria2c --version >/dev/null \
     && ffmpeg -version >/dev/null \
@@ -55,8 +57,9 @@ COPY . /app/
 # Copy built frontend assets from Stage 1 into /app/dist
 COPY --from=frontend-builder /build/dist /app/dist
 
-# Secure ownership
-RUN chown -R ubagen:ubagen /app
+# Pre-create separated temporary worker and output directories and secure ownership for non-root user
+RUN mkdir -p /app/download_temp/encode_temp /app/download_temp/worker_jobs /app/video_outputs && \
+    chown -R ubagen:ubagen /app
 
 USER ubagen
 

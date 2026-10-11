@@ -38,7 +38,7 @@ jobs:
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
       - name: Compile Python modules
-        run: python -B -m compileall -q main.py subtitle_extract.py stats.py health_api.py tests
+        run: python -B -m compileall -q main.py subtitle_extract.py stats.py health_api.py storage_manager.py job_store.py encoder_worker.py tests
 
       - name: Run Python regression tests
         run: python -B -m unittest discover -s tests -v
@@ -63,5 +63,5 @@ jobs:
       - name: Build production Docker image
         run: |
           docker build --tag ubagen-ci-test .
-          docker run --rm ubagen-ci-test sh -c "aria2c --version >/dev/null && ffmpeg -version >/dev/null && ffprobe -version >/dev/null && python -B -c 'import main, subtitle_extract, stats, health_api'"
+          docker run --rm ubagen-ci-test sh -c "aria2c --version >/dev/null && ffmpeg -version >/dev/null && ffprobe -version >/dev/null && python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker'"
 

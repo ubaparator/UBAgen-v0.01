@@ -33,6 +33,11 @@ Do not commit a real `.env` file or live credentials. This repository is run fro
 
 A GitHub commit alone does not guarantee that an already-running Run session or the public deployment has restarted.
 
-## Video upload limitation
+## Video upload limitation & Storage Persistence
 
-The bot's 1.5 GB limit is an application-side validation limit. It does not override Discord's own upload cap for interaction attachments. For larger videos, use the command's `magnet_uri` input or implement a separate upload/storage flow. The successful result message is configured to disappear after six minutes; a command attachment is not a bot-owned Discord message that the bot can delete from the UI.
+The bot's 1.5 GB limit is an application-side validation limit. It does not override Discord's own upload cap (8 MB standard) for interaction attachments.
+- Temporary torrent downloads (`download_temp/job_*`) and intermediate FFmpeg files (`download_temp/encode_temp/encode_*`) are strictly separated from completed outputs (`video_outputs/`) and are deleted automatically in `finally` after every job.
+- **Important Persistence Notice**: In Google AI Studio Run and published Cloud Run containers, `/` and `/tmp` are `overlay` / `tmpfs` filesystems. Although `os.statvfs("/")` may report ~378 GiB on the host overlay, container overlay storage is **ephemeral** and is wiped when a container instance restarts, scales down, or is redeployed.
+- To persist `video_outputs` across restarts/redeployments in production:
+  - **Docker / VPS**: Mount a host volume (`-v /mnt/ubagen_data:/app/storage`) and set `UBAGEN_STORAGE_DIR=/app/storage` (and optionally `UBAGEN_PERSISTENT_VOLUME_VERIFIED=true`).
+  - **Google Cloud Run**: Mount a Cloud Storage bucket via Cloud Run Volume Mounts (Cloud Storage FUSE) at `/mnt/storage` with the service account granted `roles/storage.objectAdmin`, and set `UBAGEN_STORAGE_DIR=/mnt/storage`.
