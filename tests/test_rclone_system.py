@@ -16,6 +16,9 @@ from rclone_manager import (
     collect_log_diagnostics,
     format_log_diagnostics_report,
     sanitize_rclone_text,
+    is_rclone_backend_supported,
+    get_rclone_supported_backends,
+    resolve_rclone_binary,
 )
 
 
@@ -174,6 +177,87 @@ class TestRcloneSystem(unittest.TestCase):
         report = format_log_diagnostics_report(diag)
         self.assertIsInstance(report, str)
         self.assertIn("RCLONE", report)
+
+    def test_rclone_binary_includes_mega_backend(self):
+        """Verify that the resolved rclone binary includes the official 'mega' backend."""
+        rclone_bin = resolve_rclone_binary(auto_bootstrap=False, require_backend="mega")
+        self.assertIsNotNone(rclone_bin, "A valid rclone binary supporting 'mega' must be found.")
+        self.assertTrue(os.path.isfile(rclone_bin))
+        self.assertTrue(os.access(rclone_bin, os.X_OK))
+
+        backends = get_rclone_supported_backends(rclone_bin)
+        self.assertIn(
+            "mega",
+            backends,
+            f"The resolved rclone binary at {rclone_bin} lacks 'mega' backend. Supported backends: {sorted(list(backends))[:15]}...",
+        )
+        self.assertTrue(is_rclone_backend_supported(rclone_bin, "mega"))
+
+    def test_mega_remote_creation_and_config_format(self):
+        """Verify adding a MEGA remote writes 'type = mega', user, and pass properly without credential leaks."""
+        mgr = RcloneStorageManager(
+            db_path=self.db_path,
+            rclone_config_path=self.cfg_path,
+            cipher=self.cipher,
+        )
+
+        acc = mgr.add_mega_account(
+            user="user_sample@test.org",
+            password="TestPassword123#",
+            remote_name="mega_depolama_test",
+            display_name="Mega Depolama Test",
+            remote_base_path="UBAgen_Outputs",
+            test_after_add=False,
+        )
+        self.assertEqual(acc["remote_name"], "mega_depolama_test")
+        self.assertEqual(acc["provider"], "mega")
+
+        conf_content = self.cfg_path.read_text(encoding="utf-8")
+        self.assertIn("[mega_depolama_test]", conf_content)
+        self.assertIn("type = mega", conf_content)
+        self.assertIn("user = user_sample@test.org", conf_content)
+        self.assertIn("pass =", conf_content)
+        # Cleartext password must NEVER appear in the configuration file or account dict
+        self.assertNotIn("TestPassword123#", conf_content)
+        self.assertNotIn("TestPassword123#", json.dumps(acc))
+
+    def test_connection_test_distinguishes_backend_missing_vs_auth_failure(self):
+        """Verify that test_account_connection detects missing backend explicitly without misattributing it to auth failure."""
+        mgr = RcloneStorageManager(
+            db_path=self.db_path,
+            rclone_config_path=self.cfg_path,
+            cipher=self.cipher,
+        )
+
+        mgr.add_mega_account(
+            user="user@example.com",
+            password="password",
+            remote_name="mega_unit_test",
+            test_after_add=False,
+        )
+
+        # 1. Simulate binary missing the backend
+        with patch("rclone_manager.is_rclone_backend_supported", return_value=False), \
+             patch("rclone_manager.resolve_rclone_binary", return_value=None):
+            result = mgr.test_account_connection("mega_unit_test")
+            self.assertFalse(result.get("ok"))
+            self.assertTrue(result.get("backend_missing"))
+            self.assertIn("depolama backend'ini içermiyor", result.get("error", ""))
+
+        # 2. Simulate invalid credentials (backend is present, but credentials fail)
+        class DummyProcess:
+            returncode = 1
+            stdout = ""
+            stderr = "2026/10/12 12:00:00 Failed to create file system for \"mega_unit_test:\": Bad credentials or login failed: [Bad username/password]"
+
+        with patch("rclone_manager.is_rclone_backend_supported", return_value=True), \
+             patch.object(mgr, "_run_rclone_cli", return_value=DummyProcess()):
+            result2 = mgr.test_account_connection("mega_unit_test")
+            # Result must NOT claim success, and must NOT report backend_missing
+            self.assertEqual(result2.get("status"), "error")
+            self.assertFalse(result2.get("last_test_ok", True))
+            self.assertFalse(result2.get("backend_missing", False))
+            self.assertIn("Bad credentials", result2.get("last_error", ""))
 
 
 if __name__ == "__main__":

@@ -705,6 +705,7 @@ class BotLifecycleManager:
         self._stop_bot_event = asyncio.Event()
         self._wake_event = asyncio.Event()
         self.bot_task: Optional[asyncio.Task] = None
+        self.watchdog_task: Optional[asyncio.Task] = None
 
         self.bot: Any = self._create_bot_instance()
         if self.health_app is not None:
@@ -766,9 +767,76 @@ class BotLifecycleManager:
         """Retrieve current DISCORD_BOT_TOKEN from environment without mutating or logging it."""
         return os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
+    async def _gateway_watchdog_loop(self) -> None:
+        """
+        Continuous in-process Discord Gateway watchdog:
+        - Monitors the Discord runner task (`self.bot_task`) and Gateway connectivity.
+        - Automatically revives the runner task if it unexpectedly terminates or crashes.
+        - Wakes the bot if it has been stalled in a disconnected state without active backoff.
+        - Respects exponential backoff, ongoing connection attempts, and invalid token state.
+        - Exits cleanly when `shutdown_event` or `_stop_bot_event` is set.
+        """
+        logger.info("Discord Gateway watchdog monitor initialized.")
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(10.0)
+                if self.shutdown_event.is_set() or self._stop_bot_event.is_set():
+                    break
+
+                token = self.get_bot_token()
+                if not token or is_placeholder_bot_token(token):
+                    continue
+
+                tracker = getattr(self.bot, "tracker", None)
+                if tracker and tracker.status == "invalid_token":
+                    continue
+
+                # Condition 1: Bot runner task died unexpectedly while application is alive
+                if self.bot_task is not None and self.bot_task.done():
+                    exc = None
+                    with suppress(Exception):
+                        exc = self.bot_task.exception()
+                    logger.warning(
+                        "Gateway Watchdog: Discord runner task unexpectedly completed (exception: %s). Reviving bot...",
+                        type(exc).__name__ if exc else "None",
+                    )
+                    async with self._restart_lock:
+                        if not self.shutdown_event.is_set() and not self._stop_bot_event.is_set():
+                            self._stop_bot_event = asyncio.Event()
+                            self._wake_event = asyncio.Event()
+                            self.bot_task = asyncio.create_task(
+                                run_discord_bot(
+                                    self.bot,
+                                    token,
+                                    self.shutdown_event,
+                                    stop_event=self._stop_bot_event,
+                                    wake_event=self._wake_event,
+                                    bot_factory=self._create_bot_instance,
+                                    on_bot_replaced=self._update_active_bot,
+                                    initial_retry_delay=self.retry_delay,
+                                )
+                            )
+                    continue
+
+                # Condition 2: Prolonged disconnection without active progress
+                if tracker and not tracker.connected and not self.is_restarting:
+                    last_err = getattr(tracker, "last_error_time", 0.0) or 0.0
+                    if last_err > 0 and (time.time() - last_err) > 90.0:
+                        if self._wake_event is not None and not self._wake_event.is_set():
+                            logger.info("Gateway Watchdog: Gateway disconnected for >90s. Triggering wake event...")
+                            self._wake_event.set()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Gateway Watchdog iteration error: %s", exc)
+
     def start(self) -> Optional[asyncio.Task]:
-        """Start the Discord bot background task if token and runtime are available."""
+        """Start the Discord bot background task and in-process watchdog if token and runtime are available."""
         bot_token = self.get_bot_token()
+        if self.watchdog_task is None or self.watchdog_task.done():
+            self.watchdog_task = asyncio.create_task(self._gateway_watchdog_loop())
+
         if self.bot is not None and not is_placeholder_bot_token(bot_token):
             self._stop_bot_event = asyncio.Event()
             self._wake_event = asyncio.Event()
@@ -809,6 +877,12 @@ class BotLifecycleManager:
     async def stop_bot(self) -> None:
         """Cleanly close the active Discord bot connection and stop its task without stopping FastAPI."""
         self._stop_bot_event.set()
+        if self.watchdog_task is not None and not self.watchdog_task.done():
+            self.watchdog_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self.watchdog_task
+            self.watchdog_task = None
+
         current_bot = self.bot
         current_task = self.bot_task
 

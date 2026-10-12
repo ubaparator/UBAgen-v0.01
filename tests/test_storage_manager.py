@@ -59,6 +59,7 @@ class StorageManagerTests(unittest.IsolatedAsyncioTestCase):
                         "UBAGEN_GCS_BUCKET": "",
                         "GCS_BUCKET_NAME": "",
                         "GOOGLE_DRIVE_CREDENTIALS": "",
+                        "UBAGEN_DISABLE_RCLONE_STORAGE_DETECT": "1",
                     },
                     clear=False,
                 ),

@@ -531,7 +531,7 @@ async def execute_http_command_background(
         handle_encodeal_slash_command,
         handle_job_status_slash_command,
     )
-    from stats import build_stats_embed, collect_all_stats
+    from stats import build_stats_embed, collect_all_stats, format_compact_stats_message
 
     data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     cmd_name = str(data_obj.get("name") or "").strip().lower()
@@ -610,15 +610,12 @@ async def execute_http_command_background(
         if cmd_name == "stats":
             stats_data = await asyncio.to_thread(collect_all_stats, active_bot)
             embed = build_stats_embed(stats_data)
-            bot_info = stats_data.get("bot", {})
             wake_note = ""
             if wake_result and wake_result.get("woken"):
                 wake_note = "⚡ **Komutla Uyanma Tetiklendi:** Discord Gateway botu arka planda yeniden bağlanıyor.\n"
-            summary_text = (
-                f"{wake_note}📊 **UBAgen Sistem Durumu** — HTTP: `Alive` | "
-                f"Gateway: `{'Connected' if bot_info.get('connected') else 'Disconnected'}` | "
-                f"Bot Ready: `{'Ready' if bot_info.get('is_ready') else 'Not Ready'}`"
-            )
+            summary_text = format_compact_stats_message(stats_data, max_len=1023, wake_note=wake_note)
+            if len(summary_text) > 1023:
+                summary_text = summary_text[:1020] + "..."
             await adapter.edit_original_response(content=summary_text, embed=embed)
             return {"command": cmd_name, "status": "completed", "wake": wake_result}
 

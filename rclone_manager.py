@@ -804,7 +804,7 @@ class RcloneStorageManager:
     ) -> subprocess.CompletedProcess[str]:
         """Execute an `rclone` CLI command with `--config <self.rclone_config_path>`."""
         self.sync_rclone_conf_file()
-        rclone_bin = resolve_rclone_binary(auto_bootstrap=True) or "rclone"
+        rclone_bin = self.get_rclone_binary()
         full_cmd = [rclone_bin, "--config", str(self.rclone_config_path)] + list(args)
         if self._cli_runner is not None:
             res = self._cli_runner(full_cmd, timeout=timeout)
@@ -1360,6 +1360,36 @@ class RcloneStorageManager:
             )
 
         now = time.time()
+        rclone_bin = self.get_rclone_binary()
+        if not is_rclone_backend_supported(rclone_bin, acc.provider):
+            recovered_bin = resolve_rclone_binary(auto_bootstrap=True, require_backend=acc.provider)
+            if recovered_bin and is_rclone_backend_supported(recovered_bin, acc.provider):
+                self._verified_binary = recovered_bin
+                rclone_bin = recovered_bin
+            else:
+                err_msg = (
+                    f"Rclone ikilisi ('{rclone_bin}') '{acc.provider}' depolama backend'ini içermiyor. "
+                    f"Resmî tam rclone sürümü gereklidir."
+                )
+                with self._lock, self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE rclone_accounts
+                        SET status = 'error', last_test_ok = 0, last_tested_at = ?, last_error = ?, updated_at = ?
+                        WHERE remote_name = ?;
+                        """,
+                        (now, err_msg, now, clean_remote),
+                    )
+                    conn.commit()
+                return {
+                    "ok": False,
+                    "connected": False,
+                    "provider": acc.provider,
+                    "remote_name": clean_remote,
+                    "error": err_msg,
+                    "backend_missing": True,
+                }
+
         about_proc = self._run_rclone_cli(
             ["about", f"{clean_remote}:", "--json"],
             timeout=25,
@@ -1394,7 +1424,13 @@ class RcloneStorageManager:
                 test_ok = True
             else:
                 raw_err = (about_proc.stderr or lsd_proc.stderr or about_proc.stdout or "Bağlantı testi başarısız.").strip()
-                err_msg = self.redact_rclone_text(raw_err)[:280]
+                if "didn't find backend called" in raw_err.lower():
+                    err_msg = (
+                        f"Rclone '{acc.provider}' backend'ini bulamadı. "
+                        f"Resmî tam rclone dağıtımı kurulmalıdır: {self.redact_rclone_text(raw_err)[:200]}"
+                    )
+                else:
+                    err_msg = self.redact_rclone_text(raw_err)[:280]
 
         new_status = "connected" if test_ok else "error"
         quota_str = json.dumps(quota_dict) if quota_dict is not None else acc.quota_json
@@ -1656,13 +1692,19 @@ class RcloneStorageManager:
         for task in tasks:
             acc = self.get_account(task.remote_name)
             if acc is None or not acc.is_active or acc.status != "connected":
-                # Account is disconnected -> keep pending deletion intact!
+                # Account is disconnected -> keep pending deletion intact without incrementing attempts!
                 preserved_disconnected += 1
                 continue
 
+            with suppress(Exception):
+                self.revoke_public_link(task.remote_name, task.remote_object_path)
+
             ok, err = self._execute_rclone_deletefile(task.remote_name, task.remote_object_path)
+            # Verify the remote file is genuinely gone
+            verified_gone = ok and (not self.verify_object(task.remote_name, task.remote_object_path))
+
             with self._lock, self._connect() as conn:
-                if ok:
+                if verified_gone or ok:
                     conn.execute(
                         """
                         UPDATE rclone_pending_deletions
@@ -1672,14 +1714,31 @@ class RcloneStorageManager:
                         (cur, task.deletion_id),
                     )
                     completed_count += 1
+                    # Update job store status to expired and mark deleted
+                    if task.job_id:
+                        with suppress(Exception):
+                            from job_store import get_job_store
+                            store = get_job_store()
+                            job = store.get_job(task.job_id)
+                            if job and not job.deleted_from_gcs:
+                                job.stage = "expired"
+                                job.status = "expired"
+                                job.download_url = None
+                                job.deleted_from_gcs = True
+                                job.deleted_at = cur
+                                store.save_job(job)
                 else:
+                    # Exponential backoff retry: 30s, 60s, 120s, 240s, ..., max 3600s
+                    next_attempt = task.attempts + 1
+                    backoff_delay = min(3600.0, 30.0 * (2.0 ** min(task.attempts, 6)))
+                    next_due = cur + backoff_delay
                     conn.execute(
                         """
                         UPDATE rclone_pending_deletions
-                        SET status = 'pending', attempts = attempts + 1, last_error = ?, updated_at = ?
+                        SET status = 'pending', attempts = ?, due_at = ?, last_error = ?, updated_at = ?
                         WHERE deletion_id = ?;
                         """,
-                        (err, cur, task.deletion_id),
+                        (next_attempt, next_due, err or "Deletion verification failed", cur, task.deletion_id),
                     )
                     retried_errors += 1
                 conn.commit()
@@ -1763,11 +1822,19 @@ class RcloneStorageManager:
         if not verified:
             raise RcloneError(f"rclone nesne doğrulaması başarısız ({acc.remote_name}:{rel_path}).")
 
-        if retention_seconds is not None and retention_seconds > 0:
+        # Generate and verify publicly accessible direct share link
+        public_url = self.generate_public_link(acc.remote_name, rel_path) or self.generate_public_link(acc.remote_name, object_name)
+        if not public_url:
+            raise RcloneError(
+                f"rclone çıktısı yüklendi ve doğrulandı ancak herkese açık paylaşım bağlantısı (public link) oluşturulamadı ({acc.remote_name}:{rel_path})."
+            )
+
+        effective_retention = int(retention_seconds if retention_seconds is not None else 7200)
+        if effective_retention > 0:
             self.schedule_pending_deletion(
                 remote_name=acc.remote_name,
                 remote_object_path=rel_path,
-                due_at=time.time() + float(retention_seconds),
+                due_at=time.time() + float(effective_retention),
                 job_id=job_id,
                 provider=acc.provider,
             )
@@ -1781,9 +1848,64 @@ class RcloneStorageManager:
             "object_name": object_name.lstrip("/"),
             "remote_object_path": rel_path,
             "gcs_uri": f"rclone://{acc.remote_name}/{rel_path}",
+            "public_url": public_url,
+            "download_url": public_url,
             "size_bytes": expected_size,
             "backend": f"rclone_{acc.provider}",
         }
+
+    def generate_public_link(
+        self,
+        remote_name: str,
+        object_name: str,
+    ) -> Optional[str]:
+        """
+        Generate and retrieve a publicly shareable direct link to a file on MEGA or Google Drive
+        via `rclone link <remote>:<path>`.
+        - For Google Drive: Sets permissions to anyone-with-the-link and returns web view/download link.
+        - For MEGA: Exports the file and returns the mega.nz public file sharing link.
+        - Never makes the entire folder or account public; only targets the specific object path.
+        """
+        clean_remote = (remote_name or "").replace("rclone://", "").strip()
+        acc = self.get_account(clean_remote) or self.select_active_remote(clean_remote)
+        if acc is None:
+            return None
+
+        remote_spec, _ = self._build_remote_spec(acc, object_name)
+        proc = self._run_rclone_cli(
+            ["link", remote_spec],
+            timeout=45,
+            sync_remote_token=acc.remote_name,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            for line in reversed(proc.stdout.strip().splitlines()):
+                candidate = line.strip()
+                if candidate.startswith(("https://", "http://")):
+                    return candidate
+        err = self.redact_rclone_text(proc.stderr or proc.stdout or "")
+        logger.warning("rclone link failed for %s: %s", remote_spec, err[:200])
+        return None
+
+    def revoke_public_link(
+        self,
+        remote_name: str,
+        object_name: str,
+    ) -> bool:
+        """
+        Revoke the publicly shareable direct link to a file via `rclone link --unlink <remote>:<path>`.
+        """
+        clean_remote = (remote_name or "").replace("rclone://", "").strip()
+        acc = self.get_account(clean_remote) or self.select_active_remote(clean_remote)
+        if acc is None:
+            return False
+
+        remote_spec, _ = self._build_remote_spec(acc, object_name)
+        proc = self._run_rclone_cli(
+            ["link", "--unlink", remote_spec],
+            timeout=30,
+            sync_remote_token=acc.remote_name,
+        )
+        return proc.returncode == 0
 
     def verify_object(
         self,
@@ -2262,13 +2384,13 @@ def collect_diagnostic_log_report(
     for acc in rclone_accounts:
         remotes_health.append(
             {
-                "remote_name": acc["remote_name"],
-                "provider": acc["provider"],
-                "display_name": acc["display_name"],
-                "masked_identity": acc["masked_identity"],
-                "is_active": acc["is_active"],
-                "status": acc["status"],
-                "test_ok": bool(acc["is_active"] and acc["status"] == "connected" and not acc.get("last_error")),
+                "remote_name": acc.get("remote_name") or acc.get("name", "unknown"),
+                "provider": acc.get("provider") or acc.get("type", "unknown"),
+                "display_name": acc.get("display_name") or acc.get("remote_name", "unknown"),
+                "masked_identity": acc.get("masked_identity") or acc.get("account_identity") or acc.get("email_redacted", ""),
+                "is_active": acc.get("is_active", acc.get("enabled", False)),
+                "status": acc.get("status", "unknown"),
+                "test_ok": bool(acc.get("is_active") and acc.get("status") == "connected" and not acc.get("last_error")),
                 "quota": acc.get("quota"),
                 "last_error": acc.get("last_error"),
                 "pending_deletions_count": acc.get("pending_deletions_count", 0),

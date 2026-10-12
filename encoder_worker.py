@@ -30,6 +30,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
@@ -461,6 +462,9 @@ def parse_ffmpeg_progress_block(
         percent = min(99.9, (processed_frames / float(total_frames)) * 100.0)
     elif total_duration_sec > 0 and out_time_sec > 0:
         percent = min(99.9, (out_time_sec / float(total_duration_sec)) * 100.0)
+    elif out_time_sec > 0:
+        # Fallback for streams lacking container duration metadata to avoid progress hanging
+        percent = min(95.0, round(5.0 + math.log1p(out_time_sec) * 12.0, 1))
 
     # Calculate ETA in seconds
     eta_seconds: Optional[int] = None
@@ -509,6 +513,10 @@ def build_ffmpeg_encode_command(
     )
     crf_value = "22" if video_encoder == "libx264" else "24"
 
+    cpu_cnt = os.cpu_count() or 4
+    enc_threads = str(min(cpu_cnt, 16))
+    flt_threads = str(min(cpu_cnt, 8))
+
     cmd: list[str] = [
         "ffmpeg",
         "-nostdin",
@@ -518,6 +526,10 @@ def build_ffmpeg_encode_command(
         "-progress",
         "pipe:1",
         "-nostats",
+        "-threads",
+        enc_threads,
+        "-filter_threads",
+        flt_threads,
         "-y",
     ]
 
@@ -544,7 +556,12 @@ def build_ffmpeg_encode_command(
             f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v0]"
         )
-        main_v_base = f"[1:v]scale={w}:{h},setsar=1,fps={fps},format=yuv420p"
+        m_w = int(m_meta.get("width") or 0)
+        m_h = int(m_meta.get("height") or 0)
+        if m_w == w and m_h == h:
+            main_v_base = f"[1:v]setsar=1,fps={fps},format=yuv420p"
+        else:
+            main_v_base = f"[1:v]scale={w}:{h},setsar=1,fps={fps},format=yuv420p"
         if sub_filter:
             main_v_chain = f"{main_v_base},{sub_filter}[v1]"
         else:
@@ -673,18 +690,25 @@ def format_discord_job_message(job: EncodeJob) -> str:
     if job.status == "completed" and job.gcs_upload_verified and job.download_url:
         exp_ts = int(job.expires_at or (time.time() + DEFAULT_RETENTION_SECONDS))
         size_label = format_storage_bytes(job.output_size_bytes)
+        provider_label = "MEGA / Google Drive bulut depolamasından"
+        if job.gcs_bucket and "mega" in str(job.gcs_bucket).lower():
+            provider_label = "MEGA bulut depolamasından"
+        elif job.gcs_bucket and "drive" in str(job.gcs_bucket).lower():
+            provider_label = "Google Drive bulut depolamasından"
+
         lines.extend([
             f"• **Çıktı Boyutu:** `{size_label}` (`{job.output_filename or 'video.mp4'}`)",
             f"• **Son Kullanma (7200 sn / 2 Saat):** <t:{exp_ts}:F> (<t:{exp_ts}:R>)",
-            f"🔗 **İndirme Bağlantısı (Yalnızca <@{job.user_id}> için yetkili):**\n{job.download_url}",
-            "⚠️ *Not: Bu bağlantı 7200 saniye (2 saat) sonra otomatik olarak iptal edilir ve video Google Cloud Storage'dan kalıcı olarak silinir.*",
+            f"🔗 **Doğrudan İndirme / Paylaşım Bağlantısı:**\n{job.download_url}",
+            f"⚠️ *Not: Bu bağlantı 7200 saniye (2 saat) sonra otomatik olarak iptal edilir ve video {provider_label} kalıcı olarak silinir.*",
+            "🌐 *Not: Bu bağlantı doğrudan herkese açık dosya erişimi sağlar.*",
         ])
     elif job.status == "cancelled":
         lines.append(f"🛑 **Durum:** {job.error or 'İşlem iptal edildi.'}")
     elif job.status == "failed" or job.error:
         lines.append(f"❌ **Hata:** {job.error or 'Bilinmeyen işlem hatası.'}")
     elif job.status == "expired" or job.deleted_from_gcs:
-        lines.append("🗑️ **Durum:** 7200 saniyelik saklama süresi dolduğu için erişim iptal edildi ve dosya GCS'den silindi.")
+        lines.append("🗑️ **Durum:** 7200 saniyelik saklama süresi dolduğu için erişim iptal edildi ve çıktı dosyası bulut depolamasından silindi.")
 
     return "\n".join(lines)
 
@@ -1208,6 +1232,29 @@ def execute_encode_job_sync(
         last_emit_time = 0.0
         start_encode_ts = time.monotonic()
 
+        stdout_queue: queue.Queue[Optional[str]] = queue.Queue()
+        stderr_lines: list[str] = []
+
+        def _drain_stdout(stream: Any) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    stdout_queue.put(line)
+            except Exception:
+                pass
+            finally:
+                stdout_queue.put(None)
+
+        def _drain_stderr(stream: Any) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    if len(stderr_lines) < 250:
+                        stderr_lines.append(line)
+                    else:
+                        stderr_lines.pop(0)
+                        stderr_lines.append(line)
+            except Exception:
+                pass
+
         with subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.PIPE,
@@ -1215,12 +1262,26 @@ def execute_encode_job_sync(
             text=True,
             bufsize=1,
         ) as proc:
+            t_out = threading.Thread(target=_drain_stdout, args=(proc.stdout,), daemon=True)
+            t_err = threading.Thread(target=_drain_stderr, args=(proc.stderr,), daemon=True)
+            t_out.start()
+            t_err.start()
+
             try:
-                assert proc.stdout is not None
-                for raw_line in proc.stdout:
+                while True:
                     if (time.monotonic() - start_encode_ts) > encode_timeout:
                         proc.kill()
                         raise subprocess.TimeoutExpired(ffmpeg_cmd, encode_timeout)
+
+                    try:
+                        raw_line = stdout_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            break
+                        continue
+
+                    if raw_line is None:
+                        break
 
                     line = raw_line.strip()
                     if not line or "=" not in line:
@@ -1257,8 +1318,10 @@ def execute_encode_job_sync(
                             last_emit_time = now_mono
                         progress_kv.clear()
 
-                stderr_out = proc.stderr.read() if proc.stderr else ""
                 retcode = proc.wait(timeout=30)
+                t_out.join(timeout=1.0)
+                t_err.join(timeout=1.0)
+                stderr_out = "".join(stderr_lines)
             except Exception:
                 if proc.poll() is None:
                     with suppress(Exception):
@@ -1306,6 +1369,8 @@ def execute_encode_job_sync(
                 "GCS nesne doğrulaması başarısız oldu; çıktı yüklemesi teyit edilemediği için bağlantı üretilmedi."
             )
 
+        direct_link = upload_res.get("public_url") or upload_res.get("download_url")
+
         completed_job = store.mark_job_completed(
             job_id,
             gcs_bucket=str(upload_res["bucket"]),
@@ -1313,6 +1378,7 @@ def execute_encode_job_sync(
             output_filename=output_filename,
             output_size_bytes=int(upload_res["size_bytes"]),
             gcs_upload_verified=True,
+            direct_download_url=direct_link,
         )
         _emit_update(completed_job)
         return completed_job

@@ -548,11 +548,17 @@ class GCSOutputStorage:
         self,
         bucket_name: Optional[str] = None,
         local_mirror_dir: Optional[Path | str] = None,
+        allow_rclone: Optional[bool] = None,
     ) -> None:
         self.bucket_name = (
             bucket_name
             if bucket_name is not None
             else (os.getenv("UBAGEN_GCS_BUCKET", "").strip() or os.getenv("GCS_BUCKET_NAME", "").strip())
+        )
+        self.allow_rclone: bool = (
+            allow_rclone
+            if allow_rclone is not None
+            else (bucket_name is None or bool(bucket_name))
         )
         env_mirror = os.getenv("UBAGEN_GCS_LOCAL_MIRROR_DIR", "").strip()
         self.local_mirror_dir: Optional[Path] = (
@@ -567,11 +573,12 @@ class GCSOutputStorage:
     def is_configured(self) -> bool:
         if self.bucket_name:
             return True
-        with suppress(Exception):
-            from rclone_manager import get_rclone_manager
+        if self.allow_rclone:
+            with suppress(Exception):
+                from rclone_manager import get_rclone_manager
 
-            if get_rclone_manager().select_active_remote() is not None:
-                return True
+                if get_rclone_manager().select_active_remote() is not None:
+                    return True
         return False
 
     def _mirror_object_path(self, bucket: str, object_name: str) -> Optional[Path]:
@@ -628,23 +635,24 @@ class GCSOutputStorage:
                 }
 
         # 2. Primary Runtime Backend: Rclone (MEGA / Google Drive)
-        with suppress(ImportError):
-            from rclone_manager import get_rclone_manager
+        if self.allow_rclone:
+            with suppress(ImportError):
+                from rclone_manager import get_rclone_manager
 
-            rclone_mgr = get_rclone_manager()
-            active_remote = rclone_mgr.select_active_remote(preferred_remote=bucket or None)
-            if active_remote is not None:
-                job_id_meta = job_id or ((metadata or {}).get("job_id") if isinstance(metadata, dict) else None)
-                effective_retention = (
-                    retention_seconds if retention_seconds is not None else get_configured_retention_seconds()
-                )
-                return rclone_mgr.upload_file(
-                    local_path,
-                    clean_object,
-                    preferred_remote=active_remote.remote_name,
-                    retention_seconds=effective_retention,
-                    job_id=job_id_meta,
-                )
+                rclone_mgr = get_rclone_manager()
+                active_remote = rclone_mgr.select_active_remote(preferred_remote=bucket or None)
+                if active_remote is not None:
+                    job_id_meta = job_id or ((metadata or {}).get("job_id") if isinstance(metadata, dict) else None)
+                    effective_retention = (
+                        retention_seconds if retention_seconds is not None else get_configured_retention_seconds()
+                    )
+                    return rclone_mgr.upload_file(
+                        local_path,
+                        clean_object,
+                        preferred_remote=active_remote.remote_name,
+                        retention_seconds=effective_retention,
+                        job_id=job_id_meta,
+                    )
 
         if not bucket:
             raise RuntimeError(
@@ -1601,6 +1609,7 @@ class PersistentJobStore:
         gcs_upload_verified: bool,
         completed_at: Optional[float] = None,
         public_base_url: Optional[str] = None,
+        direct_download_url: Optional[str] = None,
     ) -> EncodeJob:
         """
         Mark a job as completed ONLY if `gcs_upload_verified` is True and `output_size_bytes > 0`.
@@ -1634,12 +1643,20 @@ class PersistentJobStore:
         job.expires_at = fin_time + retention
         job.gcs_bucket = gcs_bucket
         job.gcs_object_name = gcs_object_name
-        job.gcs_uri = f"gs://{gcs_bucket}/{gcs_object_name.lstrip('/')}"
+        if "://" in gcs_bucket:
+            job.gcs_uri = f"{gcs_bucket}/{gcs_object_name.lstrip('/')}"
+        elif any(sep in gcs_bucket for sep in ("mega", "drive", ":")):
+            job.gcs_uri = f"rclone://{gcs_bucket}/{gcs_object_name.lstrip('/')}"
+        else:
+            job.gcs_uri = f"gs://{gcs_bucket}/{gcs_object_name.lstrip('/')}"
         job.gcs_upload_verified = True
         job.output_filename = output_filename
         job.output_size_bytes = int(output_size_bytes)
         job.deleted_from_gcs = False
-        job.download_url = self.build_download_url(job, public_base_url=public_base_url)
+        if direct_download_url and direct_download_url.strip().startswith(("https://", "http://")):
+            job.download_url = direct_download_url.strip()
+        else:
+            job.download_url = self.build_download_url(job, public_base_url=public_base_url)
         with suppress(Exception):
             self.gcs.cleanup_job_staging_objects(job)
         return self.save_job(job)
@@ -1762,12 +1779,11 @@ class PersistentJobStore:
             purged_job_ids.append(job.job_id)
 
         rclone_pending_cleanup: Optional[dict[str, Any]] = None
-        if self.gcs.local_mirror_dir is None:
-            with suppress(Exception):
-                from rclone_manager import get_rclone_manager
+        with suppress(Exception):
+            from rclone_manager import get_rclone_manager
 
-                rclone_pending_cleanup = get_rclone_manager().process_pending_deletions(now=cur)
-                gcs_deleted_count += int(rclone_pending_cleanup.get("deleted") or 0)
+            rclone_pending_cleanup = get_rclone_manager().process_pending_deletions(now=cur)
+            gcs_deleted_count += int(rclone_pending_cleanup.get("deleted") or 0)
 
         return {
             "checked_at": _iso_utc(cur),

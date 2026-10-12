@@ -308,18 +308,19 @@ def detect_external_cloud_storage() -> dict[str, Any]:
 
     rclone_accounts: list[dict[str, Any]] = []
     rclone_connected_remotes: list[str] = []
-    with suppress(Exception):
-        from rclone_manager import get_rclone_manager
+    if os.getenv("UBAGEN_DISABLE_RCLONE_STORAGE_DETECT", "").strip() not in ("1", "true", "yes"):
+        with suppress(Exception):
+            from rclone_manager import get_rclone_manager
 
-        mgr = get_rclone_manager()
-        for acc in mgr.list_accounts():
-            acc_dict = acc.to_public_dict() if hasattr(acc, "to_public_dict") else dict(acc)
-            rclone_accounts.append(acc_dict)
-            if acc_dict.get("is_active") and acc_dict.get("status") == "connected":
-                prov = acc_dict.get("provider", "remote")
-                rname = acc_dict.get("remote_name", "unknown")
-                rclone_connected_remotes.append(f"rclone:{prov} ({rname})")
-                providers.append(f"rclone:{prov} ({rname})")
+            mgr = get_rclone_manager()
+            for acc in mgr.list_accounts():
+                acc_dict = acc.to_public_dict() if hasattr(acc, "to_public_dict") else dict(acc)
+                rclone_accounts.append(acc_dict)
+                if acc_dict.get("is_active") and acc_dict.get("status") == "connected":
+                    prov = acc_dict.get("provider", "remote")
+                    rname = acc_dict.get("remote_name", "unknown")
+                    rclone_connected_remotes.append(f"rclone:{prov} ({rname})")
+                    providers.append(f"rclone:{prov} ({rname})")
 
     return {
         "configured": bool(providers),

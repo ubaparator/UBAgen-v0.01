@@ -1244,6 +1244,122 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
+# Compact Character-Bounded Stats Message (< 1024 Chars Strict Limit)
+# ------------------------------------------------------------------------------
+def format_compact_stats_message(
+    stats: dict[str, Any],
+    max_len: int = 1023,
+    wake_note: str = "",
+) -> str:
+    """
+    Format a high-density, strictly character-bounded (<= max_len, default 1023)
+    Discord markdown status report.
+    Prioritizes:
+    1. Gateway connection & latency
+    2. CPU, host & process RAM usage
+    3. Disk storage usage & persistence
+    4. Essential binary toolchain (FFmpeg, aria2, rclone)
+    5. Active jobs / queue summary
+
+    Guaranteed never to exceed max_len under any combination of inputs or errors.
+    """
+    effective_max = max(100, min(max_len, 1023))
+    clean_wake = (wake_note or "").strip()
+    if clean_wake and not clean_wake.endswith("\n"):
+        clean_wake += "\n"
+
+    bot_info = stats.get("bot") if isinstance(stats.get("bot"), dict) else {}
+    compute = stats.get("compute") if isinstance(stats.get("compute"), dict) else {}
+    mem = stats.get("memory") if isinstance(stats.get("memory"), dict) else {}
+    disk = stats.get("disk") if isinstance(stats.get("disk"), dict) else {}
+    binaries = stats.get("binaries") if isinstance(stats.get("binaries"), dict) else {}
+
+    # 1. Gateway & Bot status
+    is_ready = bool(bot_info.get("is_ready"))
+    connected = bool(bot_info.get("connected") or bot_info.get("gateway_connected"))
+    bot_status = "🟢 Bağlı" if is_ready else ("🟡 Bağlanıyor" if connected else "🔴 Çevrimdışı")
+    lat_val = bot_info.get("latency_ms")
+    lat_str = f" ({lat_val:.0f}ms ping)" if isinstance(lat_val, (int, float)) and lat_val >= 0 else ""
+    bot_user = str(bot_info.get("user") or "").strip()
+    bot_acc_str = f" [`{bot_user[:30]}`]" if bot_user and bot_user != "None" else ""
+
+    lines: list[str] = [
+        "📊 **UBAgen Sistem Durumu**",
+        f"• **Gateway:** {bot_status}{lat_str}{bot_acc_str}",
+    ]
+
+    # 2. CPU & RAM
+    cpu_pct = compute.get("cpu_usage_pct")
+    cpu_str = f"%{cpu_pct:.1f}" if isinstance(cpu_pct, (int, float)) else "N/A"
+    cores = compute.get("logical_cores")
+    cores_str = f" ({cores} çekirdek)" if isinstance(cores, int) else ""
+
+    ram_used = mem.get("system_used_str") or "N/A"
+    ram_total = mem.get("system_total_str") or "N/A"
+    ram_pct = mem.get("system_percent")
+    ram_pct_str = f" (%{ram_pct:.1f})" if isinstance(ram_pct, (int, float)) else ""
+    proc_rss = mem.get("process_rss_str")
+    proc_str = f" | **Süreç:** `{proc_rss}`" if proc_rss else ""
+
+    lines.append(f"• **CPU:** `{cpu_str}`{cores_str} | **RAM:** {ram_used}/{ram_total}{ram_pct_str}{proc_str}")
+
+    # 3. Disk & Storage
+    disk_used = disk.get("used_str") or "N/A"
+    disk_total = disk.get("total_str") or "N/A"
+    disk_pct = disk.get("percent")
+    disk_pct_str = f" (%{disk_pct:.1f})" if isinstance(disk_pct, (int, float)) else ""
+    is_persistent = disk.get("is_persistent")
+    persist_label = "Kalıcı" if is_persistent else "Geçici"
+    fs_type = str(disk.get("fs_type") or "fs")[:10]
+
+    lines.append(f"• **Disk:** {disk_used}/{disk_total}{disk_pct_str} `[{persist_label}/{fs_type}]`")
+
+    # 4. Binaries toolchain
+    ff_ok = bool((binaries.get("ffmpeg") or {}).get("installed"))
+    aria_ok = bool((binaries.get("aria2") or {}).get("installed"))
+    tool_status = f"FFmpeg: {'✅' if ff_ok else '❌'} | aria2: {'✅' if aria_ok else '❌'}"
+
+    # Rclone info if available
+    try:
+        from rclone_manager import get_rclone_manager
+        mgr = get_rclone_manager()
+        accs = mgr.list_accounts()
+        connected_remotes = [a["remote_name"] for a in accs if a.get("is_active") and a.get("status") == "connected"]
+        pending_del = mgr.count_pending_deletions()
+        if connected_remotes:
+            tool_status += f" | Rclone: ✅ ({len(connected_remotes)} bağlı, {pending_del} bekleyen silme)"
+        else:
+            tool_status += " | Rclone: ⚠️ (Bağlı hesap yok)"
+    except Exception:
+        pass
+
+    lines.append(f"• **Araçlar:** {tool_status}")
+
+    # 5. Uptime & Host info
+    sys_uptime = compute.get("backend_uptime_str") or compute.get("system_uptime_str")
+    if sys_uptime:
+        lines.append(f"• **Çalışma Süresi:** `{str(sys_uptime)[:40]}`")
+
+    # Combine with optional wake note
+    body = "\n".join(lines)
+    full_message = f"{clean_wake}{body}" if clean_wake else body
+
+    if len(full_message) <= effective_max:
+        return full_message
+
+    # Over length: progressively drop secondary lines from the bottom
+    while len(lines) > 3 and len(f"{clean_wake}{chr(10).join(lines)}") > effective_max:
+        lines.pop()
+
+    candidate = f"{clean_wake}{chr(10).join(lines)}"
+    if len(candidate) <= effective_max:
+        return candidate
+
+    # If still over (e.g. extremely long wake_note), truncate cleanly
+    return candidate[: effective_max - 3] + "..."
+
+
+# ------------------------------------------------------------------------------
 # Discord Embed Builder
 # ------------------------------------------------------------------------------
 def build_stats_embed(stats: dict[str, Any]) -> Any:
@@ -1254,16 +1370,16 @@ def build_stats_embed(stats: dict[str, Any]) -> Any:
     if discord is None:
         return None
 
-    bot_info = stats["bot"]
-    compute = stats["compute"]
-    mem = stats["memory"]
-    disk = stats["disk"]
-    binaries = stats["binaries"]
-    env_vars = stats["env_vars"]
+    bot_info = stats.get("bot") if isinstance(stats.get("bot"), dict) else {}
+    compute = stats.get("compute") if isinstance(stats.get("compute"), dict) else {}
+    mem = stats.get("memory") if isinstance(stats.get("memory"), dict) else {}
+    disk = stats.get("disk") if isinstance(stats.get("disk"), dict) else {}
+    binaries = stats.get("binaries") if isinstance(stats.get("binaries"), dict) else {}
+    env_vars = stats.get("env_vars") if isinstance(stats.get("env_vars"), list) else []
 
-    is_ready = bot_info["is_ready"]
-    cpu_pct = compute["cpu_usage_pct"] or 0
-    ram_pct = mem["system_percent"] or 0
+    is_ready = bool(bot_info.get("is_ready"))
+    cpu_pct = compute.get("cpu_usage_pct") or 0
+    ram_pct = mem.get("system_percent") or 0
 
     if not is_ready:
         color = discord.Color.gold()
@@ -1281,21 +1397,21 @@ def build_stats_embed(stats: dict[str, Any]) -> Any:
 
     # 1. Bot Connection Status Field
     if is_ready:
-        bot_latency_str = f"{bot_info['latency_ms']} ms" if bot_info["latency_ms"] is not None else "Unavailable"
+        bot_latency_str = f"{bot_info.get('latency_ms')} ms" if bot_info.get("latency_ms") is not None else "Unavailable"
         bot_status_lines = [
             f"**Status:** 🟢 Connected (`{bot_latency_str}` ping)",
-            f"**Account:** `{bot_info['user']}`",
-            f"**Guilds:** {bot_info['guild_count']} server(s) connected",
-            f"**Bot Uptime:** {bot_info['uptime_str']}",
-            f"**Backend Uptime:** {compute['backend_uptime_str']}",
+            f"**Account:** `{bot_info.get('user', 'Unknown')}`",
+            f"**Guilds:** {bot_info.get('guild_count', 0)} server(s) connected",
+            f"**Bot Uptime:** {bot_info.get('uptime_str', 'N/A')}",
+            f"**Backend Uptime:** {compute.get('backend_uptime_str', 'N/A')}",
         ]
         if bot_info.get("invite_url"):
             bot_status_lines.append(f"**Invite Bot:** [Add to Discord Server]({bot_info['invite_url']})")
     else:
         bot_status_lines = [
-            f"**Status:** 🔴 {bot_info['status'].replace('_', ' ').title()}",
-            f"**Diagnostic:** {bot_info['diagnostic_message']}",
-            f"**Backend Uptime:** {compute['backend_uptime_str']}",
+            f"**Status:** 🔴 {str(bot_info.get('status', 'unknown')).replace('_', ' ').title()}",
+            f"**Diagnostic:** {str(bot_info.get('diagnostic_message', 'No diagnostic'))[:120]}",
+            f"**Backend Uptime:** {compute.get('backend_uptime_str', 'N/A')}",
         ]
         if bot_info.get("invite_url"):
             bot_status_lines.append(f"**Invite Bot:** [Add to Discord Server]({bot_info['invite_url']})")
@@ -1432,19 +1548,16 @@ def register_stats_command(tree: Any, bot: Any) -> None:
 
         try:
             stats = await asyncio.to_thread(collect_all_stats, bot)
+            message = format_compact_stats_message(stats, max_len=1023)
+            if len(message) > 1023:
+                message = message[:1020] + "..."
             embed = build_stats_embed(stats)
-            if embed:
-                await interaction.followup.send(embed=embed)
-            else:
-                await interaction.followup.send("Failed to construct stats embed.")
+            await interaction.followup.send(content=message, embed=embed)
         except Exception as exc:
             logger.exception("Error executing /stats command: %s", exc)
-            error_embed = discord.Embed(
-                title="UBAgen — Diagnostics Error",
-                description=f"An error occurred while compiling backend statistics: `{type(exc).__name__}: {str(exc)}`",
-                color=discord.Color.red(),
-            )
-            await interaction.followup.send(embed=error_embed)
+            safe_err = redact_sensitive_text(str(exc))[:200]
+            err_msg = f"❌ **UBAgen — İstatistik Hatası:** `{type(exc).__name__}: {safe_err}`"[:1023]
+            await interaction.followup.send(content=err_msg)
 
 
 # ------------------------------------------------------------------------------
