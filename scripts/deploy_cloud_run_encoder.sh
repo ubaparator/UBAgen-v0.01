@@ -51,28 +51,19 @@ if ! gcloud storage buckets describe "gs://${BUCKET_NAME}" --project="${PROJECT_
 fi
 
 echo "=== [4/7] Configuring Least-Privilege IAM Roles for ${SA_EMAIL} ==="
-# 1. Allow Cloud Run Service to trigger Cloud Run Job (run.jobs.run) and controlled service revision restarts
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/run.developer" \
-  --condition=None >/dev/null
-
-# 2. Allow Service Account to act as itself when deploying/running jobs
-gcloud iam service-accounts add-iam-policy-binding "${SA_EMAIL}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/iam.serviceAccountUser" \
-  --project="${PROJECT_ID}" >/dev/null
-
-# 3. Allow Bot Service & Worker Job to read/write job records in Firestore
+# 1. Allow the worker to read/write job records in Firestore.
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/datastore.user" \
   --condition=None >/dev/null
 
-# 4. Allow Bot Service & Worker Job to stage inputs and upload/delete outputs on the dedicated GCS bucket only
+# 2. Allow the worker to stage inputs and upload/delete outputs on this bucket only.
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectAdmin" >/dev/null
+
+# Cloud Run execution IAM is scoped to the individual Job after it is deployed.
+# The deploying principal must have permission to set IAM policy on that Job.
 
 # 5. If DISCORD_BOT_TOKEN secret exists in Secret Manager, grant secretAccessor on that secret only
 if gcloud secrets describe DISCORD_BOT_TOKEN --project="${PROJECT_ID}" >/dev/null 2>&1; then
@@ -108,6 +99,13 @@ gcloud run jobs deploy "${JOB_NAME}" \
   --tasks=1 \
   --parallelism=1 \
   --set-env-vars="ENVIRONMENT=production,UBAGEN_GCP_PROJECT_ID=${PROJECT_ID},UBAGEN_GCP_REGION=${REGION},UBAGEN_CLOUD_RUN_JOB_NAME=${JOB_NAME},UBAGEN_USE_FIRESTORE=true,UBAGEN_FIRESTORE_DATABASE=(default),UBAGEN_FIRESTORE_COLLECTION=ubagen_encode_jobs,UBAGEN_GCS_BUCKET=${BUCKET_NAME},UBAGEN_WORKER_TEMP_DIR=/tmp/ubagen_worker_scratch,UBAGEN_ENCODE_RETENTION_SECONDS=7200,UBAGEN_PUBLIC_BASE_URL=${PUBLIC_BASE_URL}"
+
+echo "Granting the runtime service account permission to execute only ${JOB_NAME}..."
+gcloud run jobs add-iam-policy-binding "${JOB_NAME}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/run.jobsExecutor" >/dev/null
 
 echo "=== [7/7] Updating Cloud Run Service (${SERVICE_NAME}) environment variables ==="
 gcloud run services update "${SERVICE_NAME}" \
