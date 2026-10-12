@@ -1507,8 +1507,8 @@ def dispatch_encode_job_background(job_id: str, *, allow_retry: bool = False) ->
 
     # Explicit no-Job-IAM mode: run the isolated worker process inside this service container.
     # This avoids the Cloud Run Jobs API and its run.jobs.run permission entirely.
-    encoder_mode = os.getenv("UBAGEN_ENCODER_MODE", "cloud_run_job").strip().lower()
-    if encoder_mode in {"service_worker", "local_service_worker"}:
+    encoder_mode = os.getenv("UBAGEN_ENCODER_MODE", "service_worker").strip().lower()
+    if encoder_mode in {"service_worker", "local_service_worker", "local_worker", "local", "isolated_subprocess"}:
         worker_script = Path(__file__).resolve()
         try:
             proc = subprocess.Popen(
@@ -1534,36 +1534,18 @@ def dispatch_encode_job_background(job_id: str, *, allow_retry: bool = False) ->
         store.update_job_progress(job_id, worker_execution_name=f"service-worker-pid-{proc.pid}")
         return {"dispatched": True, "mode": "service_worker", "pid": proc.pid}
 
-    if env_details.get("cloud_run_job_configured") and not _is_local_worker_fallback_allowed():
-        res = trigger_cloud_run_job_execution(job_id)
-        if res.get("dispatched"):
-            return res
-        fail_reason = f"Cloud Run Job başlatılamadı: {res.get('reason')}"
-        store.mark_job_failed(job_id, fail_reason)
-        return res
-
     if env_details.get("cloud_run_job_configured") and os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip():
         # If running on Cloud Run or when Cloud Run Job API token is available, dispatch via Cloud Run Job
         if os.getenv("K_SERVICE", "").strip() or os.getenv("UBAGEN_FORCE_CLOUD_RUN_JOB", "").strip().lower() in ("1", "true", "yes"):
             res = trigger_cloud_run_job_execution(job_id)
             if res.get("dispatched"):
                 return res
-            fail_reason = f"Cloud Run Job başlatılamadı: {res.get('reason')}"
-            store.mark_job_failed(job_id, fail_reason)
-            return res
-
-    if not _is_local_worker_fallback_allowed():
-        reason = (
-            "Cloud Run Job (`UBAGEN_CLOUD_RUN_JOB_NAME`) veya GCP proje kimliği (`UBAGEN_GCP_PROJECT_ID`) doğrulanamadı. "
-            "Üretim ortamında bot/web servisinin kararlılığını korumak için yerel worker fallback devre dışıdır."
-        )
-        store.mark_job_failed(job_id, reason)
-        return {"dispatched": False, "mode": "disabled", "reason": reason}
+            logger.warning("Cloud Run Job başlatılamadı (%s); yerel worker sürecine geçiliyor.", res.get("reason"))
 
     worker_script = Path(__file__).resolve()
     proc = subprocess.Popen(
         [sys.executable, "-B", str(worker_script), "--job-id", job_id],
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "UBAGEN_JOB_ID": job_id},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

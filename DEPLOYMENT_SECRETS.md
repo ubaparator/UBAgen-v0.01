@@ -38,6 +38,7 @@ A GitHub commit alone does not guarantee that an already-running Run session or 
 The bot's 1.5 GB limit is an application-side validation limit. It does not override Discord's own upload cap (8 MB standard) for interaction attachments.
 - Temporary torrent downloads (`download_temp/job_*`) and intermediate FFmpeg files (`download_temp/encode_temp/encode_*`) are strictly separated from completed outputs (`video_outputs/`) and are deleted automatically in `finally` after every job.
 - **Important Persistence Notice**: In Google AI Studio Run and published Cloud Run containers, `/` and `/tmp` are `overlay` / `tmpfs` filesystems. Although `os.statvfs("/")` may report ~378 GiB on the host overlay, container overlay storage is **ephemeral** and is wiped when a container instance restarts, scales down, or is redeployed.
-- To persist `video_outputs` across restarts/redeployments in production:
-  - **Docker / VPS**: Mount a host volume (`-v /mnt/ubagen_data:/app/storage`) and set `UBAGEN_STORAGE_DIR=/app/storage` (and optionally `UBAGEN_PERSISTENT_VOLUME_VERIFIED=true`).
-  - **Google Cloud Run**: Mount a Cloud Storage bucket via Cloud Run Volume Mounts (Cloud Storage FUSE) at `/mnt/storage` with the service account granted `roles/storage.objectAdmin`, and set `UBAGEN_STORAGE_DIR=/mnt/storage`.
+- **SQLite & Rclone Configuration Persistence**:
+  - `ubagen_jobs.sqlite3` (storing encode jobs and pending 7200s deletions) and `rclone.conf` (storing encrypted MEGA & Google Drive remote credentials) must be mounted on a persistent volume in production.
+  - **Docker / VPS**: Mount a host directory to `/app/storage` (e.g. `-v /var/data/ubagen:/app/storage`) and set `UBAGEN_STORAGE_DIR=/app/storage`. Both the SQLite database (`/app/storage/ubagen_jobs.sqlite3`) and rclone configuration (`/app/storage/rclone.conf`) will be persisted across container rebuilds and restarts.
+  - **Cloud Run / Managed Container**: Attach a Cloud Storage or NFS volume at `/mnt/storage` and configure `UBAGEN_STORAGE_DIR=/mnt/storage`. Never assume root overlay filesystem (`/`) is persistent across container instance lifecycles.

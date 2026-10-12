@@ -26,24 +26,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install runtime dependencies:
 # - ffmpeg: Required for multimedia tools (monitored in dashboard & /stats)
 # - aria2: High-speed download utility (monitored in dashboard & /stats)
-# - rclone: Multi-account MEGA & Google Drive cloud storage engine
-# - curl & unzip: For container health checks and binary verification
+# - rclone: Official release with native MEGA and Google Drive backends
+# - curl & unzip: For container health checks, binary installation and verification
 # - procps & ca-certificates: For process monitoring and SSL
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
-    rclone \
     curl \
     unzip \
     procps \
     ca-certificates \
     fontconfig \
     fonts-dejavu-core \
+    && curl -fsSL https://rclone.org/install.sh | bash \
     && rm -rf /var/lib/apt/lists/* \
     && aria2c --version >/dev/null \
     && ffmpeg -version >/dev/null \
     && ffprobe -version >/dev/null \
-    && rclone version >/dev/null
+    && rclone version >/dev/null \
+    && rclone help backends | grep -q "mega"
 
 WORKDIR /app
 

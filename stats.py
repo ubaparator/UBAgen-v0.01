@@ -700,15 +700,16 @@ def check_environment_variables() -> list[dict[str, str]]:
     })
 
     job_name = os.getenv("UBAGEN_CLOUD_RUN_JOB_NAME", "").strip()
-    encoder_mode = os.getenv("UBAGEN_ENCODER_MODE", "").strip().lower()
-    in_proc_mode = encoder_mode in ("service_worker", "in_process", "local")
+    raw_mode = os.getenv("UBAGEN_ENCODER_MODE", "").strip().lower()
+    encoder_mode = raw_mode or "service_worker"
+    in_proc_mode = encoder_mode in ("service_worker", "local_service_worker", "in_process", "local", "isolated_subprocess")
     local_fb = os.getenv("UBAGEN_ALLOW_LOCAL_WORKER_FALLBACK", "").strip().lower() in ("1", "true", "yes")
     results.append({
         "name": "UBAGEN_ENCODER_MODE",
         "status": (
-            f"{encoder_mode} (In-Process Background Worker — No Cloud Run Job IAM Required)"
+            f"{encoder_mode} (Yerel Worker & Rclone Depolama — Google Cloud Gerektirmez)"
             if in_proc_mode
-            else "cloud_run_job (Cloud Run Job v2 Execution Mode)"
+            else f"{encoder_mode} (Cloud Run Job v2 Execution Mode)"
         ),
         "indicator": "✅",
         "type": "Encoder Mode",

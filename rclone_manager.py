@@ -190,33 +190,107 @@ def mask_account_identity(identity: Optional[str]) -> Optional[str]:
 
 _RCLONE_BOOTSTRAP_ATTEMPTED = False
 _RCLONE_BOOTSTRAP_LOCK = threading.Lock()
+_BACKEND_CACHE: dict[str, set[str]] = {}
+_BACKEND_CACHE_LOCK = threading.Lock()
 
 
-def resolve_rclone_binary(auto_bootstrap: bool = True) -> Optional[str]:
+def get_rclone_supported_backends(path: str) -> set[str]:
     """
-    Resolve the `rclone` binary path from PATH or standard container locations.
-    If running in a container where `rclone` was reset and `shutil.which` is unmocked,
-    automatically bootstraps the official static Linux `rclone` binary once.
+    Query and return the set of backend names supported by the given rclone binary.
+    Parses `rclone help backends` output and caches results.
     """
-    found = shutil.which("rclone")
-    if found:
-        return found
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return set()
+    with _BACKEND_CACHE_LOCK:
+        if path in _BACKEND_CACHE:
+            return _BACKEND_CACHE[path]
+    try:
+        proc = subprocess.run(
+            [path, "help", "backends"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        backends: set[str] = set()
+        if proc.returncode == 0 and proc.stdout:
+            for line in proc.stdout.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("All rclone backends") or stripped.startswith("To see more"):
+                    continue
+                parts = stripped.split(None, 1)
+                if parts:
+                    backends.add(parts[0].lower().strip())
+        with _BACKEND_CACHE_LOCK:
+            _BACKEND_CACHE[path] = backends
+        return backends
+    except Exception as exc:
+        logger.debug("Failed to query rclone help backends from %s: %s", path, exc)
+        return set()
 
-    # If shutil.which was patched by a unit test (e.g. testing missing rclone), respect the mock
-    if getattr(shutil.which, "__module__", "") != "shutil":
-        return None
 
-    for candidate in ("/usr/local/bin/rclone", "/usr/bin/rclone", "/tmp/ubagen_bin/rclone"):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
+def is_rclone_backend_supported(path: str, backend: str = "mega") -> bool:
+    """Return whether the specified rclone binary supports `backend` (e.g. 'mega' or 'drive')."""
+    return backend.lower().strip() in get_rclone_supported_backends(path)
+
+
+def resolve_rclone_binary(
+    auto_bootstrap: bool = True,
+    require_backend: Optional[str] = "mega",
+) -> Optional[str]:
+    """
+    Resolve the `rclone` binary path from standard container locations or PATH.
+    Verifies that the candidate binary supports `require_backend` (default 'mega').
+    If a stripped rclone is encountered (e.g. Debian package lacking 'mega'),
+    attempts to find the official static Linux release or auto-bootstraps it.
+    """
+    # 1. If shutil.which was mocked by a unit test (e.g. testing missing rclone), respect the mock
+    is_mocked = getattr(shutil.which, "__module__", "") != "shutil"
+    if is_mocked:
+        mocked = shutil.which("rclone")
+        if not mocked:
+            return None
+        if require_backend and not is_rclone_backend_supported(mocked, require_backend):
+            return None if not auto_bootstrap else mocked
+        return mocked
+
+    env_override = os.getenv("UBAGEN_RCLONE_PATH", "").strip()
+    candidates: list[str] = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.extend([
+        "/usr/local/bin/rclone",
+        "/usr/bin/rclone",
+        shutil.which("rclone") or "",
+        "/tmp/ubagen_bin/rclone",
+    ])
+
+    seen: set[str] = set()
+    fallback_binary: Optional[str] = None
+
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            if not require_backend:
+                return cand
+            if is_rclone_backend_supported(cand, require_backend):
+                return cand
+            if fallback_binary is None:
+                fallback_binary = cand
 
     if not auto_bootstrap or os.getenv("UBAGEN_DISABLE_RCLONE_BOOTSTRAP", "").strip() in ("1", "true", "yes"):
-        return None
+        return fallback_binary
 
     global _RCLONE_BOOTSTRAP_ATTEMPTED
     with _RCLONE_BOOTSTRAP_LOCK:
         if _RCLONE_BOOTSTRAP_ATTEMPTED:
-            return shutil.which("rclone")
+            for cand in ("/usr/local/bin/rclone", "/usr/bin/rclone", "/tmp/ubagen_bin/rclone"):
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    if not require_backend or is_rclone_backend_supported(cand, require_backend):
+                        return cand
+            return fallback_binary
         _RCLONE_BOOTSTRAP_ATTEMPTED = True
         try:
             import platform
@@ -226,15 +300,15 @@ def resolve_rclone_binary(auto_bootstrap: bool = True) -> Optional[str]:
             arch = "arm64" if machine in ("aarch64", "arm64") else "amd64"
             url = f"https://downloads.rclone.org/rclone-current-linux-{arch}.zip"
             req = urllib.request.Request(url, headers={"User-Agent": "UBAgen-Rclone-Bootstrap/1.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=25) as resp:
                 zip_bytes = resp.read()
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                 member = next((m for m in zf.namelist() if m.endswith("/rclone")), None)
                 if not member:
-                    return None
+                    return fallback_binary
                 raw_bin = zf.read(member)
 
-            for target_str in ("/usr/local/bin/rclone", "/tmp/ubagen_bin/rclone"):
+            for target_str in ("/usr/local/bin/rclone", "/usr/bin/rclone", "/tmp/ubagen_bin/rclone"):
                 try:
                     target = Path(target_str)
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -243,26 +317,34 @@ def resolve_rclone_binary(auto_bootstrap: bool = True) -> Optional[str]:
                     parent_str = str(target.parent)
                     if parent_str not in os.environ.get("PATH", ""):
                         os.environ["PATH"] = f"{parent_str}:{os.environ.get('PATH', '')}"
-                    return str(target)
+                    with _BACKEND_CACHE_LOCK:
+                        _BACKEND_CACHE.pop(str(target), None)
+                    if not require_backend or is_rclone_backend_supported(str(target), require_backend):
+                        return str(target)
                 except Exception:
                     continue
         except Exception as exc:
-            logger.debug("Automatic rclone binary bootstrap skipped: %s", exc)
-    return shutil.which("rclone")
+            logger.warning("Automatic official rclone binary bootstrap failed: %s", exc)
+
+    return fallback_binary
 
 
 def check_rclone_binary() -> dict[str, Any]:
     """
-    Check whether `rclone` is installed and executable in the current environment.
-    Returns `{installed, executable, path, version, error}`.
+    Check whether `rclone` is installed and executable in the current environment,
+    and verify that it supports native MEGA and Google Drive storage backends.
+    Returns `{installed, executable, path, version, mega_supported, drive_supported, backends_count, error}`.
     """
-    path = resolve_rclone_binary(auto_bootstrap=True)
+    path = resolve_rclone_binary(auto_bootstrap=True, require_backend="mega") or resolve_rclone_binary(auto_bootstrap=False, require_backend=None)
     if not path:
         return {
             "installed": False,
             "executable": False,
             "path": None,
             "version": "Unavailable",
+            "mega_supported": False,
+            "drive_supported": False,
+            "backends_count": 0,
             "error": "rclone ikili dosyası (binary) sistem PATH üzerinde bulunamadı.",
         }
     try:
@@ -275,12 +357,26 @@ def check_rclone_binary() -> dict[str, Any]:
         )
         first_line = ((proc.stdout or proc.stderr or "").splitlines() or ["Unavailable"])[0].strip()
         ok = proc.returncode == 0
+        backends = get_rclone_supported_backends(path)
+        mega_ok = "mega" in backends
+        drive_ok = "drive" in backends
+        err_msg = None
+        if not ok:
+            err_msg = (proc.stderr or proc.stdout or f"Exit code {proc.returncode}").strip()[:200]
+        elif not mega_ok:
+            err_msg = (
+                f"Kurulu rclone sürümünde ({first_line}) 'mega' depolama sağlayıcısı bulunamadı. "
+                "Resmî MEGA destekli rclone dağıtımı gereklidir."
+            )
         return {
             "installed": True,
             "executable": ok,
             "path": path,
             "version": first_line if ok else "Error",
-            "error": None if ok else (proc.stderr or proc.stdout or f"Exit code {proc.returncode}").strip()[:200],
+            "mega_supported": mega_ok,
+            "drive_supported": drive_ok,
+            "backends_count": len(backends),
+            "error": err_msg,
         }
     except Exception as exc:
         return {
@@ -288,6 +384,9 @@ def check_rclone_binary() -> dict[str, Any]:
             "executable": False,
             "path": path,
             "version": "Error",
+            "mega_supported": False,
+            "drive_supported": False,
+            "backends_count": 0,
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -301,7 +400,7 @@ def obscure_rclone_password(raw_password: str) -> str:
     if not clean_pw:
         raise ValueError("MEGA hesap şifresi boş olamaz.")
 
-    rclone_bin = resolve_rclone_binary(auto_bootstrap=True)
+    rclone_bin = resolve_rclone_binary(auto_bootstrap=True, require_backend="mega") or resolve_rclone_binary(auto_bootstrap=False, require_backend=None)
     if rclone_bin:
         try:
             proc = subprocess.run(
@@ -464,6 +563,7 @@ class RcloneStorageManager:
             self.rclone_config_path = (self.db_path.parent / "rclone.conf").resolve()
 
         self._lock = threading.RLock()
+        self._verified_binary: Optional[str] = None
         self._ensure_storage_paths()
         self.cipher = cipher or RcloneSecretCipher(key_file_dir=self.db_path.parent)
         self._cli_runner = cli_runner
@@ -471,6 +571,19 @@ class RcloneStorageManager:
         self._ensure_tables()
         self._import_existing_rclone_conf_remotes()
         self.sync_rclone_conf_file()
+
+    def get_rclone_binary(self) -> str:
+        """
+        Return the verified, official rclone binary path that is guaranteed to support
+        both MEGA and Google Drive backends. Never relies on an unverified random PATH binary.
+        """
+        if self._verified_binary and os.path.isfile(self._verified_binary) and os.access(self._verified_binary, os.X_OK):
+            return self._verified_binary
+        bin_path = resolve_rclone_binary(auto_bootstrap=True, require_backend="mega")
+        if not bin_path:
+            bin_path = resolve_rclone_binary(auto_bootstrap=False, require_backend=None) or "rclone"
+        self._verified_binary = bin_path
+        return bin_path
 
     def _ensure_storage_paths(self) -> None:
         try:
