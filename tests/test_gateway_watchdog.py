@@ -155,6 +155,16 @@ class GatewayWatchdogTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(mgr.bot, created[1])
             self.assertIsNotNone(mgr.bot_task)
             self.assertFalse(mgr.bot_task.done())
+
+            # Model a successful READY event on the replacement and ensure the watchdog settles.
+            mgr.bot.tracker.connected = True
+            mgr.bot.tracker.is_ready = True
+            mgr.bot.tracker.status = "connected"
+            mgr.bot.tracker.gateway_state_since = None
+            mgr.bot.tracker.gateway_attempt_started_at = None
+            await asyncio.sleep(0.04)
+            self.assertEqual(len(created), 2, "a recovered Gateway must not trigger repeated replacement")
+
             await mgr.stop_bot()
             mgr.shutdown_event.set()
 
