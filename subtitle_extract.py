@@ -9,6 +9,7 @@ import ipaddress
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import socket
@@ -144,108 +145,262 @@ def check_runtime_binary(binary_name: str, version_arg: str = "--version") -> di
         }
 
 
+def detect_runtime_environment() -> dict[str, Any]:
+    """Identify the current OS, Linux distribution, architecture, container hint, and package managers."""
+    system = platform.system() or "Unknown"
+    machine = platform.machine() or "Unknown"
+    distro_id = ""
+    distro_name = ""
+    distro_version = ""
+    id_like = ""
+    os_release_path = Path("/etc/os-release")
+    if os_release_path.is_file():
+        try:
+            for line in os_release_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+                if key == "ID":
+                    distro_id = value.lower()
+                elif key == "NAME":
+                    distro_name = value
+                elif key == "VERSION_ID":
+                    distro_version = value
+                elif key == "ID_LIKE":
+                    id_like = value.lower()
+        except OSError:
+            pass
+
+    manager_candidates: list[str]
+    if system.lower() == "darwin":
+        manager_candidates = ["brew"]
+    elif system.lower() == "windows":
+        manager_candidates = ["winget", "choco", "scoop"]
+    elif distro_id in {"alpine"}:
+        manager_candidates = ["apk"]
+    elif distro_id in {"arch", "manjaro"}:
+        manager_candidates = ["pacman"]
+    elif distro_id in {"fedora"}:
+        manager_candidates = ["dnf", "yum"]
+    elif distro_id in {"rhel", "centos", "rocky", "almalinux", "ol"} or any(
+        part in id_like for part in ("rhel", "fedora", "centos")
+    ):
+        manager_candidates = ["dnf", "yum"]
+    else:
+        manager_candidates = ["apt-get", "apt", "dnf", "yum", "apk", "pacman"]
+
+    available = [name for name in manager_candidates if shutil.which(name)]
+    is_container = bool(
+        os.path.exists("/.dockerenv")
+        or os.getenv("container")
+        or os.getenv("KUBERNETES_SERVICE_HOST")
+        or os.getenv("K_SERVICE")
+        or os.getenv("CODESPACES")
+    )
+    return {
+        "os": system,
+        "distro_id": distro_id or "unknown",
+        "distro_name": distro_name or system,
+        "distro_version": distro_version or "unknown",
+        "id_like": id_like or None,
+        "architecture": machine,
+        "is_container": is_container,
+        "effective_uid": os.geteuid() if hasattr(os, "geteuid") else None,
+        "package_managers": available,
+        "package_manager": available[0] if available else None,
+    }
+
+
+def _package_install_plan(manager: str) -> tuple[list[str], list[list[str]], Optional[list[str]]]:
+    """Return manager-specific update command, package groups, and install command prefix."""
+    plans: dict[str, tuple[list[str], list[list[str]]]] = {
+        "apt-get": (
+            ["apt-get", "update", "-qq"],
+            [["aria2"], ["ffmpeg"], ["curl", "ca-certificates", "unzip", "procps", "fontconfig", "fonts-dejavu-core"]],
+        ),
+        "apt": (
+            ["apt", "update", "-qq"],
+            [["aria2"], ["ffmpeg"], ["curl", "ca-certificates", "unzip", "procps", "fontconfig", "fonts-dejavu-core"]],
+        ),
+        "apk": (
+            ["apk", "update"],
+            [["aria2"], ["ffmpeg"], ["curl", "ca-certificates", "unzip", "procps", "fontconfig", "ttf-dejavu"]],
+        ),
+        "dnf": (
+            ["dnf", "makecache", "--refresh"],
+            [["aria2"], ["ffmpeg"], ["curl", "ca-certificates", "unzip", "procps-ng", "fontconfig", "dejavu-sans-fonts"]],
+        ),
+        "yum": (
+            ["yum", "makecache"],
+            [["aria2"], ["ffmpeg"], ["curl", "ca-certificates", "unzip", "procps-ng", "fontconfig", "dejavu-sans-fonts"]],
+        ),
+        "pacman": (
+            ["pacman", "-Sy", "--noconfirm"],
+            [["aria2"], ["ffmpeg"], ["curl", "ca-certificates", "unzip", "procps-ng", "fontconfig", "ttf-dejavu"]],
+        ),
+        "brew": (
+            [],
+            [["aria2"], ["ffmpeg"]],
+        ),
+    }
+    if manager not in plans:
+        return [], [], None
+    update_cmd, package_groups = plans[manager]
+    if manager in {"apt-get", "apt"}:
+        install_prefix = [manager, "install", "-y", "--no-install-recommends"]
+    elif manager == "apk":
+        install_prefix = ["apk", "add", "--no-cache"]
+    elif manager in {"dnf", "yum"}:
+        install_prefix = [manager, "install", "-y"]
+    elif manager == "pacman":
+        install_prefix = ["pacman", "-S", "--noconfirm", "--needed"]
+    else:
+        install_prefix = ["brew", "install"]
+    return update_cmd, package_groups, install_prefix
+
+
+def _run_package_manager_command(
+    command: list[str],
+    *,
+    timeout: int,
+    env: Optional[dict[str, str]] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a package-manager command, using only non-interactive sudo if explicitly permitted."""
+    effective = list(command)
+    if hasattr(os, "geteuid") and os.geteuid() != 0 and effective[0] != "brew":
+        sudo_path = shutil.which("sudo")
+        can_sudo = False
+        if sudo_path:
+            try:
+                check = subprocess.run(
+                    [sudo_path, "-n", "true"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                can_sudo = check.returncode == 0
+            except Exception:
+                can_sudo = False
+        if not can_sudo:
+            raise PermissionError(
+                "Root privileges are unavailable and passwordless non-interactive sudo is not permitted."
+            )
+        effective = [sudo_path, "-n", *effective]
+    command_env = dict(os.environ)
+    command_env["DEBIAN_FRONTEND"] = "noninteractive"
+    if env:
+        command_env.update(env)
+    return subprocess.run(
+        effective,
+        env=command_env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
 def ensure_runtime_binaries(auto_install: bool = True) -> dict[str, dict[str, Any]]:
     """
-    Verify that `aria2c`, `ffmpeg`, and `ffprobe` are present and executable in the current runtime.
-    If any required binary is missing and `auto_install=True`, attempts installation via the platform's
-    official Debian/Ubuntu `apt-get` package manager when running with root privileges (such as AI Studio Run).
-    Never downloads arbitrary binaries or executes untrusted remote shell scripts.
+    Verify aria2c, ffmpeg and ffprobe, identify the runtime platform, and attempt installation
+    through its detected package manager. Installation is only attempted when the host grants
+    root privileges or non-interactive sudo; platform restrictions are never bypassed.
     """
-    statuses: dict[str, dict[str, Any]] = {}
-    missing_apt_packages: list[str] = []
+    def scan() -> tuple[dict[str, dict[str, Any]], list[str]]:
+        found: dict[str, dict[str, Any]] = {}
+        missing_packages: list[str] = []
+        for bin_name, ver_arg, package_name in REQUIRED_BINARIES:
+            info = check_runtime_binary(bin_name, ver_arg)
+            found[bin_name] = info
+            if (not info["installed"] or not info["executable"]) and package_name not in missing_packages:
+                missing_packages.append(package_name)
+        return found, missing_packages
 
-    for bin_name, ver_arg, apt_pkg in REQUIRED_BINARIES:
-        info = check_runtime_binary(bin_name, ver_arg)
-        statuses[bin_name] = info
-        if (not info["installed"] or not info["executable"]) and apt_pkg not in missing_apt_packages:
-            missing_apt_packages.append(apt_pkg)
-
-    if not missing_apt_packages or not auto_install:
+    statuses, missing_packages = scan()
+    if not missing_packages or not auto_install:
         return statuses
 
-    with _INSTALL_LOCK:
-        # Re-check inside lock in case another caller already completed installation
-        missing_apt_packages.clear()
-        for bin_name, ver_arg, apt_pkg in REQUIRED_BINARIES:
-            info = check_runtime_binary(bin_name, ver_arg)
-            statuses[bin_name] = info
-            if (not info["installed"] or not info["executable"]) and apt_pkg not in missing_apt_packages:
-                missing_apt_packages.append(apt_pkg)
+    runtime = detect_runtime_environment()
+    logger.info(
+        "Runtime detected: OS=%s distro=%s %s arch=%s container=%s package_managers=%s uid=%s",
+        runtime["os"], runtime["distro_id"], runtime["distro_version"], runtime["architecture"],
+        runtime["is_container"], runtime["package_managers"], runtime["effective_uid"],
+    )
 
-        if not missing_apt_packages:
+    with _INSTALL_LOCK:
+        statuses, missing_packages = scan()
+        if not missing_packages:
             return statuses
 
-        apt_get_path = shutil.which("apt-get")
-        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
-        if apt_get_path and is_root:
-            logger.info(
-                "Missing system multimedia package(s) %s detected; installing via official apt-get...",
-                ", ".join(missing_apt_packages),
-            )
-            env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-            try:
-                update_res = subprocess.run(
-                    [apt_get_path, "update", "-qq"],
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=90,
-                    check=False,
-                )
-                if update_res.returncode != 0:
-                    logger.warning(
-                        "apt-get update exited with code %s: %s",
-                        update_res.returncode,
-                        (update_res.stderr or update_res.stdout or "").strip()[-500:],
-                    )
-                install_res = subprocess.run(
-                    [
-                        apt_get_path,
-                        "-o",
-                        "Dpkg::Options::=--force-confdef",
-                        "-o",
-                        "Dpkg::Options::=--force-confold",
-                        "install",
-                        "-y",
-                        "--no-install-recommends",
-                        *missing_apt_packages,
-                        "ca-certificates",
-                        "curl",
-                    ],
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    check=False,
-                )
-                if install_res.returncode != 0:
-                    logger.warning(
-                        "apt-get install exited with code %s: %s",
-                        install_res.returncode,
-                        (install_res.stderr or install_res.stdout or "").strip()[-500:],
-                    )
-                clear_binary_cache()
-            except Exception as exc:
-                logger.warning("Automatic apt-get provisioning failed (%s): %s", type(exc).__name__, exc)
-        elif not apt_get_path:
+        manager = runtime.get("package_manager")
+        if not manager or manager not in {"apt-get", "apt", "apk", "dnf", "yum", "pacman", "brew"}:
             logger.error(
-                "Cannot auto-install missing multimedia tools %s: apt-get is unavailable in this runtime. "
-                "Install aria2 and ffmpeg in the image/build configuration.",
-                ", ".join(missing_apt_packages),
+                "Cannot auto-install missing encode tools %s: unsupported/no usable package manager detected (%s).",
+                ", ".join(missing_packages), runtime.get("package_managers") or "none",
+            )
+            return statuses
+
+        update_cmd, package_groups, install_prefix = _package_install_plan(manager)
+        if install_prefix is None:
+            logger.error("No safe installer plan is available for package manager %s.", manager)
+            return statuses
+
+        try:
+            if update_cmd:
+                update_result = _run_package_manager_command(update_cmd, timeout=120)
+                if update_result.returncode != 0:
+                    logger.warning(
+                        "%s package-index update exited %s: %s",
+                        manager, update_result.returncode,
+                        (update_result.stderr or update_result.stdout or "").strip()[-500:],
+                    )
+            for group in package_groups:
+                # Skip groups that cannot fix any currently missing executable.
+                if group == ["aria2"] and statuses.get("aria2c", {}).get("executable"):
+                    continue
+                if group == ["ffmpeg"] and statuses.get("ffmpeg", {}).get("executable") and statuses.get("ffprobe", {}).get("executable"):
+                    continue
+                try:
+                    result = _run_package_manager_command(
+                        [*install_prefix, *group],
+                        timeout=240,
+                    )
+                    if result.returncode != 0:
+                        logger.warning(
+                            "%s install group %s exited %s: %s",
+                            manager, ", ".join(group), result.returncode,
+                            (result.stderr or result.stdout or "").strip()[-600:],
+                        )
+                    else:
+                        logger.info("Installed/verified system packages via %s: %s", manager, ", ".join(group))
+                except Exception as exc:
+                    logger.warning(
+                        "%s could not install package group %s (%s): %s",
+                        manager, ", ".join(group), type(exc).__name__, str(exc)[:300],
+                    )
+                statuses, missing_packages = scan()
+                if not missing_packages:
+                    break
+        except Exception as exc:
+            logger.warning(
+                "Automatic encode-tool provisioning failed on %s (%s): %s",
+                manager, type(exc).__name__, str(exc)[:400],
+            )
+
+        clear_binary_cache()
+        statuses, missing_packages = scan()
+        if missing_packages:
+            logger.error(
+                "Encode toolchain still incomplete after auto-provisioning: missing=%s; runtime=%s/%s/%s; "
+                "manager=%s; root=%s. Host permissions/repository availability may prevent installation.",
+                ", ".join(name for name, info in statuses.items() if not info.get("installed") or not info.get("executable")),
+                runtime["os"], runtime["distro_id"], runtime["architecture"], manager, runtime["effective_uid"] == 0,
             )
         else:
-            logger.error(
-                "Cannot auto-install missing multimedia tools %s: apt-get requires root privileges, "
-                "but the current process is not root (euid=%s). Install aria2 and ffmpeg during image build.",
-                ", ".join(missing_apt_packages),
-                os.geteuid() if hasattr(os, "geteuid") else "unknown",
-            )
-
-        for bin_name, ver_arg, _ in REQUIRED_BINARIES:
-            statuses[bin_name] = check_runtime_binary(bin_name, ver_arg)
-
+            logger.info("Encode toolchain ready: aria2c, ffmpeg, and ffprobe are executable.")
     return statuses
-
 
 def log_runtime_binaries_status(auto_install: bool = True) -> dict[str, dict[str, Any]]:
     """Verify and log the paths and versions of `aria2c`, `ffmpeg`, and `ffprobe` at startup."""
