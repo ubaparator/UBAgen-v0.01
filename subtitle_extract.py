@@ -184,7 +184,7 @@ def ensure_runtime_binaries(auto_install: bool = True) -> dict[str, dict[str, An
             )
             env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
             try:
-                subprocess.run(
+                update_res = subprocess.run(
                     [apt_get_path, "update", "-qq"],
                     env=env,
                     capture_output=True,
@@ -192,6 +192,12 @@ def ensure_runtime_binaries(auto_install: bool = True) -> dict[str, dict[str, An
                     timeout=90,
                     check=False,
                 )
+                if update_res.returncode != 0:
+                    logger.warning(
+                        "apt-get update exited with code %s: %s",
+                        update_res.returncode,
+                        (update_res.stderr or update_res.stdout or "").strip()[-500:],
+                    )
                 install_res = subprocess.run(
                     [
                         apt_get_path,
@@ -221,6 +227,19 @@ def ensure_runtime_binaries(auto_install: bool = True) -> dict[str, dict[str, An
                 clear_binary_cache()
             except Exception as exc:
                 logger.warning("Automatic apt-get provisioning failed (%s): %s", type(exc).__name__, exc)
+        elif not apt_get_path:
+            logger.error(
+                "Cannot auto-install missing multimedia tools %s: apt-get is unavailable in this runtime. "
+                "Install aria2 and ffmpeg in the image/build configuration.",
+                ", ".join(missing_apt_packages),
+            )
+        else:
+            logger.error(
+                "Cannot auto-install missing multimedia tools %s: apt-get requires root privileges, "
+                "but the current process is not root (euid=%s). Install aria2 and ffmpeg during image build.",
+                ", ".join(missing_apt_packages),
+                os.geteuid() if hasattr(os, "geteuid") else "unknown",
+            )
 
         for bin_name, ver_arg, _ in REQUIRED_BINARIES:
             statuses[bin_name] = check_runtime_binary(bin_name, ver_arg)
