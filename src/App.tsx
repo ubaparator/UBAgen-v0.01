@@ -250,6 +250,11 @@ export default function App() {
   const [encodeJobs, setEncodeJobs] = useState<EncodeJobItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState<boolean>(false);
+  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(false);
+  const [diagnosticsText, setDiagnosticsText] = useState<string>('');
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [copiedDiagnostics, setCopiedDiagnostics] = useState<boolean>(false);
   const [restartingBot, setRestartingBot] = useState<boolean>(false);
   const [showRestartModal, setShowRestartModal] = useState<boolean>(false);
   const [restartAdminTokenInput, setRestartAdminTokenInput] = useState<string>('');
@@ -390,6 +395,52 @@ export default function App() {
 
   const handleManualRefresh = () => {
     fetchStats(true);
+  };
+
+  // Fetch redacted diagnostics from the backend and display them directly on this page.
+  const handleGetDiagnostics = async () => {
+    setShowDiagnostics(true);
+    setDiagnosticsLoading(true);
+    setDiagnosticsError(null);
+    setDiagnosticsText('');
+    try {
+      const response = await fetch('/api/diagnostics/log?live_tests=false', {
+        headers: { Accept: 'application/json' },
+        cache: 'no-store',
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(payload?.detail || payload?.error || `HTTP ${response.status}: ${response.statusText}`);
+      }
+      const report = typeof payload?.formatted_report === 'string'
+        ? payload.formatted_report
+        : JSON.stringify(payload?.diagnostics ?? payload, null, 2);
+      setDiagnosticsText(report || 'Tanılama raporu boş döndü.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Bilinmeyen hata';
+      setDiagnosticsError(`Tanılama raporu alınamadı: ${message}`);
+      setDiagnosticsText('');
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  };
+
+  const handleCopyDiagnostics = async () => {
+    if (!diagnosticsText) return;
+    try {
+      await navigator.clipboard.writeText(diagnosticsText);
+    } catch {
+      const textArea = document.createElement('textarea');
+      textArea.value = diagnosticsText;
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+    }
+    setCopiedDiagnostics(true);
+    window.setTimeout(() => setCopiedDiagnostics(false), 2000);
   };
 
   const resolvedRestartEndpointPreview = (() => {
@@ -576,6 +627,18 @@ export default function App() {
             )}
           </button>
 
+          {/* One-click diagnostics report */}
+          <button
+            type="button"
+            onClick={handleGetDiagnostics}
+            disabled={diagnosticsLoading}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-500/10 text-amber-200 border border-amber-500/30 hover:bg-amber-500/20 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            title="Canlı sistem tanılama raporunu bu sayfada göster"
+          >
+            <Terminal className={`w-3.5 h-3.5 ${diagnosticsLoading ? 'animate-pulse' : ''}`} />
+            <span>{diagnosticsLoading ? 'Log alınıyor…' : 'Log çıktısı al'}</span>
+          </button>
+
           {/* Manual Refresh Button */}
           <button
             onClick={handleManualRefresh}
@@ -684,6 +747,37 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 flex flex-col gap-6">
+        {/* Inline diagnostics report */}
+        {showDiagnostics && (
+          <section className="rounded-2xl border border-amber-500/30 bg-slate-900/90 shadow-xl overflow-hidden" aria-live="polite">
+            <div className="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Terminal className="w-4 h-4 text-amber-300" />
+                <h2 className="text-sm font-bold text-white">UBAgen — Tanılama / Log Çıktısı</h2>
+              </div>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={handleGetDiagnostics} disabled={diagnosticsLoading} className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 disabled:opacity-50">
+                  <RefreshCw className={`inline w-3.5 h-3.5 mr-1.5 ${diagnosticsLoading ? 'animate-spin' : ''}`} />Yenile
+                </button>
+                <button type="button" onClick={handleCopyDiagnostics} disabled={!diagnosticsText} className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white disabled:opacity-50">
+                  {copiedDiagnostics ? <Check className="inline w-3.5 h-3.5 mr-1.5" /> : <Copy className="inline w-3.5 h-3.5 mr-1.5" />}
+                  {copiedDiagnostics ? 'Kopyalandı' : 'Kopyala'}
+                </button>
+                <button type="button" onClick={() => setShowDiagnostics(false)} aria-label="Log panelini kapat" className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            {diagnosticsLoading ? (
+              <div className="p-5 text-sm text-slate-300"><RefreshCw className="inline w-4 h-4 mr-2 animate-spin" />Sistem tanılama raporu alınıyor…</div>
+            ) : diagnosticsError ? (
+              <div className="p-4 text-sm text-rose-200 whitespace-pre-wrap">{diagnosticsError}<p className="mt-2 text-xs text-slate-400">Backend erişilemiyorsa bu panelde rapor gösterilemez; servisin loglarını kontrol edin.</p></div>
+            ) : (
+              <pre className="p-4 max-h-[60vh] overflow-auto whitespace-pre-wrap break-words text-xs leading-relaxed font-mono text-slate-200">{diagnosticsText || 'Henüz log alınmadı.'}</pre>
+            )}
+          </section>
+        )}
+
         {/* Error Banner */}
         {error && (
           <div className="bg-rose-950/50 border border-rose-500/40 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-lg text-rose-200">
