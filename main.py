@@ -1472,8 +1472,21 @@ async def main() -> None:
             storage_report.get("directories", {}).get("video_outputs_dir"),
             storage_report.get("directories", {}).get("download_temp_dir"),
         )
-    with suppress(Exception):
-        await asyncio.to_thread(log_runtime_binaries_status, True)
+    try:
+        binary_statuses = await asyncio.to_thread(log_runtime_binaries_status, True)
+        missing_binaries = [
+            name for name, info in binary_statuses.items()
+            if not info.get("installed") or not info.get("executable")
+        ]
+        if missing_binaries:
+            logger.error(
+                "Encode toolchain is incomplete in this runtime: %s. "
+                "The Dockerfile already installs aria2 and ffmpeg (which provides ffprobe); "
+                "if this app is not built from the Dockerfile, install them in the host's build/start configuration.",
+                ", ".join(missing_binaries),
+            )
+    except Exception:
+        logger.exception("Unexpected error while checking/installing encode runtime binaries.")
 
     shutdown_event = asyncio.Event()
     bot_manager = BotLifecycleManager(
