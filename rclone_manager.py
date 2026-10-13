@@ -2220,7 +2220,10 @@ def collect_diagnostic_log_report(
     """
     install_error_ring_buffer()
     from stats import collect_all_stats, redact_sensitive_text
+    from subtitle_extract import detect_runtime_environment, log_runtime_binaries_status
 
+    runtime_environment = detect_runtime_environment()
+    encode_toolchain = log_runtime_binaries_status(auto_install=False)
     active_bot = bot or (getattr(bot_manager, "bot", None) if bot_manager is not None else None)
     stats_payload = collect_all_stats(active_bot)
     rclone_mgr = get_rclone_manager()
@@ -2462,6 +2465,8 @@ def collect_diagnostic_log_report(
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": "ok",
+        "runtime_environment": runtime_environment,
+        "encode_toolchain": encode_toolchain,
         "recent_errors": recent_errors,
         "failed_jobs_errors": failed_jobs_errors,
         "env_audit": {
@@ -2517,6 +2522,8 @@ def format_diagnostic_log_for_discord(report: dict[str, Any]) -> str:
     cfg_audit = report.get("config_files", {})
     rclone_info = report.get("rclone", {})
     rclone_bin = rclone_info.get("binary", {})
+    runtime_info = report.get("runtime_environment", {})
+    encode_tools = report.get("encode_toolchain", {})
     remotes = rclone_info.get("remotes", [])
     discord_info = report.get("discord", {})
     bh = report.get("backend_health", {})
@@ -2563,6 +2570,16 @@ def format_diagnostic_log_for_discord(report: dict[str, Any]) -> str:
     # 4. Rclone Binary
     rc_badge = "✅ Kurulu & Çalışıyor" if rclone_bin.get("executable") else "❌ Kurulu Değil / Çalıştırılamıyor"
     rc_line = f"{rc_badge} (`{rclone_bin.get('version', 'Unavailable')}` @ `{rclone_bin.get('path') or 'PATH yok'}`)"
+    tool_parts = []
+    for tool_name in ("aria2c", "ffmpeg", "ffprobe"):
+        tool_info = encode_tools.get(tool_name, {})
+        tool_parts.append(f"{tool_name}:{'OK' if tool_info.get('installed') and tool_info.get('executable') else 'MISSING'}")
+    runtime_line = (
+        f"OS={runtime_info.get('os', '?')} distro={runtime_info.get('distro_id', '?')} "
+        f"arch={runtime_info.get('architecture', '?')} manager={runtime_info.get('package_manager') or 'none'} "
+        f"root={runtime_info.get('effective_uid') == 0} container={runtime_info.get('is_container', '?')}"
+    )
+    tool_line = " | ".join(tool_parts)
 
     # 5. MEGA & Google Drive Remotes
     remote_lines: list[str] = []
@@ -2593,6 +2610,7 @@ def format_diagnostic_log_for_discord(report: dict[str, Any]) -> str:
         f"**2. Ortam Değişkenleri & Secret Denetimi (Değerler Gizli):**\n  • {env_line}\n  • {opt_line}",
         f"**3. Yapılandırma Dosyaları:**\n  • {cfg_line}",
         f"**4. Rclone Kurulumu:**\n  • {rc_line}",
+        f"**4b. Sunucu & Encode Araçları:**\n  • {runtime_line}\n  • {tool_line}",
         f"**5. MEGA & Google Drive Remote Durumu (Bekleyen Silme: `{rclone_info.get('pending_deletions_count', 0)}`):**\n"
         + "\n".join(remote_lines),
         f"**6. Discord Bot, İzinler & Komut Senkronizasyonu:**\n"
