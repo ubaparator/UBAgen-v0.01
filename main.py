@@ -161,6 +161,7 @@ if commands is not None:
             self._guild_commands_synced = False
             self._global_commands_synced = False
             self._synced_guild_ids: set[int] = set()
+            self._gateway_toolchain_check_done = False
             self.lifecycle_manager: Any = None
 
         def write_state_file(self) -> None:
@@ -272,6 +273,24 @@ if commands is not None:
 
         async def on_ready(self) -> None:
             """Fires when Discord gateway connection and guild cache are fully established."""
+            if not self._gateway_toolchain_check_done:
+                self._gateway_toolchain_check_done = True
+                try:
+                    runtime_status = await asyncio.to_thread(log_runtime_binaries_status, True)
+                    missing_tools = [
+                        name for name, info in runtime_status.items()
+                        if not info.get("installed") or not info.get("executable")
+                    ]
+                    if missing_tools:
+                        logger.error(
+                            "Gateway became ready, but encode tools are still missing: %s. "
+                            "See /log for detected OS, package manager and installation diagnostics.",
+                            ", ".join(missing_tools),
+                        )
+                    else:
+                        logger.info("Gateway-ready encode toolchain check passed: aria2c, ffmpeg, ffprobe.")
+                except Exception:
+                    logger.exception("Gateway-ready encode toolchain check failed unexpectedly.")
             if self.user:
                 logger.info("==================================================")
                 logger.info("🎉 UBAgen Bot is ONLINE!")
