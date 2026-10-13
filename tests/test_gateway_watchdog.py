@@ -168,6 +168,13 @@ class GatewayWatchdogTests(unittest.IsolatedAsyncioTestCase):
             await mgr.stop_bot()
             mgr.shutdown_event.set()
 
+    async def test_transient_event_loop_lag_is_recorded_without_restarting_bot(self):
+        mgr = BotLifecycleManager(bot_factory=lambda: FakeBot(), shutdown_event=asyncio.Event())
+        original_bot = mgr.bot
+        mgr._record_event_loop_lag(0.25)
+        self.assertAlmostEqual(mgr.last_event_loop_lag_seconds, 0.25)
+        self.assertIs(mgr.bot, original_bot)
+
     async def test_watchdog_does_not_revive_on_invalid_token(self):
         """When token is rejected (status='invalid_token'), watchdog must NOT hammer reconnects."""
         shutdown_event = asyncio.Event()

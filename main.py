@@ -713,6 +713,8 @@ class BotLifecycleManager:
         self._wake_lock = asyncio.Lock()
         self.gateway_stall_timeout: float = 120.0
         self.watchdog_interval: float = 10.0
+        self.event_loop_lag_warning_threshold: float = 2.0
+        self.last_event_loop_lag_seconds: float = 0.0
         self.is_restarting: bool = False
         self.last_restart_at: float = 0.0
         self.last_wake_at: float = 0.0
@@ -783,6 +785,17 @@ class BotLifecycleManager:
     def get_bot_token(self) -> str:
         """Retrieve current DISCORD_BOT_TOKEN from environment without mutating or logging it."""
         return os.getenv("DISCORD_BOT_TOKEN", "").strip()
+
+    def _record_event_loop_lag(self, lag_seconds: float) -> None:
+        """Record event-loop scheduling delay; warn only for material stalls."""
+        lag = max(0.0, float(lag_seconds))
+        self.last_event_loop_lag_seconds = lag
+        if lag >= self.event_loop_lag_warning_threshold:
+            logger.warning(
+                "Asyncio event-loop scheduling delay detected: %.2fs (warning threshold %.2fs).",
+                lag,
+                self.event_loop_lag_warning_threshold,
+            )
 
     async def _recover_stalled_gateway(self, token: str, expected_tracker: Any, stalled_for: float) -> bool:
         """Replace a Gateway client that has remained unready past the stall threshold."""
@@ -876,7 +889,10 @@ class BotLifecycleManager:
         logger.info("Discord Gateway watchdog monitor initialized.")
         while not self.shutdown_event.is_set():
             try:
+                loop = asyncio.get_running_loop()
+                expected_wakeup = loop.time() + self.watchdog_interval
                 await asyncio.sleep(self.watchdog_interval)
+                self._record_event_loop_lag(loop.time() - expected_wakeup)
                 if self.shutdown_event.is_set() or self._stop_bot_event.is_set():
                     break
 
