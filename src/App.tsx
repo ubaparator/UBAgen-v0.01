@@ -49,10 +49,30 @@ function DiscordLogo({ className = 'w-4 h-4' }: { className?: string }) {
   );
 }
 
+interface GatewayShutdownInfo {
+  label?: string;
+  platform_limit_seconds: number | null;
+  platform_limit_str: string;
+  limit_type: string;
+  is_exact_platform_limit: boolean;
+  platform_limit_description?: string;
+  observed_session_duration_sec: number | null;
+  observed_session_duration_str: string;
+  time_since_last_disconnect_sec: number | null;
+  time_since_last_disconnect_str: string | null;
+  estimated_remaining_seconds: number | null;
+  estimated_remaining_str: string;
+  uncertainty_note?: string;
+  previous_session_duration_sec?: number | null;
+  previous_session_duration_str?: string | null;
+  summary_display?: string;
+}
+
 interface StatsResponse {
   status: string;
   timestamp: string;
   epoch_time: number;
+  gateway_shutdown_info?: GatewayShutdownInfo;
   bot: {
     status?: string;
     is_ready: boolean;
@@ -77,6 +97,7 @@ interface StatsResponse {
     interactions_endpoint_configured?: boolean;
     interactions_endpoint_path?: string;
     wake_endpoint_path?: string;
+    gateway_shutdown_info?: GatewayShutdownInfo;
   };
   compute: {
     cpu_usage_pct: number | null;

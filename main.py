@@ -68,7 +68,12 @@ from rclone_manager import (
     install_rclone_error_buffer_handler,
     register_log_command,
 )
-from stats import BotTracker, install_log_buffer_handler, register_stats_command
+from stats import (
+    BotTracker,
+    install_log_buffer_handler,
+    record_gateway_lifecycle_event,
+    register_stats_command,
+)
 
 from storage_manager import get_storage_manager
 from subtitle_extract import (
@@ -289,6 +294,7 @@ if commands is not None:
                 if not self.tracker.last_connected_time:
                     self.tracker.last_connected_time = time.time()
                 self.tracker.diagnostic_message = "Connected to Discord Gateway."
+                record_gateway_lifecycle_event("ready", details=f"guilds={len(self.guilds)}")
                 self.write_state_file()
 
                 activity = discord.Activity(
@@ -351,18 +357,22 @@ if commands is not None:
             latency = getattr(self, "latency", None)
             self.tracker.latency_ms = round(latency * 1000, 1) if latency is not None else None
             self.tracker.guild_count = len(self.guilds)
+            record_gateway_lifecycle_event("resumed")
             self.write_state_file()
 
         async def on_disconnect(self) -> None:
             """Fires when disconnected from Discord gateway."""
             disconnected_at = time.time()
             logger.warning("Discord Gateway disconnected at %.3f; discord.py will attempt to reconnect.", disconnected_at)
+            last_conn = self.tracker.last_connected_time
+            dur = (disconnected_at - float(last_conn)) if (last_conn and self.tracker.connected) else None
             self.tracker.connected = False
             self.tracker.is_ready = False
             self.tracker.status = "disconnected"
             self.tracker.last_error_time = disconnected_at
             self.tracker.gateway_state_since = disconnected_at
             self.tracker.diagnostic_message = "Connection temporarily interrupted. Reconnecting..."
+            record_gateway_lifecycle_event("disconnected", duration_sec=dur, details="gateway_disconnected")
             self.write_state_file()
 else:
     UBAgenBot = None

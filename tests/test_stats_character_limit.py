@@ -1,18 +1,18 @@
 """
 Unit tests verifying strict character limit enforcement for /stats:
-Discord messages must be strictly <= 1023 characters under ALL input combinations
-(normal, empty, degraded, and adversarial worst-case inputs with oversized fields).
+Discord messages must be strictly <= 950 characters under ALL input combinations
+(normal, empty, degraded, error handlers, and adversarial worst-case inputs with oversized fields).
 """
 
 from __future__ import annotations
 
 import unittest
-from stats import format_compact_stats_message, collect_all_stats, BotTracker
+from stats import format_compact_stats_message, collect_all_stats, BotTracker, DEFAULT_STATS_MAX_LEN, redact_sensitive_text
 
 
 class StatsCharacterLimitTests(unittest.TestCase):
-    def test_standard_stats_strictly_under_1024_chars(self):
-        """Standard stats output must be concise and strictly <= 1023 characters."""
+    def test_standard_stats_strictly_under_950_chars(self):
+        """Standard stats output must be concise and strictly <= 950 characters."""
         stats = {
             "bot": {
                 "connected": True,
@@ -48,11 +48,14 @@ class StatsCharacterLimitTests(unittest.TestCase):
                 "ffprobe": {"installed": True, "version": "4.4.2"},
                 "aria2": {"installed": True, "version": "1.36.0"},
             },
+            "jobs": {
+                "active_count": 1,
+            },
         }
 
-        msg = format_compact_stats_message(stats, max_len=1023)
+        msg = format_compact_stats_message(stats, max_len=950)
         self.assertIsInstance(msg, str)
-        self.assertLessEqual(len(msg), 1023, f"Output exceeded 1023 characters: len={len(msg)}")
+        self.assertLessEqual(len(msg), 950, f"Output exceeded 950 characters: len={len(msg)}")
         self.assertIn("UBAgen Sistem Durumu", msg)
         self.assertIn("Gateway", msg)
         self.assertIn("CPU", msg)
@@ -60,15 +63,15 @@ class StatsCharacterLimitTests(unittest.TestCase):
         self.assertIn("Disk", msg)
 
     def test_empty_and_degraded_dictionary_handling(self):
-        """Empty or degraded dictionary must produce valid output <= 1023 chars without crashing."""
+        """Empty or degraded dictionary must produce valid output <= 950 chars without crashing."""
         for sample in ({}, {"status": "degraded"}, {"bot": None, "compute": {}}):
-            msg = format_compact_stats_message(sample, max_len=1023)
+            msg = format_compact_stats_message(sample, max_len=950)
             self.assertIsInstance(msg, str)
-            self.assertLessEqual(len(msg), 1023)
+            self.assertLessEqual(len(msg), 950)
             self.assertGreater(len(msg), 0)
 
-    def test_adversarial_oversized_fields_strictly_clamped_to_1023(self):
-        """Adversarial worst case with 5000+ char strings must strictly remain <= 1023 chars."""
+    def test_adversarial_oversized_fields_strictly_clamped_to_950(self):
+        """Adversarial worst case with 5000+ char strings must strictly remain <= 950 chars."""
         oversized_text = "A" * 6000
         stats = {
             "bot": {
@@ -76,6 +79,7 @@ class StatsCharacterLimitTests(unittest.TestCase):
                 "is_ready": False,
                 "user": oversized_text,
                 "status": oversized_text,
+                "last_error": oversized_text,
                 "diagnostic_message": oversized_text,
                 "latency_ms": 999999.0,
             },
@@ -103,21 +107,29 @@ class StatsCharacterLimitTests(unittest.TestCase):
         }
         huge_wake_note = "⚡ " + "WAKE_" * 800 + "\n"
 
-        msg = format_compact_stats_message(stats, max_len=1023, wake_note=huge_wake_note)
+        msg = format_compact_stats_message(stats, max_len=950, wake_note=huge_wake_note)
         self.assertIsInstance(msg, str)
         self.assertLessEqual(
             len(msg),
-            1023,
-            f"Adversarial stats output reached {len(msg)} characters! Must be <= 1023.",
+            950,
+            f"Adversarial stats output reached {len(msg)} characters! Must be <= 950.",
         )
 
+    def test_error_message_path_strictly_under_950(self):
+        """Long error messages must never exceed the 950 character limit."""
+        huge_exception = RuntimeError("X" * 2500)
+        safe_err = redact_sensitive_text(str(huge_exception))[:200]
+        err_msg = f"❌ **UBAgen — İstatistik Hatası:** `{type(huge_exception).__name__}: {safe_err}`"[:DEFAULT_STATS_MAX_LEN]
+        self.assertLessEqual(len(err_msg), 950)
+
     def test_exact_character_limit_boundaries(self):
-        """Ensure boundary enforcement at custom limits like 250, 500, 1023."""
+        """Ensure boundary enforcement at custom limits like 200, 500, 950."""
         stats = {"bot": {"connected": True, "is_ready": True}}
-        for boundary in (200, 500, 1023):
+        for boundary in (200, 500, 950):
             msg = format_compact_stats_message(stats, max_len=boundary)
             self.assertLessEqual(len(msg), boundary)
 
 
 if __name__ == "__main__":
     unittest.main()
+

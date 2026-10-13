@@ -17,9 +17,11 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+from pathlib import Path
 import platform
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -168,6 +170,240 @@ def generate_discord_invite_url(client_id: Optional[str], permissions: int = 214
 
 
 # ------------------------------------------------------------------------------
+# Formatting Utilities
+# ------------------------------------------------------------------------------
+def format_bytes(num_bytes: int | float | None) -> str:
+    """Format bytes into a human-readable string (B, KB, MB, GB, TB)."""
+    if num_bytes is None or num_bytes < 0:
+        return "Unavailable"
+    num = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.2f} {unit}"
+        num /= 1024.0
+    return f"{num:.2f} PB"
+
+
+def format_duration(seconds: float | None) -> str:
+    """Format duration in seconds to a human-readable string (e.g., 2d 4h 12m 30s)."""
+    if seconds is None or seconds < 0:
+        return "Unavailable"
+    secs = int(seconds)
+    days, remainder = divmod(secs, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, s = divmod(remainder, 60)
+
+    parts: list[str] = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0 or hours > 0 or days > 0:
+        parts.append(f"{minutes}m")
+    parts.append(f"{s}s")
+
+    return " ".join(parts) if parts else "0s"
+
+
+# ------------------------------------------------------------------------------
+# Persistent Gateway Lifecycle & AI Studio / Cloud Run Environment Telemetry
+# ------------------------------------------------------------------------------
+LIFECYCLE_DB_LOCK = threading.Lock()
+
+
+def get_lifecycle_db_path() -> Path:
+    """Resolve persistent SQLite DB path for lifecycle telemetry."""
+    base_dir = os.getenv("UBAGEN_STORAGE_DIR", "").strip()
+    if base_dir and os.path.isdir(base_dir):
+        return Path(base_dir) / "ubagen_jobs.sqlite3"
+    local_p = Path("ubagen_jobs.sqlite3").resolve()
+    if local_p.parent.exists() and os.access(str(local_p.parent), os.W_OK):
+        return local_p
+    return Path("/tmp/ubagen_jobs.sqlite3")
+
+
+def record_gateway_lifecycle_event(
+    event_type: str,
+    duration_sec: Optional[float] = None,
+    details: str = "",
+) -> None:
+    """Safely log gateway lifecycle transitions (startup, ready, disconnect, resume, shutdown)."""
+    db_path = get_lifecycle_db_path()
+    try:
+        with LIFECYCLE_DB_LOCK:
+            with sqlite3.connect(str(db_path), timeout=5.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gateway_lifecycle_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_type TEXT NOT NULL,
+                        timestamp REAL NOT NULL,
+                        duration_sec REAL,
+                        details TEXT
+                    );
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO gateway_lifecycle_history (event_type, timestamp, duration_sec, details) VALUES (?, ?, ?, ?)",
+                    (event_type, time.time(), duration_sec, details[:500] if details else None),
+                )
+    except Exception as exc:
+        logger.debug("Could not record gateway lifecycle event: %s", exc)
+
+
+def get_latest_lifecycle_summary() -> dict[str, Any]:
+    """Retrieve previous session duration and restart history from persistent database."""
+    db_path = get_lifecycle_db_path()
+    if not db_path.exists():
+        return {"previous_session_sec": None, "previous_session_str": None, "last_event": None}
+    try:
+        with LIFECYCLE_DB_LOCK:
+            with sqlite3.connect(str(db_path), timeout=3.0) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT event_type, timestamp, duration_sec, details
+                    FROM gateway_lifecycle_history
+                    WHERE duration_sec IS NOT NULL AND duration_sec > 0
+                    ORDER BY id DESC LIMIT 1;
+                    """
+                )
+                row = cursor.fetchone()
+                if row:
+                    dur = float(row["duration_sec"])
+                    return {
+                        "previous_session_sec": dur,
+                        "previous_session_str": format_duration(dur),
+                        "last_event": row["event_type"],
+                    }
+    except Exception:
+        pass
+    return {"previous_session_sec": None, "previous_session_str": None, "last_event": None}
+
+
+def detect_gateway_shutdown_info(
+    bot_tracker: Any = None,
+    now: Optional[float] = None,
+    backend_uptime: Optional[float] = None,
+) -> dict[str, Any]:
+    """
+    Analyzes Google AI Studio / Cloud Run execution environment and Gateway session lifetimes.
+    Strictly differentiates between:
+    1. Exact platform timeout limits (e.g., CLOUD_RUN_TIMEOUT_SECONDS=3600)
+    2. Estimated remaining runtime (which varies based on idle scale-to-zero and CPU throttling)
+    3. Measured continuous session durations and time since last disconnect
+    4. Explicit 'Bilinmiyor' / 'Ölçülemiyor' fallbacks when data cannot be measured.
+    """
+    cur_now = now or time.time()
+    effective_uptime = backend_uptime if backend_uptime is not None else (cur_now - PROCESS_START_TIME)
+
+    # 1. Platform-level limit detection
+    cr_timeout_env = os.getenv("CLOUD_RUN_TIMEOUT_SECONDS", "").strip()
+    is_cloud_run = bool(os.getenv("K_SERVICE") or os.getenv("K_REVISION") or cr_timeout_env)
+    platform_limit_sec: Optional[int] = None
+    platform_limit_str: str = "Bilinmiyor"
+    limit_type: str = "unknown"
+    is_exact_platform_limit: bool = False
+
+    if cr_timeout_env.isdigit():
+        platform_limit_sec = int(cr_timeout_env)
+        platform_limit_str = f"{platform_limit_sec}s ({format_duration(platform_limit_sec)})"
+        limit_type = "platform_configured"
+        is_exact_platform_limit = True
+        platform_desc = (
+            f"Google Cloud Run azami istek yürütme sınırı (CLOUD_RUN_TIMEOUT_SECONDS={platform_limit_sec}). "
+            "Aktif HTTP trafiği olmadığında Cloud Run örneği boşta kalma nedeniyle daha erken sonlandırabilir."
+        )
+    elif is_cloud_run:
+        platform_limit_sec = 3600
+        platform_limit_str = "1 saat (3600s)"
+        limit_type = "platform_configured"
+        is_exact_platform_limit = True
+        platform_desc = (
+            "Google Cloud Run varsayılan azami timeout sınırı (3600s). "
+            "Boşta kalma (scale-to-zero) durumunda daha erken sonlandırılabilir."
+        )
+    else:
+        platform_limit_sec = None
+        platform_limit_str = "Bilinmiyor"
+        limit_type = "unknown"
+        is_exact_platform_limit = False
+        platform_desc = "Platform tarafından bildirilen kesin bir kapanma süresi sınırı bulunmuyor."
+
+    # 2. Observed continuous session measurement
+    is_ready = False
+    is_connected = False
+    last_conn: Optional[float] = None
+    last_err: Optional[float] = None
+
+    if bot_tracker:
+        is_ready = bool(getattr(bot_tracker, "is_ready", False))
+        is_connected = bool(getattr(bot_tracker, "connected", False) or is_ready)
+        last_conn = getattr(bot_tracker, "last_connected_time", None)
+        last_err = getattr(bot_tracker, "last_error_time", None)
+
+    observed_session_sec: Optional[float] = None
+    observed_session_str: str = "Ölçülemiyor"
+    if is_ready and isinstance(last_conn, (int, float)) and last_conn > 0:
+        observed_session_sec = max(0.0, cur_now - float(last_conn))
+        observed_session_str = format_duration(observed_session_sec)
+
+    time_since_disconnect_sec: Optional[float] = None
+    time_since_disconnect_str: Optional[str] = None
+    if not is_connected and isinstance(last_err, (int, float)) and last_err > 0:
+        time_since_disconnect_sec = max(0.0, cur_now - float(last_err))
+        time_since_disconnect_str = format_duration(time_since_disconnect_sec)
+
+    # 3. Estimated remaining lifetime calculation
+    estimated_remaining_sec: Optional[float] = None
+    estimated_remaining_str: str = "Ölçülemiyor"
+    if platform_limit_sec is not None and effective_uptime is not None:
+        estimated_remaining_sec = max(0.0, float(platform_limit_sec) - float(effective_uptime))
+        estimated_remaining_str = format_duration(estimated_remaining_sec)
+        uncertainty_note = (
+            "Tahmini ve belirsizdir: Cloud Run boşta kalma politikası (scale-to-zero) ve CPU kısma "
+            "nedeniyle aktif web trafiği kesilirse örnek 3600s dolmadan önce kapanabilir."
+        )
+    else:
+        uncertainty_note = (
+            "Platformdan kesin bir kapanma süresi bilgisi alınamadığından sabit bir değer uydurulmamıştır. "
+            "Ölçüm 'Bilinmiyor / Ölçülemiyor' olarak raporlanmaktadır."
+        )
+
+    # 4. Historical lifecycle summary
+    history = get_latest_lifecycle_summary()
+
+    # 5. Display label / summary
+    if is_ready and observed_session_sec is not None:
+        summary_display = f"Aktif: {observed_session_str} (Limit: {platform_limit_str})"
+    elif not is_connected and time_since_disconnect_str:
+        summary_display = f"Kopuk: {time_since_disconnect_str} önce"
+    else:
+        summary_display = "Ölçülemiyor"
+
+    return {
+        "label": "Gateway Kapanma Süresi",
+        "platform_limit_seconds": platform_limit_sec,
+        "platform_limit_str": platform_limit_str,
+        "limit_type": limit_type,
+        "is_exact_platform_limit": is_exact_platform_limit,
+        "platform_limit_description": platform_desc,
+        "observed_session_duration_sec": observed_session_sec,
+        "observed_session_duration_str": observed_session_str,
+        "time_since_last_disconnect_sec": time_since_disconnect_sec,
+        "time_since_last_disconnect_str": time_since_disconnect_str,
+        "estimated_remaining_seconds": estimated_remaining_sec,
+        "estimated_remaining_str": estimated_remaining_str,
+        "uncertainty_note": uncertainty_note,
+        "previous_session_duration_sec": history.get("previous_session_sec"),
+        "previous_session_duration_str": history.get("previous_session_str"),
+        "summary_display": summary_display,
+    }
+
+
+# ------------------------------------------------------------------------------
 # Bot Tracker Class
 # ------------------------------------------------------------------------------
 class BotTracker:
@@ -224,6 +460,7 @@ class BotTracker:
         inv_url = self.invite_url or generate_discord_invite_url(cid)
         pub_key = os.getenv("DISCORD_PUBLIC_KEY", "").strip()
         interactions_configured = bool(len(pub_key) == 64)
+        shutdown_telemetry = detect_gateway_shutdown_info(self, now=cur_now, backend_uptime=uptime_sec)
 
         return {
             "status": effective_status,
@@ -250,43 +487,8 @@ class BotTracker:
             "interactions_endpoint_configured": interactions_configured,
             "interactions_endpoint_path": "/api/discord/interactions",
             "wake_endpoint_path": "/api/discord/wake",
+            "gateway_shutdown_info": shutdown_telemetry,
         }
-
-
-# ------------------------------------------------------------------------------
-# Formatting Utilities
-# ------------------------------------------------------------------------------
-def format_bytes(num_bytes: int | float | None) -> str:
-    """Format bytes into a human-readable string (B, KB, MB, GB, TB)."""
-    if num_bytes is None or num_bytes < 0:
-        return "Unavailable"
-    num = float(num_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if abs(num) < 1024.0:
-            return f"{num:3.2f} {unit}"
-        num /= 1024.0
-    return f"{num:.2f} PB"
-
-
-def format_duration(seconds: float | None) -> str:
-    """Format duration in seconds to a human-readable string (e.g., 2d 4h 12m 30s)."""
-    if seconds is None or seconds < 0:
-        return "Unavailable"
-    secs = int(seconds)
-    days, remainder = divmod(secs, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, s = divmod(remainder, 60)
-
-    parts: list[str] = []
-    if days > 0:
-        parts.append(f"{days}d")
-    if hours > 0 or days > 0:
-        parts.append(f"{hours}h")
-    if minutes > 0 or hours > 0 or days > 0:
-        parts.append(f"{minutes}m")
-    parts.append(f"{s}s")
-
-    return " ".join(parts) if parts else "0s"
 
 
 # ------------------------------------------------------------------------------
@@ -913,6 +1115,7 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
     wake_attempts = 0
     last_wake_time = None
     last_wake_reason = None
+    cached_gw_shutdown = None
 
     state_file = "/tmp/ubagen_bot_state.json"
     if not bot_tracker and os.path.exists(state_file):
@@ -944,6 +1147,7 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
                     wake_attempts = int(cached_dict.get("wake_attempts", 0))
                     last_wake_time = cached_dict.get("last_wake_time")
                     last_wake_reason = cached_dict.get("last_wake_reason")
+                    cached_gw_shutdown = cached_dict.get("gateway_shutdown_info")
                     bot_tracker = "cached"
         except Exception as e:
             logger.debug("Failed reading state file: %s", e)
@@ -1152,6 +1356,17 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
     # 9. Environment Variables
     env_statuses = check_environment_variables()
 
+    # 10. Gateway Shutdown & Lifecycle Telemetry
+    gw_shutdown_info = detect_gateway_shutdown_info(
+        bot_tracker=bot_tracker if bot_tracker != "cached" else None,
+        now=now,
+        backend_uptime=backend_uptime_sec,
+    )
+    if bot_tracker == "cached" and isinstance(cached_gw_shutdown, dict):
+        for k in ("observed_session_duration_sec", "observed_session_duration_str", "summary_display"):
+            if cached_gw_shutdown.get(k) is not None and gw_shutdown_info.get(k) in (None, "Ölçülemiyor"):
+                gw_shutdown_info[k] = cached_gw_shutdown[k]
+
     return {
         "status": "online",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1180,6 +1395,7 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             "interactions_endpoint_configured": interactions_configured,
             "interactions_endpoint_path": "/api/discord/interactions",
             "wake_endpoint_path": "/api/discord/wake",
+            "gateway_shutdown_info": gw_shutdown_info,
         },
         "compute": {
             "cpu_usage_pct": cpu_usage_pct,
@@ -1233,6 +1449,7 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
             "effective_budget_str": storage_usage.get("effective_budget_str", format_bytes(disk_free)),
         },
         "storage": storage_audit,
+        "gateway_shutdown_info": gw_shutdown_info,
         "binaries": {
             "ffmpeg": ffmpeg_info,
             "ffprobe": ffprobe_info,
@@ -1244,26 +1461,30 @@ def collect_all_stats(bot: Any = None) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Compact Character-Bounded Stats Message (< 1024 Chars Strict Limit)
+# Compact Character-Bounded Stats Message (< 950 Chars Strict Limit)
 # ------------------------------------------------------------------------------
+DEFAULT_STATS_MAX_LEN = 950
+
+
 def format_compact_stats_message(
     stats: dict[str, Any],
-    max_len: int = 1023,
+    max_len: int = DEFAULT_STATS_MAX_LEN,
     wake_note: str = "",
 ) -> str:
     """
-    Format a high-density, strictly character-bounded (<= max_len, default 1023)
+    Format a high-density, strictly character-bounded (<= max_len, max 950)
     Discord markdown status report.
     Prioritizes:
     1. Gateway connection & latency
-    2. CPU, host & process RAM usage
-    3. Disk storage usage & persistence
-    4. Essential binary toolchain (FFmpeg, aria2, rclone)
-    5. Active jobs / queue summary
+    2. Bot & system uptime
+    3. CPU & RAM usage (or explicit 'Ölçülemiyor')
+    4. Active encode jobs
+    5. Health / last error state
+    6. Disk storage & essential binaries
 
-    Guaranteed never to exceed max_len under any combination of inputs or errors.
+    Guaranteed never to exceed max_len (and strictly <= 950) under any combination of inputs or errors.
     """
-    effective_max = max(100, min(max_len, 1023))
+    effective_max = max(100, min(max_len, DEFAULT_STATS_MAX_LEN))
     clean_wake = (wake_note or "").strip()
     if clean_wake and not clean_wake.endswith("\n"):
         clean_wake += "\n"
@@ -1281,64 +1502,84 @@ def format_compact_stats_message(
     lat_val = bot_info.get("latency_ms")
     lat_str = f" ({lat_val:.0f}ms ping)" if isinstance(lat_val, (int, float)) and lat_val >= 0 else ""
     bot_user = str(bot_info.get("user") or "").strip()
-    bot_acc_str = f" [`{bot_user[:30]}`]" if bot_user and bot_user != "None" else ""
+    bot_acc_str = f" [`{bot_user[:24]}`]" if bot_user and bot_user != "None" else ""
 
     lines: list[str] = [
         "📊 **UBAgen Sistem Durumu**",
         f"• **Gateway:** {bot_status}{lat_str}{bot_acc_str}",
     ]
 
-    # 2. CPU & RAM
+    # 2. Uptime
+    bot_uptime = bot_info.get("uptime_str") or compute.get("backend_uptime_str") or compute.get("system_uptime_str")
+    if bot_uptime:
+        lines.append(f"• **Çalışma Süresi:** `{str(bot_uptime)[:32]}`")
+
+    # 3. CPU & RAM (explicitly state when unmeasurable)
     cpu_pct = compute.get("cpu_usage_pct")
-    cpu_str = f"%{cpu_pct:.1f}" if isinstance(cpu_pct, (int, float)) else "N/A"
+    cpu_str = f"%{cpu_pct:.1f}" if isinstance(cpu_pct, (int, float)) else "Ölçülemiyor"
     cores = compute.get("logical_cores")
     cores_str = f" ({cores} çekirdek)" if isinstance(cores, int) else ""
 
-    ram_used = mem.get("system_used_str") or "N/A"
-    ram_total = mem.get("system_total_str") or "N/A"
-    ram_pct = mem.get("system_percent")
-    ram_pct_str = f" (%{ram_pct:.1f})" if isinstance(ram_pct, (int, float)) else ""
-    proc_rss = mem.get("process_rss_str")
-    proc_str = f" | **Süreç:** `{proc_rss}`" if proc_rss else ""
+    ram_used = mem.get("system_used_str")
+    ram_total = mem.get("system_total_str")
+    if ram_used and ram_total:
+        ram_pct = mem.get("system_percent")
+        ram_pct_str = f" (%{ram_pct:.1f})" if isinstance(ram_pct, (int, float)) else ""
+        proc_rss = mem.get("process_rss_str")
+        proc_str = f" | Süreç: `{proc_rss}`" if proc_rss else ""
+        ram_summary = f"{ram_used}/{ram_total}{ram_pct_str}{proc_str}"
+    else:
+        ram_summary = "Ölçülemiyor"
 
-    lines.append(f"• **CPU:** `{cpu_str}`{cores_str} | **RAM:** {ram_used}/{ram_total}{ram_pct_str}{proc_str}")
+    lines.append(f"• **CPU:** `{cpu_str}`{cores_str} | **RAM:** {ram_summary}")
 
-    # 3. Disk & Storage
-    disk_used = disk.get("used_str") or "N/A"
-    disk_total = disk.get("total_str") or "N/A"
-    disk_pct = disk.get("percent")
-    disk_pct_str = f" (%{disk_pct:.1f})" if isinstance(disk_pct, (int, float)) else ""
-    is_persistent = disk.get("is_persistent")
-    persist_label = "Kalıcı" if is_persistent else "Geçici"
-    fs_type = str(disk.get("fs_type") or "fs")[:10]
+    # 4. Aktif Encode İşleri
+    active_jobs = stats.get("active_jobs_count")
+    if active_jobs is None and isinstance(stats.get("jobs"), dict):
+        active_jobs = stats.get("jobs", {}).get("active_count")
+    if active_jobs is None:
+        with suppress(Exception):
+            from job_store import get_job_store
+            active_jobs = len(get_job_store().list_jobs(status="running", limit=50))
+    if isinstance(active_jobs, int):
+        active_str = f"{active_jobs} iş çalışıyor" if active_jobs > 0 else "0 aktif iş"
+        lines.append(f"• **Aktif Encode:** `{active_str}`")
 
-    lines.append(f"• **Disk:** {disk_used}/{disk_total}{disk_pct_str} `[{persist_label}/{fs_type}]`")
+    # 5. Son Hata veya Genel Sağlık Durumu
+    last_err = bot_info.get("last_error") or stats.get("last_error") or stats.get("error")
+    if last_err:
+        clean_err = redact_sensitive_text(str(last_err))[:60]
+        lines.append(f"• **Son Hata:** `{clean_err}`")
+    else:
+        health_label = "🟢 Sağlıklı" if is_ready else ("🟡 Bağlanıyor" if connected else "🔴 Çevrimdışı")
+        lines.append(f"• **Genel Sağlık:** {health_label}")
 
-    # 4. Binaries toolchain
+    # 6. Disk & Storage (secondary)
+    disk_used = disk.get("used_str")
+    disk_total = disk.get("total_str")
+    if disk_used and disk_total:
+        disk_pct = disk.get("percent")
+        disk_pct_str = f" (%{disk_pct:.1f})" if isinstance(disk_pct, (int, float)) else ""
+        is_persistent = disk.get("is_persistent")
+        persist_label = "Kalıcı" if is_persistent else "Geçici"
+        lines.append(f"• **Disk:** {disk_used}/{disk_total}{disk_pct_str} `[{persist_label}]`")
+
+    # 7. Araçlar (secondary)
     ff_ok = bool((binaries.get("ffmpeg") or {}).get("installed"))
     aria_ok = bool((binaries.get("aria2") or {}).get("installed"))
     tool_status = f"FFmpeg: {'✅' if ff_ok else '❌'} | aria2: {'✅' if aria_ok else '❌'}"
-
-    # Rclone info if available
     try:
         from rclone_manager import get_rclone_manager
         mgr = get_rclone_manager()
         accs = mgr.list_accounts()
         connected_remotes = [a["remote_name"] for a in accs if a.get("is_active") and a.get("status") == "connected"]
-        pending_del = mgr.count_pending_deletions()
         if connected_remotes:
-            tool_status += f" | Rclone: ✅ ({len(connected_remotes)} bağlı, {pending_del} bekleyen silme)"
+            tool_status += f" | Rclone: ✅ ({len(connected_remotes)} bağlı)"
         else:
-            tool_status += " | Rclone: ⚠️ (Bağlı hesap yok)"
+            tool_status += " | Rclone: ⚠️"
     except Exception:
         pass
-
     lines.append(f"• **Araçlar:** {tool_status}")
-
-    # 5. Uptime & Host info
-    sys_uptime = compute.get("backend_uptime_str") or compute.get("system_uptime_str")
-    if sys_uptime:
-        lines.append(f"• **Çalışma Süresi:** `{str(sys_uptime)[:40]}`")
 
     # Combine with optional wake note
     body = "\n".join(lines)
@@ -1348,14 +1589,13 @@ def format_compact_stats_message(
         return full_message
 
     # Over length: progressively drop secondary lines from the bottom
-    while len(lines) > 3 and len(f"{clean_wake}{chr(10).join(lines)}") > effective_max:
+    while len(lines) > 2 and len(f"{clean_wake}{chr(10).join(lines)}") > effective_max:
         lines.pop()
 
     candidate = f"{clean_wake}{chr(10).join(lines)}"
     if len(candidate) <= effective_max:
         return candidate
 
-    # If still over (e.g. extremely long wake_note), truncate cleanly
     return candidate[: effective_max - 3] + "..."
 
 
@@ -1548,15 +1788,15 @@ def register_stats_command(tree: Any, bot: Any) -> None:
 
         try:
             stats = await asyncio.to_thread(collect_all_stats, bot)
-            message = format_compact_stats_message(stats, max_len=1023)
-            if len(message) > 1023:
-                message = message[:1020] + "..."
+            message = format_compact_stats_message(stats, max_len=DEFAULT_STATS_MAX_LEN)
+            if len(message) > DEFAULT_STATS_MAX_LEN:
+                message = message[: DEFAULT_STATS_MAX_LEN - 3] + "..."
             embed = build_stats_embed(stats)
             await interaction.followup.send(content=message, embed=embed)
         except Exception as exc:
             logger.exception("Error executing /stats command: %s", exc)
             safe_err = redact_sensitive_text(str(exc))[:200]
-            err_msg = f"❌ **UBAgen — İstatistik Hatası:** `{type(exc).__name__}: {safe_err}`"[:1023]
+            err_msg = f"❌ **UBAgen — İstatistik Hatası:** `{type(exc).__name__}: {safe_err}`"[:DEFAULT_STATS_MAX_LEN]
             await interaction.followup.send(content=err_msg)
 
 

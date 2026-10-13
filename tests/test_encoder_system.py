@@ -127,12 +127,14 @@ class TestClient:
         resp_headers: dict[str, str] = {}
         chunks: list[bytes] = []
         sent_body = False
+        disconnect_event = asyncio.Event()
 
         async def receive():
             nonlocal sent_body
             if not sent_body:
                 sent_body = True
                 return {"type": "http.request", "body": body, "more_body": False}
+            await disconnect_event.wait()
             return {"type": "http.disconnect"}
 
         async def send(message):
@@ -145,6 +147,8 @@ class TestClient:
                 }
             elif message["type"] == "http.response.body":
                 chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    disconnect_event.set()
 
         asyncio.run(self.app(scope, receive, send))
         return _AsgiResponse(status_code=status_code, content=b"".join(chunks), headers=resp_headers)

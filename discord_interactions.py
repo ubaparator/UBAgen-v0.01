@@ -613,9 +613,9 @@ async def execute_http_command_background(
             wake_note = ""
             if wake_result and wake_result.get("woken"):
                 wake_note = "⚡ **Komutla Uyanma Tetiklendi:** Discord Gateway botu arka planda yeniden bağlanıyor.\n"
-            summary_text = format_compact_stats_message(stats_data, max_len=1023, wake_note=wake_note)
-            if len(summary_text) > 1023:
-                summary_text = summary_text[:1020] + "..."
+            summary_text = format_compact_stats_message(stats_data, max_len=950, wake_note=wake_note)
+            if len(summary_text) > 950:
+                summary_text = summary_text[:947] + "..."
             await adapter.edit_original_response(content=summary_text, embed=embed)
             return {"command": cmd_name, "status": "completed", "wake": wake_result}
 
