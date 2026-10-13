@@ -103,6 +103,61 @@ class GatewayWatchdogTests(unittest.IsolatedAsyncioTestCase):
             await mgr.stop_bot()
             shutdown_event.set()
 
+    async def test_watchdog_replaces_runner_stuck_inside_gateway_start(self):
+        """A live runner stuck unready is replaced once; wake_event alone is insufficient."""
+        created: list[FakeBot] = []
+
+        class StalledBot(FakeBot):
+            def __init__(self, name: str):
+                super().__init__(name)
+                self._release_start = asyncio.Event()
+
+            async def start(self, token: str) -> None:
+                self.start_called += 1
+                self.tracker.connected = False
+                self.tracker.is_ready = False
+                self.tracker.status = "disconnected"
+                await self._release_start.wait()
+
+            async def close(self) -> None:
+                await super().close()
+                self._release_start.set()
+
+        def factory():
+            bot = StalledBot(f"Bot_{len(created)}")
+            created.append(bot)
+            return bot
+
+        mgr = BotLifecycleManager(bot_factory=factory, shutdown_event=asyncio.Event(), retry_delay=0.02)
+        mgr.gateway_stall_timeout = 0.05
+        mgr.watchdog_interval = 0.01
+        with patch.object(mgr, "get_bot_token", return_value="VALID_TOKEN_XYZ_123"):
+            mgr.start()
+            for _ in range(100):
+                if mgr.bot.start_called:
+                    break
+                await asyncio.sleep(0.005)
+            self.assertGreaterEqual(mgr.bot.start_called, 1)
+
+            # Simulate on_disconnect while bot.start remains alive in discord.py's reconnect path.
+            mgr.bot.tracker.connected = False
+            mgr.bot.tracker.is_ready = False
+            mgr.bot.tracker.status = "disconnected"
+            mgr.bot.tracker.last_error_time = time.time() - 1
+            mgr.bot.tracker.gateway_state_since = time.time() - 1
+
+            for _ in range(100):
+                if len(created) >= 2 and mgr.bot is created[1]:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertGreaterEqual(len(created), 2)
+            self.assertIs(mgr.bot, created[1])
+            self.assertIsNotNone(mgr.bot_task)
+            self.assertFalse(mgr.bot_task.done())
+            await mgr.stop_bot()
+            mgr.shutdown_event.set()
+
     async def test_watchdog_does_not_revive_on_invalid_token(self):
         """When token is rejected (status='invalid_token'), watchdog must NOT hammer reconnects."""
         shutdown_event = asyncio.Event()

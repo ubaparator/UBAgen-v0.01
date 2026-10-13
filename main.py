@@ -251,6 +251,7 @@ if commands is not None:
             self.tracker.connected = True
             self.tracker.is_ready = False
             self.tracker.status = "connecting"
+            self.tracker.gateway_state_since = time.time()
             if self.user:
                 self.tracker.user = str(self.user)
                 self.tracker.client_id = str(self.user.id)
@@ -277,6 +278,9 @@ if commands is not None:
                 self.tracker.connected = True
                 self.tracker.is_ready = True
                 self.tracker.status = "connected"
+                self.tracker.last_error_time = None
+                self.tracker.gateway_state_since = None
+                self.tracker.gateway_attempt_started_at = None
                 self.tracker.user = str(self.user)
                 self.tracker.client_id = str(self.user.id)
                 self.tracker.invite_url = f"https://discord.com/oauth2/authorize?client_id={self.user.id}&permissions=2147485696&scope=bot%20applications.commands"
@@ -338,6 +342,9 @@ if commands is not None:
             self.tracker.connected = True
             self.tracker.is_ready = True
             self.tracker.status = "connected"
+            self.tracker.last_error_time = None
+            self.tracker.gateway_state_since = None
+            self.tracker.gateway_attempt_started_at = None
             self.tracker.diagnostic_message = "Gateway session resumed."
             # Refresh the latency snapshot after reconnect; otherwise the dashboard
             # can keep displaying the last pre-disconnect value.
@@ -348,10 +355,13 @@ if commands is not None:
 
         async def on_disconnect(self) -> None:
             """Fires when disconnected from Discord gateway."""
-            logger.warning("Disconnected from Discord Gateway. discord.py is reconnecting...")
+            disconnected_at = time.time()
+            logger.warning("Discord Gateway disconnected at %.3f; discord.py will attempt to reconnect.", disconnected_at)
             self.tracker.connected = False
             self.tracker.is_ready = False
             self.tracker.status = "disconnected"
+            self.tracker.last_error_time = disconnected_at
+            self.tracker.gateway_state_since = disconnected_at
             self.tracker.diagnostic_message = "Connection temporarily interrupted. Reconnecting..."
             self.write_state_file()
 else:
@@ -512,6 +522,11 @@ async def run_discord_bot(
                     bot.clear()
 
         try:
+            attempt_started_at = time.time()
+            if not bool(getattr(tracker, "is_ready", False)):
+                tracker.gateway_attempt_started_at = attempt_started_at
+                if not getattr(tracker, "gateway_state_since", None):
+                    tracker.gateway_state_since = attempt_started_at
             logger.info("Connecting to Discord Gateway...")
             await bot.start(token)
             # A normal return is expected only when shutdown/restart was requested. If the
@@ -696,6 +711,8 @@ class BotLifecycleManager:
 
         self._restart_lock = asyncio.Lock()
         self._wake_lock = asyncio.Lock()
+        self.gateway_stall_timeout: float = 120.0
+        self.watchdog_interval: float = 10.0
         self.is_restarting: bool = False
         self.last_restart_at: float = 0.0
         self.last_wake_at: float = 0.0
@@ -767,6 +784,86 @@ class BotLifecycleManager:
         """Retrieve current DISCORD_BOT_TOKEN from environment without mutating or logging it."""
         return os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
+    async def _recover_stalled_gateway(self, token: str, expected_tracker: Any, stalled_for: float) -> bool:
+        """Replace a Gateway client that has remained unready past the stall threshold."""
+        async with self._restart_lock:
+            if self.shutdown_event.is_set() or self._stop_bot_event.is_set() or self.is_restarting:
+                return False
+
+            tracker = getattr(self.bot, "tracker", None)
+            if tracker is None or tracker is not expected_tracker or bool(getattr(tracker, "is_ready", False)):
+                return False
+
+            state_since = (
+                getattr(tracker, "gateway_state_since", None)
+                or getattr(tracker, "gateway_attempt_started_at", None)
+                or getattr(tracker, "last_error_time", None)
+            )
+            if not state_since or (time.time() - float(state_since)) < self.gateway_stall_timeout:
+                return False
+
+            self.is_restarting = True
+            old_bot = self.bot
+            old_task = self.bot_task
+            old_stop_event = self._stop_bot_event
+            # The watchdog must not observe its own stop request and exit.
+            self._stop_bot_event = asyncio.Event()
+            self._wake_event = asyncio.Event()
+            old_stop_event.set()
+
+            try:
+                logger.error(
+                    "Gateway watchdog detected an unready Discord client for %.1fs; replacing the client.",
+                    max(0.0, stalled_for),
+                )
+                if old_bot is not None and hasattr(old_bot, "close") and callable(old_bot.close):
+                    try:
+                        await asyncio.wait_for(old_bot.close(), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("Timed out closing stalled Discord client; cancelling its runner if needed.")
+                    except Exception as exc:
+                        logger.warning("Error closing stalled Discord client (%s).", type(exc).__name__)
+
+                if old_task is not None and not old_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(old_task), timeout=3.0)
+                    except (asyncio.TimeoutError, Exception):
+                        old_task.cancel()
+                        with suppress(asyncio.CancelledError, Exception):
+                            await old_task
+
+                if self.shutdown_event.is_set():
+                    return False
+
+                new_bot = self._create_bot_instance()
+                if new_bot is None:
+                    logger.error("Gateway watchdog could not create a replacement Discord client.")
+                    return False
+
+                new_tracker = getattr(new_bot, "tracker", None)
+                if new_tracker is not None:
+                    new_tracker.status = "connecting"
+                    new_tracker.connected = False
+                    new_tracker.is_ready = False
+                    new_tracker.gateway_state_since = time.time()
+                    new_tracker.diagnostic_message = "Replacing a stalled Discord Gateway session..."
+                self._update_active_bot(new_bot)
+                self.bot_task = asyncio.create_task(
+                    run_discord_bot(
+                        new_bot,
+                        token,
+                        self.shutdown_event,
+                        stop_event=self._stop_bot_event,
+                        wake_event=self._wake_event,
+                        bot_factory=self._create_bot_instance,
+                        on_bot_replaced=self._update_active_bot,
+                        initial_retry_delay=self.retry_delay,
+                    )
+                )
+                return True
+            finally:
+                self.is_restarting = False
+
     async def _gateway_watchdog_loop(self) -> None:
         """
         Continuous in-process Discord Gateway watchdog:
@@ -779,7 +876,7 @@ class BotLifecycleManager:
         logger.info("Discord Gateway watchdog monitor initialized.")
         while not self.shutdown_event.is_set():
             try:
-                await asyncio.sleep(10.0)
+                await asyncio.sleep(self.watchdog_interval)
                 if self.shutdown_event.is_set() or self._stop_bot_event.is_set():
                     break
 
@@ -818,13 +915,19 @@ class BotLifecycleManager:
                             )
                     continue
 
-                # Condition 2: Prolonged disconnection without active progress
-                if tracker and not tracker.connected and not self.is_restarting:
-                    last_err = getattr(tracker, "last_error_time", 0.0) or 0.0
-                    if last_err > 0 and (time.time() - last_err) > 90.0:
-                        if self._wake_event is not None and not self._wake_event.is_set():
-                            logger.info("Gateway Watchdog: Gateway disconnected for >90s. Triggering wake event...")
-                            self._wake_event.set()
+                # Condition 2: The runner can remain alive inside discord.py's own reconnect
+                # loop even though the Gateway never reaches READY/RESUMED. A wake event cannot
+                # interrupt that await, so replace the stalled client after a generous timeout.
+                if tracker and not bool(getattr(tracker, "is_ready", False)) and not self.is_restarting:
+                    state_since = (
+                        getattr(tracker, "gateway_state_since", None)
+                        or getattr(tracker, "gateway_attempt_started_at", None)
+                        or getattr(tracker, "last_error_time", None)
+                    )
+                    if state_since:
+                        stalled_for = time.time() - float(state_since)
+                        if stalled_for >= self.gateway_stall_timeout:
+                            await self._recover_stalled_gateway(token, tracker, stalled_for)
 
             except asyncio.CancelledError:
                 break
