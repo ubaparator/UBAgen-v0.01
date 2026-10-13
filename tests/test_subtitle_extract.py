@@ -21,6 +21,7 @@ from subtitle_extract import (
     clean_srt_file,
     create_job_workdir,
     ensure_runtime_binaries,
+    detect_runtime_environment,
     execute_subtitle_extraction,
     find_video_files,
     log_runtime_binaries_status,
@@ -242,6 +243,17 @@ class SubtitleExtractTests(unittest.IsolatedAsyncioTestCase):
             any("❌" in msg for msg in interaction.progress_updates),
             "Expected error message in progress updates",
         )
+
+    def test_runtime_environment_reports_platform_and_package_managers(self):
+        with patch("subtitle_extract.platform.system", return_value="Linux"), patch(
+            "subtitle_extract.platform.machine", return_value="x86_64"
+        ), patch("subtitle_extract.shutil.which", side_effect=lambda name: "/usr/bin/" + name if name in {"apt-get", "ffmpeg"} else None):
+            runtime = detect_runtime_environment()
+        self.assertEqual(runtime["os"], "Linux")
+        self.assertEqual(runtime["architecture"], "x86_64")
+        self.assertIn("apt-get", runtime["package_managers"])
+        self.assertEqual(runtime["package_manager"], "apt-get")
+        self.assertIn("is_container", runtime)
 
     def test_runtime_binaries_verification(self):
         statuses = log_runtime_binaries_status(auto_install=False)
