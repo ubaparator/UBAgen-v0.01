@@ -17,6 +17,7 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
 import hmac
+import json
 import logging
 import os
 import time
@@ -1113,7 +1114,11 @@ def create_health_app(
             bot_manager=current_mgr,
             run_live_remote_tests=bool(live_tests),
         )
-        report_text = format_log_diagnostics_report(diag)
+        report_text = (
+            format_log_diagnostics_report(diag)
+            + "\n\n=== FULL STRUCTURED DIAGNOSTICS ===\n"
+            + json.dumps(diag, indent=2, ensure_ascii=False, default=str)
+        )
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         filename = f"ubagen-log-{timestamp}.txt"
         return Response(
