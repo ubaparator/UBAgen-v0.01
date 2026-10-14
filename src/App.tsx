@@ -26,6 +26,7 @@ import {
   Zap,
   ExternalLink,
   Copy,
+  Download,
   Check,
   Share2,
   X,
@@ -763,6 +764,14 @@ export default function App() {
                   {copiedDiagnostics ? <Check className="inline w-3.5 h-3.5 mr-1.5" /> : <Copy className="inline w-3.5 h-3.5 mr-1.5" />}
                   {copiedDiagnostics ? 'Kopyalandı' : 'Kopyala'}
                 </button>
+                <a
+                  href="/api/diagnostics/log/download?live_tests=false"
+                  className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-xs font-semibold text-white inline-flex items-center"
+                  title="Tam tanılama raporunu .txt dosyası olarak indir"
+                  download
+                >
+                  <Download className="inline w-3.5 h-3.5 mr-1.5" />Log dosyasını indir
+                </a>
                 <button type="button" onClick={() => setShowDiagnostics(false)} aria-label="Log panelini kapat" className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">
                   <X className="w-4 h-4" />
                 </button>
