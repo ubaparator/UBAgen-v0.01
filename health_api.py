@@ -1102,6 +1102,30 @@ def create_health_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.get("/api/diagnostics/log/download", summary="Download System & Rclone Diagnostics Log")
+    async def download_diagnostics_log_api(live_tests: bool = False) -> Response:
+        """Download the same redacted diagnostic report as a UTF-8 plain-text file."""
+        current_bot = getattr(app.state, "bot", None)
+        current_mgr = getattr(app.state, "bot_manager", None)
+        diag = await asyncio.to_thread(
+            collect_log_diagnostics,
+            bot=current_bot,
+            bot_manager=current_mgr,
+            run_live_remote_tests=bool(live_tests),
+        )
+        report_text = format_log_diagnostics_report(diag)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        filename = f"ubagen-log-{timestamp}.txt"
+        return Response(
+            content=report_text or "Tanılama raporu boş döndü.",
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @app.get("/api/rclone/status", summary="Rclone Multi-Account Storage & Pending Deletions Status")
     async def get_rclone_status_api(refresh: bool = False) -> JSONResponse:
         rc_mgr = get_rclone_manager()
