@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#07110d">
+  <title>UBAgen · Yönetim Paneli</title>
+  <style>
+    :root{color-scheme:dark;--bg:#07110d;--panel:#101c16;--panel2:#14251b;--line:#294434;--text:#edf8ef;--muted:#a4b9a9;--green:#6ee7a0;--red:#ff9e9e}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#123321 0,transparent 42%),var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+    main{width:min(100% - 28px,1000px);margin:28px auto 56px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:22px}
+    .brand{font-size:23px;font-weight:800;letter-spacing:-.5px}.brand span{color:var(--green)}.tag{border:1px solid var(--line);padding:5px 10px;border-radius:999px;color:var(--muted);font-size:12px}
+    h1{font-size:clamp(25px,5vw,38px);line-height:1.1;margin:12px 0}.lead{color:var(--muted);max-width:680px;margin:0 0 24px}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.card{background:linear-gradient(145deg,var(--panel),#0b1710);border:1px solid var(--line);border-radius:18px;padding:18px;min-width:0}
+    .wide{grid-column:1/-1}.card h2{font-size:17px;margin:0 0 13px}.muted{color:var(--muted);font-size:13px}.field{display:block;margin:12px 0}.field span{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+    input,select{width:100%;border:1px solid #365342;border-radius:10px;background:#08130c;color:var(--text);padding:12px;font:inherit;min-width:0}button,.button{border:1px solid #3d8659;border-radius:10px;background:#173d27;color:#eaffef;padding:10px 13px;font:inherit;font-weight:650;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px}
+    button:hover,.button:hover{background:#205336}button.secondary{background:#111e16;border-color:var(--line)}button:disabled{opacity:.5;cursor:wait}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}
+    .notice{border:1px solid var(--line);border-radius:12px;padding:12px;color:var(--muted);font-size:13px;margin-top:12px;overflow-wrap:anywhere}.notice.error{color:var(--red);border-color:#6b3535}.notice.ok{color:var(--green)}
+    .run{padding:12px 0;border-top:1px solid var(--line);display:flex;gap:12px;justify-content:space-between;align-items:flex-start}.run:first-child{border-top:0}.run a{color:var(--green);text-decoration:none;overflow-wrap:anywhere}.run small{display:block;color:var(--muted);margin-top:3px}.state{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;white-space:nowrap}
+    footer{color:var(--muted);font-size:12px;margin-top:18px}code{overflow-wrap:anywhere}
+    @media(max-width:650px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}.card{padding:15px}.run{flex-direction:column;gap:6px}}
+  </style>
+</head>
+<body>
+<main>
+  <div class="top"><div class="brand">UBA<span>gen</span> / Panel</div><div class="tag">GitHub Pages · Yönetim</div></div>
+  <h1>İşlerini telefondan yönet.</h1>
+  <p class="lead">Encode görevlerini GitHub Actions'a gönder, son çalıştırmaları gör ve Render yönlendirme servisinin durumunu kontrol et. Gizli anahtarlar bu sayfanın kaynak koduna gömülü değildir.</p>
+  <div class="grid">
+    <section class="card">
+      <h2>Bağlantı ve yetkilendirme</h2>
+      <label class="field"><span>Render servis adresi</span><input id="api" inputmode="url" placeholder="https://ubagen-dispatcher.onrender.com"></label>
+      <label class="field"><span>Yönetici anahtarı (Render UBAGEN_ADMIN_TOKEN)</span><input id="key" type="password" autocomplete="current-password" placeholder="Render'da ayarladığın anahtar"></label>
+      <div class="actions"><button id="connect">Bağlan / İşleri getir</button><button class="secondary" id="forget">Anahtarı temizle</button></div>
+      <div id="connection" class="notice">Henüz bağlanılmadı. Önce Render servis adresini ve yönetici anahtarını gir.</div>
+    </section>
+    <section class="card">
+      <h2>Encode işi başlat</h2>
+      <label class="field"><span>Doğrudan video URL'si (HTTP/HTTPS)</span><input id="source" inputmode="url" placeholder="https://.../video.mkv"></label>
+      <label class="field"><span>Altyazı URL'si (isteğe bağlı .ass / .srt)</span><input id="subtitle" inputmode="url" placeholder="https://.../subtitle.ass"></label>
+      <label class="field"><span>Video codec'i</span><select id="codec"><option value="h264">H.264</option><option value="h265">H.265 / HEVC</option></select></label>
+      <div class="actions"><button id="submit">Encode işini başlat</button></div>
+      <div id="dispatch" class="notice">Dosyalar doğrudan URL üzerinden alınır. Discord ekleri bu panelde doğrudan yüklenmez.</div>
+    </section>
+    <section class="card wide">
+      <div class="top"><h2 style="margin:0">Son GitHub Actions işleri</h2><a class="button" href="https://github.com/ubaparator/UBAgen-v0.01/actions" target="_blank" rel="noopener">Tüm işler ↗</a></div>
+      <div id="runs" class="muted">Bağlanınca son işler burada listelenir.</div>
+    </section>
+    <section class="card wide">
+      <h2>Gerekli ilk kurulum</h2>
+      <ol class="muted">
+        <li>GitHub Actions secrets içine <code>RCLONE_CONFIG_B64</code> ve <code>RCLONE_DESTINATION</code> ekle.</li>
+        <li>Render'da <code>DISCORD_BOT_TOKEN</code>, <code>GITHUB_TOKEN</code>, <code>UBAGEN_ADMIN_TOKEN</code> ve <code>UBAGEN_DISCORD_ADMIN_IDS</code> ayarla.</li>
+        <li>GitHub deposu Settings → Pages → Build and deployment → Source alanında GitHub Actions seç.</li>
+        <li>GitHub Actions variables alanına <code>RENDER_HEALTH_URL</code> olarak Render adresinin <code>/health</code> yolunu ekle.</li>
+      </ol>
+      <div class="notice">Ücretsiz Render uykuya geçebilir veya yeniden başlayabilir. Zamanlanmış ping en iyi çabadır; 7/24 çalışma garantisi vermez. GitHub Actions'ın ücretsiz kotası ve iş süresi sınırları da geçerlidir.</div>
+      <div class="actions"><a class="button" href="https://github.com/ubaparator/UBAgen-v0.01/blob/main/docs/GITHUB_ACTIONS_RENDER_SETUP.md" target="_blank" rel="noopener">Kurulum rehberi ↗</a><a class="button secondary" href="https://github.com/ubaparator/UBAgen-v0.01/actions/workflows/encode-job.yml" target="_blank" rel="noopener">Encode workflow ↗</a></div>
+    </section>
+  </div>
+  <footer>UBAgen · Bu statik panel token'ı kaynak koda yazmaz. Anahtar yalnızca açık sekmenin sessionStorage alanında tutulur; paylaşılmış cihazlarda temizle.</footer>
+</main>
+<script>
+(function(){
+  const byId = id => document.getElementById(id);
+  const api = byId("api"), key = byId("key");
+  api.value = sessionStorage.getItem("ubagen_api") || "https://ubagen-dispatcher.onrender.com";
+  key.value = sessionStorage.getItem("ubagen_key") || "";
+  const base = () => api.value.trim().replace(/\/+$/, "");
+  function show(id, text, kind){ const el=byId(id); el.textContent=text; el.className="notice"+(kind?" "+kind:""); }
+  async function request(path, options){
+    if(!base().startsWith("https://")) throw new Error("Render adresi https:// ile başlamalı.");
+    if(!key.value) throw new Error("Yönetici anahtarını gir.");
+    const response=await fetch(base()+path,Object.assign({headers:{"X-Admin-Key":key.value,"Content-Type":"application/json"}},options||{}));
+    let data={}; try{data=await response.json()}catch(_){}
+    if(!response.ok) throw new Error(data.error||("HTTP "+response.status));
+    return data;
+  }
+  async function loadRuns(){
+    const data=await request("/api/runs");
+    const host=byId("runs"); host.replaceChildren();
+    if(!data.runs||!data.runs.length){host.textContent="Henüz workflow çalıştırması yok.";return;}
+    data.runs.forEach(run=>{
+      const row=document.createElement("div");row.className="run";
+      const left=document.createElement("div");const link=document.createElement("a");
+      link.href=run.html_url;link.target="_blank";link.rel="noopener";link.textContent=run.name||"GitHub Actions";
+      const small=document.createElement("small");small.textContent=(run.created_at||"").replace("T"," ").replace("Z","")+" · "+(run.event||"");
+      left.append(link,small);
+      const state=document.createElement("span");state.className="state";state.textContent=run.conclusion||run.status||"unknown";
+      row.append(left,state);host.append(row);
+    });
+  }
+  byId("connect").addEventListener("click",async()=>{
+    sessionStorage.setItem("ubagen_api",base());sessionStorage.setItem("ubagen_key",key.value);
+    byId("connect").disabled=true;show("connection","Render servisine bağlanılıyor…");
+    try{await loadRuns();show("connection","Bağlantı başarılı. İş listesi güncellendi.","ok");}
+    catch(e){show("connection",e.message,"error");}
+    finally{byId("connect").disabled=false;}
+  });
+  byId("forget").addEventListener("click",()=>{key.value="";sessionStorage.removeItem("ubagen_key");show("connection","Yönetici anahtarı temizlendi.");});
+  byId("submit").addEventListener("click",async()=>{
+    const source=byId("source").value.trim(), subtitle=byId("subtitle").value.trim(), codec=byId("codec").value;
+    if(!source){show("dispatch","Video URL'si gerekli.","error");return;}
+    byId("submit").disabled=true;show("dispatch","GitHub Actions işi başlatılıyor…");
+    try{
+      const result=await request("/api/dispatch",{method:"POST",body:JSON.stringify({source_url:source,subtitle_url:subtitle,codec:codec})});
+      show("dispatch",result.message+" "+(result.workflow_url||""),"ok");
+      await loadRuns();
+    }catch(e){show("dispatch",e.message,"error");}
+    finally{byId("submit").disabled=false;}
+  });
+})();
+</script>
+</body>
+</html>

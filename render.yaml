@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: ubagen-dispatcher
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python redirect_bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: UBAGEN_ADMIN_TOKEN
+        sync: false
+      - key: UBAGEN_DISCORD_ADMIN_IDS
+        sync: false
+      - key: GITHUB_REPOSITORY
+        value: ubaparator/UBAgen-v0.01
+      - key: GITHUB_REF
+        value: main
+      - key: PAGES_ORIGIN
+        value: https://ubaparator.github.io

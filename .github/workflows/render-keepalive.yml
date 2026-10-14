@@ -1,0 +1,27 @@
+name: Render Dispatcher Health Ping
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render health endpoint
+        env:
+          CONFIGURED_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$CONFIGURED_HEALTH_URL"
+          if [ -z "$URL" ]; then
+            URL="https://ubagen-dispatcher.onrender.com/health"
+          fi
+          echo "Checking $URL"
+          curl --fail --silent --show-error --max-time 30 "$URL"
+          echo

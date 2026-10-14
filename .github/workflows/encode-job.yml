@@ -1,0 +1,149 @@
+name: UBAgen Encode Job
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: Direct public video URL (HTTP/HTTPS)
+        required: true
+        type: string
+      subtitle_url:
+        description: Optional direct ASS/SRT URL to hard-sub
+        required: false
+        type: string
+      codec:
+        description: Video codec
+        required: true
+        type: choice
+        options:
+          - h264
+          - h265
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubagen-encode-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  encode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      SOURCE_URL: ${{ inputs.source_url }}
+      SUBTITLE_URL: ${{ inputs.subtitle_url }}
+      CODEC: ${{ inputs.codec }}
+    steps:
+      - name: Validate input URLs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          for key in ("SOURCE_URL", "SUBTITLE_URL"):
+              value = os.environ.get(key, "").strip()
+              if not value:
+                  if key == "SOURCE_URL":
+                      raise SystemExit("SOURCE_URL is required")
+                  continue
+              parsed = urlparse(value)
+              if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                  raise SystemExit(f"{key} must be a direct HTTP/HTTPS URL")
+              if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+                  raise SystemExit(f"{key} must point to a public host")
+          if os.environ.get("CODEC") not in ("h264", "h265"):
+              raise SystemExit("CODEC must be h264 or h265")
+          PY
+
+      - name: Install FFmpeg, curl and rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg curl ca-certificates rclone
+          ffmpeg -version | head -n 1
+          rclone version | head -n 1
+
+      - name: Download video and optional subtitle
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --connect-timeout 30 --max-time 18000 \
+            --output input_video "$SOURCE_URL"
+          test -s input_video
+          if [ -n "$SUBTITLE_URL" ]; then
+            curl --fail --location --retry 2 --connect-timeout 30 --max-time 3600 \
+              --output input_subtitle "$SUBTITLE_URL"
+            test -s input_subtitle
+          fi
+          du -h input_video
+
+      - name: Encode with FFmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$CODEC" = "h265" ]; then
+            VIDEO_CODEC=libx265
+            CRF=24
+          else
+            VIDEO_CODEC=libx264
+            CRF=20
+          fi
+          if [ -s input_subtitle ]; then
+            ffmpeg -hide_banner -y -i input_video \
+              -vf "subtitles=input_subtitle" -c:v "$VIDEO_CODEC" -preset medium -crf "$CRF" \
+              -c:a copy -c:s copy -max_muxing_queue_size 2048 "ubagen-${GITHUB_RUN_ID}.mkv"
+          else
+            ffmpeg -hide_banner -y -i input_video \
+              -c:v "$VIDEO_CODEC" -preset medium -crf "$CRF" \
+              -c:a copy -c:s copy -max_muxing_queue_size 2048 "ubagen-${GITHUB_RUN_ID}.mkv"
+          fi
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 \
+            "ubagen-${GITHUB_RUN_ID}.mkv"
+
+      - name: Configure rclone from repository secret
+        shell: bash
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+          RCLONE_DESTINATION: ${{ secrets.RCLONE_DESTINATION }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RCLONE_CONFIG_B64" ] || [ -z "$RCLONE_DESTINATION" ]; then
+            echo "::error::Configure Actions secrets RCLONE_CONFIG_B64 and RCLONE_DESTINATION first."
+            exit 1
+          fi
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          rclone listremotes
+
+      - name: Upload encoded video
+        id: upload
+        shell: bash
+        env:
+          RCLONE_DESTINATION: ${{ secrets.RCLONE_DESTINATION }}
+        run: |
+          set -euo pipefail
+          OUTPUT="ubagen-${GITHUB_RUN_ID}.mkv"
+          rclone copyto "$OUTPUT" "${RCLONE_DESTINATION%/}/$OUTPUT" --stats 15s --stats-one-line
+          echo "output_path=${RCLONE_DESTINATION%/}/$OUTPUT" >> "$GITHUB_OUTPUT"
+          if rclone link "${RCLONE_DESTINATION%/}/$OUTPUT" > output-link.txt 2>/dev/null; then
+            echo "Output link: $(cat output-link.txt)"
+          else
+            echo "Upload succeeded; this rclone backend does not provide a public link automatically."
+            echo "Uploaded path: ${RCLONE_DESTINATION%/}/$OUTPUT"
+          fi
+
+      - name: Publish job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## UBAgen encode job"
+            echo "- Codec: $CODEC"
+            echo "- Workflow run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "- Result: upload completed"
+            else
+              echo "- Result: ${{ job.status }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
