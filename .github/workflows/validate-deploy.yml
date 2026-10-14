@@ -40,7 +40,7 @@ jobs:
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
       - name: Compile Python modules
-        run: python -B -m compileall -q main.py subtitle_extract.py stats.py health_api.py storage_manager.py job_store.py encoder_worker.py tests
+        run: python -B -m compileall -q main.py redirect_bot.py subtitle_extract.py stats.py health_api.py storage_manager.py job_store.py encoder_worker.py tests
 
       - name: Run Python regression tests
         run: python -B -m unittest discover -s tests -v
@@ -75,5 +75,5 @@ jobs:
             echo '=== Container rclone version ===' && rclone version | head -n 2 && \
             rclone help backends | grep -qi 'mega' && \
             rclone help backends | grep -qi 'drive' && \
-            python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker; print(\"All UBAgen modules loaded successfully in container\")'"
+            python -B -c 'import main, redirect_bot, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker; print(\"All UBAgen modules loaded successfully in container\")'"
 
