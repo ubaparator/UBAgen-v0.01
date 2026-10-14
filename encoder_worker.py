@@ -1941,16 +1941,88 @@ async def is_user_authorized_for_discord_restart(interaction: Any, bot: Optional
             with suppress(Exception):
                 maybe_coro = is_owner_fn(user_obj)
                 if asyncio.iscoroutine(maybe_coro):
-                    if await maybe_coro:
+                    res = await maybe_coro
+                    if res is True or (isinstance(res, bool) and res):
                         return True
-                elif bool(maybe_coro):
+                elif maybe_coro is True or (isinstance(maybe_coro, bool) and maybe_coro):
                     return True
 
     # 3. Check Guild Administrator permission when invoked in a server
     guild_perms = getattr(user_obj, "guild_permissions", None)
-    if guild_perms is not None and bool(getattr(guild_perms, "administrator", False)):
+    if guild_perms is not None and (getattr(guild_perms, "administrator", False) is True):
         return True
 
+    return False
+
+
+async def check_discord_restart_authorization(
+    interaction: Any,
+    bot: Optional[Any] = None,
+) -> tuple[bool, str]:
+    """
+    Verify whether the interaction caller is authorized to execute administrative commands (/discord, /log).
+    Returns (authorized, reason_string).
+    """
+    if interaction is None:
+        return False, "Etkileşim nesnesi bulunamadı."
+    user_obj = getattr(interaction, "user", None)
+    if user_obj is None:
+        return False, "Kullanıcı bilgisi alınamadı."
+    authorized = await is_user_authorized_for_discord_restart(interaction, bot)
+    if authorized:
+        return True, "Yetkili yönetici"
+    return False, "Kullanıcı sunucu yöneticisi (`Administrator`) veya bot sahibi değil."
+
+
+async def _safe_defer_interaction(interaction: Any, ephemeral: bool = True) -> bool:
+    """Safely defer a Discord slash command interaction if not already acknowledged."""
+    if interaction is None:
+        return False
+    try:
+        resp = getattr(interaction, "response", None)
+        if resp is not None:
+            is_done_fn = getattr(resp, "is_done", None)
+            is_done = is_done_fn() if callable(is_done_fn) else bool(getattr(resp, "_is_done", False))
+            if not is_done:
+                defer_fn = getattr(resp, "defer", None)
+                if callable(defer_fn):
+                    await defer_fn(ephemeral=ephemeral, thinking=True)
+                    return True
+    except Exception as exc:
+        logger.debug("Failed to defer interaction (%s): %s", type(exc).__name__, exc)
+    return False
+
+
+async def _safe_edit_interaction(
+    interaction: Any,
+    content: str,
+    attachments: Optional[list[Any]] = None,
+) -> bool:
+    """Safely edit original response or send follow-up message on a Discord interaction."""
+    if interaction is None:
+        return False
+    try:
+        edit_fn = getattr(interaction, "edit_original_response", None)
+        if callable(edit_fn):
+            kwargs: dict[str, Any] = {"content": content}
+            if attachments is not None:
+                kwargs["attachments"] = attachments
+            await edit_fn(**kwargs)
+            return True
+    except Exception as exc:
+        logger.debug("edit_original_response failed (%s), falling back to followup: %s", type(exc).__name__, exc)
+    try:
+        followup = getattr(interaction, "followup", None)
+        if followup is not None:
+            send_fn = getattr(followup, "send", None)
+            if callable(send_fn):
+                kwargs = {"content": content, "ephemeral": True}
+                if attachments is not None:
+                    kwargs["files"] = attachments
+                await send_fn(**kwargs)
+                return True
+    except Exception as exc:
+        logger.debug("followup.send failed (%s): %s", type(exc).__name__, exc)
     return False
 
 

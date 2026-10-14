@@ -200,3 +200,56 @@ export function resolveApiUrl(path: string): string {
   }
   return raw.startsWith('/') ? raw : `/${raw}`;
 }
+
+export const DIAGNOSTICS_LOG_PATH = '/api/diagnostics/log';
+export const DIAGNOSTICS_DOWNLOAD_PATH = '/api/diagnostics/log/download';
+
+export function resolveDiagnosticsDownloadUrl(endpointUrl: string): string {
+  const raw = (endpointUrl || '').trim();
+  if (!raw || raw === '/api/stats' || raw === '/stats' || raw === 'api/stats' || raw === 'stats') {
+    return `${DIAGNOSTICS_DOWNLOAD_PATH}?live_tests=false`;
+  }
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    try {
+      const parsed = new URL(raw);
+      const basePath = parsed.pathname
+        .replace(/\/+(?:api\/)?stats\/?$/i, '')
+        .replace(/\/+$/, '');
+      parsed.pathname = `${basePath}${DIAGNOSTICS_DOWNLOAD_PATH}`;
+      parsed.search = 'live_tests=false';
+      parsed.hash = '';
+      return parsed.toString();
+    } catch {}
+  }
+  const cleanPath = raw
+    .replace(/[?#].*$/, '')
+    .replace(/\/+(?:api\/)?stats\/?$/i, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+  return cleanPath ? `/${cleanPath}${DIAGNOSTICS_DOWNLOAD_PATH}?live_tests=false` : `${DIAGNOSTICS_DOWNLOAD_PATH}?live_tests=false`;
+}
+
+export function resolveDiagnosticsLogUrl(endpointUrl: string): string {
+  const raw = (endpointUrl || '').trim();
+  if (!raw || raw === '/api/stats' || raw === '/stats' || raw === 'api/stats' || raw === 'stats') {
+    return `${DIAGNOSTICS_LOG_PATH}?live_tests=false`;
+  }
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    try {
+      const parsed = new URL(raw);
+      const basePath = parsed.pathname
+        .replace(/\/+(?:api\/)?stats\/?$/i, '')
+        .replace(/\/+$/, '');
+      parsed.pathname = `${basePath}${DIAGNOSTICS_LOG_PATH}`;
+      parsed.search = 'live_tests=false';
+      parsed.hash = '';
+      return parsed.toString();
+    } catch {}
+  }
+  const cleanPath = raw
+    .replace(/[?#].*$/, '')
+    .replace(/\/+(?:api\/)?stats\/?$/i, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+  return cleanPath ? `/${cleanPath}${DIAGNOSTICS_LOG_PATH}?live_tests=false` : `${DIAGNOSTICS_LOG_PATH}?live_tests=false`;
+}

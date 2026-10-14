@@ -20,12 +20,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Install FFmpeg tools for encoder integration tests
+      - name: Install multimedia tools for encoder integration tests
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ffmpeg
-          ffmpeg -version
-          ffprobe -version
+          sudo apt-get install --yes ffmpeg aria2 curl unzip
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          aria2c --version | head -n 1
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+          rclone version | head -n 1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -43,3 +46,13 @@ jobs:
         run: npm run build
       - name: Type-check
         run: npm run lint
+      - name: Build and verify production Docker image
+        run: |
+          docker build --tag ubagen-encoder-test .
+          docker run --rm ubagen-encoder-test sh -c "\
+            aria2c --version >/dev/null && \
+            ffmpeg -version >/dev/null && \
+            ffprobe -version >/dev/null && \
+            rclone version >/dev/null && \
+            rclone help backends | grep -qi 'mega' && \
+            rclone help backends | grep -qi 'drive'"

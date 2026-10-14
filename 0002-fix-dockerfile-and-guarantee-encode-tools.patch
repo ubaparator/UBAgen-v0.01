@@ -1,0 +1,164 @@
+From bc4c5c632d4408b49159e91a53182310d0d97c27 Mon Sep 17 00:00:00 2001
+From: ubaparator <ilovenato.uba@gmail.com>
+Date: Wed, 14 Oct 2026 12:23:18 +0000
+Subject: [PATCH] fix(docker): guarantee encode tools (aria2c, ffmpeg, ffprobe,
+ rclone) in Dockerfile and CI
+
+---
+ .dockerignore                              |  6 +++++
+ .github/workflows/repair-cloud-run-iam.yml | 21 +++++++++++++---
+ .github/workflows/validate-deploy.yml      | 18 +++++++++++---
+ Dockerfile                                 | 29 ++++++++++++++++------
+ 4 files changed, 59 insertions(+), 15 deletions(-)
+
+diff --git a/.dockerignore b/.dockerignore
+index 8647724..2a42e9b 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -20,3 +20,9 @@ tests/
+ download_temp/
+ encode_temp/
+ video_outputs/
++*.sqlite3
++*.sqlite3-journal
++*.key
++.ubagen_rclone_master.key
++rclone.conf
++*.patch
+diff --git a/.github/workflows/repair-cloud-run-iam.yml b/.github/workflows/repair-cloud-run-iam.yml
+index 75ffc65..ad36e86 100644
+--- a/.github/workflows/repair-cloud-run-iam.yml
++++ b/.github/workflows/repair-cloud-run-iam.yml
+@@ -20,12 +20,15 @@ jobs:
+     timeout-minutes: 20
+     steps:
+       - uses: actions/checkout@v4
+-      - name: Install FFmpeg tools for encoder integration tests
++      - name: Install multimedia tools for encoder integration tests
+         run: |
+           sudo apt-get update
+-          sudo apt-get install --yes ffmpeg
+-          ffmpeg -version
+-          ffprobe -version
++          sudo apt-get install --yes ffmpeg aria2 curl unzip
++          curl -fsSL https://rclone.org/install.sh | sudo bash
++          aria2c --version | head -n 1
++          ffmpeg -version | head -n 1
++          ffprobe -version | head -n 1
++          rclone version | head -n 1
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.12"
+@@ -43,3 +46,13 @@ jobs:
+         run: npm run build
+       - name: Type-check
+         run: npm run lint
++      - name: Build and verify production Docker image
++        run: |
++          docker build --tag ubagen-encoder-test .
++          docker run --rm ubagen-encoder-test sh -c "\
++            aria2c --version >/dev/null && \
++            ffmpeg -version >/dev/null && \
++            ffprobe -version >/dev/null && \
++            rclone version >/dev/null && \
++            rclone help backends | grep -qi 'mega' && \
++            rclone help backends | grep -qi 'drive'"
+diff --git a/.github/workflows/validate-deploy.yml b/.github/workflows/validate-deploy.yml
+index 7875f73..6fe5ccb 100644
+--- a/.github/workflows/validate-deploy.yml
++++ b/.github/workflows/validate-deploy.yml
+@@ -19,13 +19,15 @@ jobs:
+       - name: Check out repository
+         uses: actions/checkout@v4
+ 
+-      - name: Install system multimedia dependencies (aria2 & ffmpeg)
++      - name: Install system multimedia & transfer dependencies (aria2, ffmpeg, rclone)
+         run: |
+           sudo apt-get update
+-          sudo apt-get install -y --no-install-recommends aria2 ffmpeg ca-certificates curl
++          sudo apt-get install -y --no-install-recommends aria2 ffmpeg ca-certificates curl unzip
++          curl -fsSL https://rclone.org/install.sh | sudo bash
+           aria2c --version | head -n 1
+           ffmpeg -version | head -n 1
+           ffprobe -version | head -n 1
++          rclone version | head -n 1
+ 
+       - name: Set up Python
+         uses: actions/setup-python@v5
+@@ -63,5 +65,15 @@ jobs:
+       - name: Build production Docker image
+         run: |
+           docker build --tag ubagen-ci-test .
+-          docker run --rm ubagen-ci-test sh -c "aria2c --version >/dev/null && ffmpeg -version >/dev/null && ffprobe -version >/dev/null && python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker; cfg = job_store.discover_and_apply_runtime_config(); assert cfg[\"discovered\"][\"cloud_run_job_name\"] == \"ubagen-encoder-worker\"'"
++
++      - name: Verify encode tools and runtime inside production Docker image
++        run: |
++          docker run --rm ubagen-ci-test sh -c "\
++            echo '=== Container aria2c version ===' && aria2c --version | head -n 2 && \
++            echo '=== Container ffmpeg version ===' && ffmpeg -version | head -n 2 && \
++            echo '=== Container ffprobe version ===' && ffprobe -version | head -n 2 && \
++            echo '=== Container rclone version ===' && rclone version | head -n 2 && \
++            rclone help backends | grep -qi 'mega' && \
++            rclone help backends | grep -qi 'drive' && \
++            python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker; print(\"All UBAgen modules loaded successfully in container\")'"
+ 
+diff --git a/Dockerfile b/Dockerfile
+index dbe757e..8b19b2e 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -24,11 +24,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
+     HOST=0.0.0.0
+ 
+ # Install runtime dependencies:
+-# - ffmpeg: Required for multimedia tools (monitored in dashboard & /stats)
+-# - aria2: High-speed download utility (monitored in dashboard & /stats)
++# - ffmpeg & ffprobe: Required for multimedia tools (monitored in dashboard & /stats)
++# - aria2 (aria2c): High-speed download utility (monitored in dashboard & /stats)
+ # - rclone: Official release with native MEGA and Google Drive backends
+ # - curl & unzip: For container health checks, binary installation and verification
+ # - procps & ca-certificates: For process monitoring and SSL
++# - fontconfig & fonts-dejavu-core: For subtitle rendering
+ RUN apt-get update && apt-get install -y --no-install-recommends \
+     ffmpeg \
+     aria2 \
+@@ -39,12 +40,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     fontconfig \
+     fonts-dejavu-core \
+     && curl -fsSL https://rclone.org/install.sh | bash \
+-    && rm -rf /var/lib/apt/lists/* \
+-    && aria2c --version >/dev/null \
+-    && ffmpeg -version >/dev/null \
+-    && ffprobe -version >/dev/null \
+-    && rclone version >/dev/null \
+-    && rclone help backends | grep -q "mega"
++    && rm -rf /var/lib/apt/lists/*
++
++# Strict Docker build verification for all four required encode & transfer tools:
++# aria2c, ffmpeg, ffprobe, and rclone MUST be installed and executable on PATH.
++# If any tool fails or is missing, the Docker image build will fail immediately.
++RUN echo "=== [Build Verification 1/4] aria2c ===" && aria2c --version \
++    && echo "=== [Build Verification 2/4] ffmpeg ===" && ffmpeg -version \
++    && echo "=== [Build Verification 3/4] ffprobe ===" && ffprobe -version \
++    && echo "=== [Build Verification 4/4] rclone ===" && rclone version \
++    && echo "=== [Build Verification] rclone backends ===" \
++    && rclone help backends | grep -qi "mega" \
++    && rclone help backends | grep -qi "drive"
+ 
+ WORKDIR /app
+ 
+@@ -68,6 +75,12 @@ RUN mkdir -p /app/download_temp/encode_temp /app/download_temp/worker_jobs /app/
+ 
+ USER ubagen
+ 
++# Verify non-root execution capability on PATH for all four tools
++RUN aria2c --version >/dev/null \
++    && ffmpeg -version >/dev/null \
++    && ffprobe -version >/dev/null \
++    && rclone version >/dev/null
++
+ EXPOSE 8080
+ 
+ # Health check targeting the FastAPI /health probe
+-- 
+2.34.1
+

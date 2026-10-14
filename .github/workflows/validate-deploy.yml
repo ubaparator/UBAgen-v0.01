@@ -19,13 +19,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install system multimedia dependencies (aria2 & ffmpeg)
+      - name: Install system multimedia & transfer dependencies (aria2, ffmpeg, rclone)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends aria2 ffmpeg ca-certificates curl
+          sudo apt-get install -y --no-install-recommends aria2 ffmpeg ca-certificates curl unzip
+          curl -fsSL https://rclone.org/install.sh | sudo bash
           aria2c --version | head -n 1
           ffmpeg -version | head -n 1
           ffprobe -version | head -n 1
+          rclone version | head -n 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -63,5 +65,15 @@ jobs:
       - name: Build production Docker image
         run: |
           docker build --tag ubagen-ci-test .
-          docker run --rm ubagen-ci-test sh -c "aria2c --version >/dev/null && ffmpeg -version >/dev/null && ffprobe -version >/dev/null && python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker; cfg = job_store.discover_and_apply_runtime_config(); assert cfg[\"discovered\"][\"cloud_run_job_name\"] == \"ubagen-encoder-worker\"'"
+
+      - name: Verify encode tools and runtime inside production Docker image
+        run: |
+          docker run --rm ubagen-ci-test sh -c "\
+            echo '=== Container aria2c version ===' && aria2c --version | head -n 2 && \
+            echo '=== Container ffmpeg version ===' && ffmpeg -version | head -n 2 && \
+            echo '=== Container ffprobe version ===' && ffprobe -version | head -n 2 && \
+            echo '=== Container rclone version ===' && rclone version | head -n 2 && \
+            rclone help backends | grep -qi 'mega' && \
+            rclone help backends | grep -qi 'drive' && \
+            python -B -c 'import main, subtitle_extract, stats, health_api, storage_manager, job_store, encoder_worker; print(\"All UBAgen modules loaded successfully in container\")'"
 

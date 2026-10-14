@@ -929,6 +929,59 @@ export function createApiApp(options: CreateApiAppOptions = {}) {
     );
   });
 
+  // GET /api/diagnostics/log/download: Downloadable UTF-8 plain-text diagnostic report
+  app.get('/api/diagnostics/log/download', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const liveTests = req.query.live_tests === '1' || req.query.live_tests === 'true';
+    const standaloneBackendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5050';
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const nowStr = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+    const defaultFilename = `ubagen-log-${nowStr}.txt`;
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      try {
+        const upstreamRes = await fetchFn(
+          `${standaloneBackendUrl}/api/diagnostics/log/download?live_tests=${liveTests ? 'true' : 'false'}`,
+          { signal: controller.signal, headers: { Accept: 'text/plain, */*' } }
+        );
+        if (upstreamRes.ok) {
+          const bodyText = await upstreamRes.text();
+          const upstreamDisposition = upstreamRes.headers.get('content-disposition');
+          res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+          res.setHeader('Content-Disposition', upstreamDisposition || `attachment; filename="${defaultFilename}"`);
+          return res.send(bodyText || 'Tanılama raporu boş döndü.');
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {}
+
+    // Fallback: direct Python execution if standalone FastAPI worker is not reachable
+    execFile(
+      'python3',
+      [
+        '-B',
+        '-c',
+        'import json, sys; from rclone_manager import collect_log_diagnostics, format_log_diagnostics_report; d = collect_log_diagnostics(run_live_remote_tests=(sys.argv[1]=="1")); msg = format_log_diagnostics_report(d); print(msg + "\\n\\n=== FULL STRUCTURED DIAGNOSTICS ===\\n" + json.dumps(d, indent=2, ensure_ascii=False, default=str))',
+        liveTests ? '1' : '0',
+      ],
+      { timeout: 8000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+      (error, stdout) => {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${defaultFilename}"`);
+        if (!error && stdout) {
+          return res.send(stdout);
+        }
+        const fallbackText = `UBAgen Tanılama Raporu (Yedek Mod)\nTarih: ${new Date().toISOString()}\nDurum: Degraded (Backend yanıt vermedi)\nHata: ${error ? error.message : 'Bilinmeyen hata'}\n`;
+        return res.send(fallbackText);
+      }
+    );
+  });
+
   const authorizeRcloneAdmin = (req: express.Request, res: express.Response): boolean => {
     res.setHeader('Cache-Control', 'no-store');
     const expectedToken = (process.env.UBAGEN_ADMIN_TOKEN || '').trim();

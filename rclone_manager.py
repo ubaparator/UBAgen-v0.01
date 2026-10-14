@@ -21,6 +21,7 @@ Key Capabilities:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import configparser
 from contextlib import suppress
@@ -2662,34 +2663,54 @@ async def handle_log_slash_command(
         run_live_remote_tests=run_live_remote_tests,
     )
     formatted_msg = format_diagnostic_log_for_discord(report)
+
+    # Prepare comprehensive downloadable .txt attachment with full structured diagnostics
     report_text = (
         formatted_msg
         + "\n\n=== FULL STRUCTURED DIAGNOSTICS ===\n"
         + json.dumps(report, indent=2, ensure_ascii=False, default=str)
     )
+    encoded_bytes = report_text.encode("utf-8")
+    if len(encoded_bytes) > 8 * 1024 * 1024:
+        encoded_bytes = encoded_bytes[: 8 * 1024 * 1024]
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     filename = f"ubagen-log-{timestamp}.txt"
+
+    file_sent = False
     try:
         import discord
 
-        log_file = discord.File(io.BytesIO(report_text.encode("utf-8")), filename=filename)
-        # Edit the deferred ephemeral response so the report and its downloadable
-        # text attachment arrive together in one message.
-        await interaction.edit_original_response(content=formatted_msg, attachments=[log_file])
+        log_file = discord.File(io.BytesIO(encoded_bytes), filename=filename)
+        edit_fn = getattr(interaction, "edit_original_response", None)
+        if callable(edit_fn):
+            await edit_fn(content=formatted_msg, attachments=[log_file])
+            file_sent = True
     except Exception as exc:
-        logger.warning("Could not attach /log report to the original response (%s); trying follow-up.", type(exc).__name__)
+        logger.warning("Could not attach /log report to original response (%s); trying follow-up: %s", type(exc).__name__, exc)
         await _safe_edit_interaction(interaction, formatted_msg)
         try:
             import discord
 
-            followup_file = discord.File(io.BytesIO(report_text.encode("utf-8")), filename=filename)
-            await interaction.followup.send(
-                content="📄 Tanılama raporunun indirilebilir dosyası:",
-                file=followup_file,
-                ephemeral=True,
+            followup = getattr(interaction, "followup", None)
+            if followup is not None and callable(getattr(followup, "send", None)):
+                followup_file = discord.File(io.BytesIO(encoded_bytes), filename=filename)
+                await followup.send(
+                    content="📄 **Tanılama Raporu Eki:**",
+                    file=followup_file,
+                    ephemeral=True,
+                )
+                file_sent = True
+        except Exception as followup_exc:
+            logger.exception("Failed to send /log text-file attachment via followup: %s", followup_exc)
+            await _safe_edit_interaction(
+                interaction,
+                f"{formatted_msg}\n\n⚠️ *Dosya eki gönderilemedi:* `{type(followup_exc).__name__}`",
             )
-        except Exception:
-            logger.exception("Failed to send the /log text-file attachment.")
+
+    if not file_sent:
+        await _safe_edit_interaction(interaction, formatted_msg)
+
     return 200, report
 
 

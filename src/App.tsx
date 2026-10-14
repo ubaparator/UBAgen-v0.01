@@ -31,10 +31,20 @@ import {
   Share2,
   X,
 } from 'lucide-react';
-import { executeBotRestartRequest, resolveRestartBotUrl } from './restartBot';
+import {
+  executeBotRestartRequest,
+  resolveRestartBotUrl,
+  resolveDiagnosticsDownloadUrl,
+  resolveDiagnosticsLogUrl,
+} from './restartBot';
 import RcloneManagement from './RcloneManagement';
 
-export { executeBotRestartRequest, resolveRestartBotUrl };
+export {
+  executeBotRestartRequest,
+  resolveRestartBotUrl,
+  resolveDiagnosticsDownloadUrl,
+  resolveDiagnosticsLogUrl,
+};
 
 // Official Discord Clyde controller SVG logo
 function DiscordLogo({ className = 'w-4 h-4' }: { className?: string }) {
@@ -256,6 +266,7 @@ export default function App() {
   const [diagnosticsText, setDiagnosticsText] = useState<string>('');
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [copiedDiagnostics, setCopiedDiagnostics] = useState<boolean>(false);
+  const [downloadingLog, setDownloadingLog] = useState<boolean>(false);
   const [restartingBot, setRestartingBot] = useState<boolean>(false);
   const [showRestartModal, setShowRestartModal] = useState<boolean>(false);
   const [restartAdminTokenInput, setRestartAdminTokenInput] = useState<string>('');
@@ -405,7 +416,8 @@ export default function App() {
     setDiagnosticsError(null);
     setDiagnosticsText('');
     try {
-      const response = await fetch('/api/diagnostics/log?live_tests=false', {
+      const targetUrl = resolveDiagnosticsLogUrl(endpointUrl);
+      const response = await fetch(targetUrl, {
         headers: { Accept: 'application/json' },
         cache: 'no-store',
       });
@@ -423,6 +435,59 @@ export default function App() {
       setDiagnosticsText('');
     } finally {
       setDiagnosticsLoading(false);
+    }
+  };
+
+  // Download the full plain-text UTF-8 diagnostic report with error handling and dynamic filename
+  const handleDownloadDiagnostics = async (e?: React.MouseEvent) => {
+    if (e) {
+      e.preventDefault();
+    }
+    if (downloadingLog) return;
+    setDownloadingLog(true);
+    setDiagnosticsError(null);
+    try {
+      const downloadTarget = resolveDiagnosticsDownloadUrl(endpointUrl);
+      const res = await fetch(downloadTarget, {
+        headers: { Accept: 'text/plain, */*' },
+        cache: 'no-store',
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      const text = await res.text();
+      if (!text || !text.trim()) {
+        throw new Error('İndirilen tanılama raporu içeriği boş.');
+      }
+      // Determine filename from Content-Disposition header if available
+      let filename = '';
+      const disp = res.headers.get('content-disposition');
+      if (disp) {
+        const match = /filename\*?=['"]?(?:UTF-\d['"]*)?([^;\r\n"']*)['"]?/i.exec(disp);
+        if (match && match[1]) {
+          filename = decodeURIComponent(match[1].trim());
+        }
+      }
+      if (!filename) {
+        const now = new Date();
+        const pad = (n: number) => String(n).padStart(2, '0');
+        const nowStr = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+        filename = `ubagen-log-${nowStr}.txt`;
+      }
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Bilinmeyen hata';
+      setDiagnosticsError(`Log dosyası indirilemedi: ${message}`);
+    } finally {
+      setDownloadingLog(false);
     }
   };
 
@@ -764,14 +829,16 @@ export default function App() {
                   {copiedDiagnostics ? <Check className="inline w-3.5 h-3.5 mr-1.5" /> : <Copy className="inline w-3.5 h-3.5 mr-1.5" />}
                   {copiedDiagnostics ? 'Kopyalandı' : 'Kopyala'}
                 </button>
-                <a
-                  href="/api/diagnostics/log/download?live_tests=false"
-                  className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-xs font-semibold text-white inline-flex items-center"
+                <button
+                  type="button"
+                  onClick={handleDownloadDiagnostics}
+                  disabled={downloadingLog}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-xs font-semibold text-white inline-flex items-center disabled:opacity-50 cursor-pointer transition-all"
                   title="Tam tanılama raporunu .txt dosyası olarak indir"
-                  download
                 >
-                  <Download className="inline w-3.5 h-3.5 mr-1.5" />Log dosyasını indir
-                </a>
+                  <Download className={`inline w-3.5 h-3.5 mr-1.5 ${downloadingLog ? 'animate-bounce' : ''}`} />
+                  {downloadingLog ? 'İndiriliyor…' : 'Log dosyasını indir'}
+                </button>
                 <button type="button" onClick={() => setShowDiagnostics(false)} aria-label="Log panelini kapat" className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">
                   <X className="w-4 h-4" />
                 </button>
