@@ -2662,7 +2662,30 @@ async def handle_log_slash_command(
         run_live_remote_tests=run_live_remote_tests,
     )
     formatted_msg = format_diagnostic_log_for_discord(report)
-    await _safe_edit_interaction(interaction, formatted_msg)
+    report_text = format_diagnostic_log_for_discord(report)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"ubagen-log-{timestamp}.txt"
+    try:
+        import discord
+
+        log_file = discord.File(io.BytesIO(report_text.encode("utf-8")), filename=filename)
+        # Edit the deferred ephemeral response so the report and its downloadable
+        # text attachment arrive together in one message.
+        await interaction.edit_original_response(content=formatted_msg, attachments=[log_file])
+    except Exception as exc:
+        logger.warning("Could not attach /log report to the original response (%s); trying follow-up.", type(exc).__name__)
+        await _safe_edit_interaction(interaction, formatted_msg)
+        try:
+            import discord
+
+            followup_file = discord.File(io.BytesIO(report_text.encode("utf-8")), filename=filename)
+            await interaction.followup.send(
+                content="📄 Tanılama raporunun indirilebilir dosyası:",
+                file=followup_file,
+                ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Failed to send the /log text-file attachment.")
     return 200, report
 
 
