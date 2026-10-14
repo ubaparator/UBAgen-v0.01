@@ -2662,7 +2662,11 @@ async def handle_log_slash_command(
         run_live_remote_tests=run_live_remote_tests,
     )
     formatted_msg = format_diagnostic_log_for_discord(report)
-    report_text = format_diagnostic_log_for_discord(report)
+    report_text = (
+        formatted_msg
+        + "\n\n=== FULL STRUCTURED DIAGNOSTICS ===\n"
+        + json.dumps(report, indent=2, ensure_ascii=False, default=str)
+    )
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     filename = f"ubagen-log-{timestamp}.txt"
     try:
